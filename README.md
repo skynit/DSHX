@@ -10,6 +10,14 @@ ARM 真机已接通用户的 DeepSeek 官方服务，模型为 `deepseek-flash`�
 
 手机输入已补充竖屏与短横屏适配：打开键盘时隐藏原生底部导航，横屏空间不足时让正文与原有操作按钮并排，保留附件可见性；收起键盘后恢复完整标题和统计区。最终开发包已在 API 36 x86_64 模拟器覆盖安装并恢复原会话，实际截图和边界见 app 验证记录。
 
+## 技术来源与致谢
+
+DSHX 直接使用 [DeepSeek 官方 deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) 提供的智能体引擎、聊天网页和插件机制，并维护 Android 适配补丁。这些上游能力不作为 DSHX 原创成果。
+
+Android 本地运行环境的技术选型参考了 [Soodok / Deepseek-Harness-Local-Android（DSH Mobile）](https://github.com/Soodok/Deepseek-Harness-Local-Android) 的实践，包括 Android 版 Node、本机引擎、随 APK 分发运行包及 WebView 承载聊天页面。感谢该项目公开实现与验证经验。DSHX 维护自己的 Android 宿主、原生管理页面、运行包构建和系统适配；本次登记不据此宣称所有文件均为独立原创。
+
+来源记录（本地文档） 区分直接依赖、技术参考和待补证的代码来源，记录参考版本、模块对应关系及首次 Git 基线。设计参考矩阵（本地文档） 保留其他项目的设计启发；设计目标不等于已经实现的能力。参考项目的版权声明保留在 [DSH Mobile 许可原文](licenses/DSH-Mobile-LICENSE.txt)。
+
 ## 构建
 
 需要 JDK 17、Android SDK 36、NDK 28.2.13676358、Python 3.11+、Node/npm、curl、dpkg-deb、readelf 和 Node N-API 头文件。N-API 是 Node 提供给 C 扩展的稳定接口，此项目用它适配文件锁、原子文件发布，并编译官方 node-pty 终端模块。
@@ -35,6 +43,7 @@ JAVA_HOME=/usr/lib/jvm/java-17-openjdk ./gradlew :app:testDebugUnitTest \
 
 ## 文档
 
+- 来源记录（本地文档）：技术参考、依赖来源、许可边界及 Git 记录规则。
 - 本地交付记录（仅本地保留）：2026-10-21 实际完成程度、安装包、验证边界和剩余交付顺序。
 - 产品设计（本地文档）：移植目标、首次使用和交互。
 - 本地实施计划（仅本地保留） · 本地计划摘要（仅本地保留）：V1-A/B/C 的阶段和证据要求。
