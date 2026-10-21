@@ -1,0 +1,176 @@
+{
+  "arm64-v8a": {
+    "ca-certificates": {
+      "version": "1:2026.10.20",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/c/ca-certificates/ca-certificates_1:2026.10.20_all.deb",
+      "sha256": "2186ab9752ae1e705eea6fd69af0c114715b7a1b2a0b4d239ae59371b6001984"
+    },
+    "nodejs-lts": {
+      "version": "24.18.0-1",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/n/nodejs-lts/nodejs-lts_24.18.0-1_aarch64.deb",
+      "sha256": "490f4d08c45b25a7ea7db6ee466ebb3ee61f07083260b85332704ed018f59a87"
+    },
+    "zlib": {
+      "version": "1.3.2",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/z/zlib/zlib_1.3.2_aarch64.deb",
+      "sha256": "75e7d0af17fcc3b40004309fdc00a1ddb9ae08346dce5e269902c34ac3966ac9"
+    },
+    "libsqlite": {
+      "version": "3.54.1",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/libs/libsqlite/libsqlite_3.54.1_aarch64.deb",
+      "sha256": "0856cac8cc87f6e112f2eef4fcac6ad5cb08209ecb7cc260f997874fc186a3c0"
+    },
+    "libicu": {
+      "version": "78.3",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/libi/libicu/libicu_78.3_aarch64.deb",
+      "sha256": "f536403f65a08fe0df6e7304184e902d54def77d5c3bd5edfd9109d57601d276"
+    },
+    "libc++": {
+      "version": "30",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/libc/libc++/libc++_30_aarch64.deb",
+      "sha256": "53d0b84a7ba7459024257cb94d5b136fe13ef858567f65a8064b35950799f2ca"
+    },
+    "c-ares": {
+      "version": "1.34.9",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/c/c-ares/c-ares_1.34.9_aarch64.deb",
+      "sha256": "623d84855e176f3f2a415d24c0e1d2f529356f4b5439bb3313e6d7ff0da4585c"
+    },
+    "resolv-conf": {
+      "version": "1.3",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/r/resolv-conf/resolv-conf_1.3_aarch64.deb",
+      "sha256": "ab541abac8e0c81709cd7ca4a02bcfa0d60ba1f4bfe7fd6dce4a694a4a9dfffa"
+    },
+    "openssl": {
+      "version": "1:3.6.5",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/o/openssl/openssl_1:3.6.5_aarch64.deb",
+      "sha256": "a2fb7856875e63ef6b90442752e05974813372c3ca86d2513a78ea43c67a0f8b"
+    },
+    "termux-licenses": {
+      "version": "2.2",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/t/termux-licenses/termux-licenses_2.2_all.deb",
+      "sha256": "a3265cd1cf7d04754f2fb683eaf5b21918263792fd714457127900c1d6d9bcd9"
+    },
+    "bash": {
+      "version": "5.3.20",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/b/bash/bash_5.3.20_aarch64.deb",
+      "sha256": "26b5b3ab5b0ac0e3b372ac1e7ddd89270519c1eb25b88fe4175485c2de8086b2"
+    },
+    "libandroid-support": {
+      "version": "29-1",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/liba/libandroid-support/libandroid-support_29-1_aarch64.deb",
+      "sha256": "f2f145d6135ad4843ac9670153be3e3944dc1e6f1736d46d2306c28f2b86f517"
+    },
+    "libiconv": {
+      "version": "1.19",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/libi/libiconv/libiconv_1.19_aarch64.deb",
+      "sha256": "fe9481b1dc101c6c3552943f25435109fd522aecc615ae49594f9fbee863bb37"
+    },
+    "ncurses": {
+      "version": "6.6.20260307+really6.5.20250830",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/n/ncurses/ncurses_6.6.20260307+really6.5.20250830_aarch64.deb",
+      "sha256": "f44bbfdc3d42ec0217bffa978309390e59cea5a48a9a83226d4a496c42ad0b99"
+    },
+    "pcre2": {
+      "version": "10.49",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/p/pcre2/pcre2_10.49_aarch64.deb",
+      "sha256": "c27995e5f52b8ecc9b8b3e662eb08e49f82a18bfd3f34343936acc7b23964724"
+    },
+    "readline": {
+      "version": "8.3.6",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/r/readline/readline_8.3.6_aarch64.deb",
+      "sha256": "616cc73009bc0223f61caed8dd09455714455aa5ea5e180126e2f69c4c775136"
+    },
+    "ripgrep": {
+      "version": "15.2.0",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/r/ripgrep/ripgrep_15.2.0_aarch64.deb",
+      "sha256": "38e28bc297000517b24702568a483eca7dc3323eb6bdccc9033f031776bdcc6c"
+    }
+  },
+  "x86_64": {
+    "ca-certificates": {
+      "version": "1:2026.10.20",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/c/ca-certificates/ca-certificates_1:2026.10.20_all.deb",
+      "sha256": "2186ab9752ae1e705eea6fd69af0c114715b7a1b2a0b4d239ae59371b6001984"
+    },
+    "nodejs-lts": {
+      "version": "24.18.0-1",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/n/nodejs-lts/nodejs-lts_24.18.0-1_x86_64.deb",
+      "sha256": "2a41c61c609993a7d897fed130adf4d6debb0b30713ab85bb47c2fc8373458ba"
+    },
+    "zlib": {
+      "version": "1.3.2",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/z/zlib/zlib_1.3.2_x86_64.deb",
+      "sha256": "c61b089dd30981452f5953b2bad4c4e7857062b2abd971f87fb0aec441bc02f4"
+    },
+    "libsqlite": {
+      "version": "3.54.1",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/libs/libsqlite/libsqlite_3.54.1_x86_64.deb",
+      "sha256": "b064739a8f4f1a67c55b3edc444688f9973a6c9ba5a1d2d4cc277e5eed08e375"
+    },
+    "libicu": {
+      "version": "78.3",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/libi/libicu/libicu_78.3_x86_64.deb",
+      "sha256": "19fa8c4d828719f465d523983b1e0d833e4130bb22790104638965d97e27fe60"
+    },
+    "libc++": {
+      "version": "30",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/libc/libc++/libc++_30_x86_64.deb",
+      "sha256": "c9bcd9a8067a19c9c0e4893a72d314a2e37d6b67ce8dd05c67b9bbacad044b4f"
+    },
+    "c-ares": {
+      "version": "1.34.9",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/c/c-ares/c-ares_1.34.9_x86_64.deb",
+      "sha256": "ac96c37fcc9181d1a7095f60485457fe6c3d784a83b0e8e6e7af9b3bfceda237"
+    },
+    "resolv-conf": {
+      "version": "1.3",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/r/resolv-conf/resolv-conf_1.3_x86_64.deb",
+      "sha256": "0fcf8c5447bc5fbb0d411a47dc5c67d2aced861227e09052fc423220291a22c7"
+    },
+    "openssl": {
+      "version": "1:3.6.5",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/o/openssl/openssl_1:3.6.5_x86_64.deb",
+      "sha256": "540f144592d23d35672976e175ede1b5d8cf464f153f646df5d4e6dcd8491a15"
+    },
+    "termux-licenses": {
+      "version": "2.2",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/t/termux-licenses/termux-licenses_2.2_all.deb",
+      "sha256": "a3265cd1cf7d04754f2fb683eaf5b21918263792fd714457127900c1d6d9bcd9"
+    },
+    "bash": {
+      "version": "5.3.20",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/b/bash/bash_5.3.20_x86_64.deb",
+      "sha256": "f8c984e68269df3df2efae9f2835a9d9af381a8f80d08b34160772bc16cd0910"
+    },
+    "libandroid-support": {
+      "version": "29-1",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/liba/libandroid-support/libandroid-support_29-1_x86_64.deb",
+      "sha256": "665900760c05959ec076082a0941f05bd452f301e5a70bdfa7383fd3404d44d5"
+    },
+    "libiconv": {
+      "version": "1.19",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/libi/libiconv/libiconv_1.19_x86_64.deb",
+      "sha256": "880e9f423b448316a4951ffca3ffcd626d79538042b60ce2c3a821b9650c594c"
+    },
+    "ncurses": {
+      "version": "6.6.20260307+really6.5.20250830",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/n/ncurses/ncurses_6.6.20260307+really6.5.20250830_x86_64.deb",
+      "sha256": "3f30f53c6a41c8450d146d4d42611a44be6ba0a8de1e8bb4dc903109a5fc3ff1"
+    },
+    "pcre2": {
+      "version": "10.49",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/p/pcre2/pcre2_10.49_x86_64.deb",
+      "sha256": "4a6f66ac12565342897ce9b5cd11ba8ce6fce1fd1a91ae679c3468d7fc2ee541"
+    },
+    "readline": {
+      "version": "8.3.6",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/r/readline/readline_8.3.6_x86_64.deb",
+      "sha256": "e9684798d13ede05f785315f68d3ff739563db2abef0e73db4dc9b8e17ded368"
+    },
+    "ripgrep": {
+      "version": "15.2.0",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/r/ripgrep/ripgrep_15.2.0_x86_64.deb",
+      "sha256": "2eb50ab2e378436767975b072ce7118decf6444d6d6ed178bc89979b5f150f2a"
+    }
+  }
+}

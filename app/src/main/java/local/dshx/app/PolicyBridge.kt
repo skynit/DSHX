@@ -1,0 +1,136 @@
+package local.dshx.app
+
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.ByteArrayOutputStream
+import java.io.Closeable
+import java.io.InputStream
+import java.net.InetAddress
+import java.net.ServerSocket
+import java.net.Socket
+import java.security.MessageDigest
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Semaphore
+import kotlin.concurrent.thread
+
+/** Authenticated JSON-lines queries for the current engine and its live sessions. */
+class PolicyBridge(private val policy: ToolPolicy, val instance: String, private val lost: () -> Unit) : Closeable {
+    val token = UUID.randomUUID().toString() + UUID.randomUUID().toString()
+    private val server = ServerSocket(0, 8, InetAddress.getByName("127.0.0.1"))
+    val port get() = server.localPort
+    private val sockets = ConcurrentHashMap.newKeySet<Socket>()
+    private val slots = Semaphore(4)
+    @Volatile private var closed = false
+    @Volatile private var client: Socket? = null
+
+    fun start() {
+        thread(name = "dsh-policy-listener", isDaemon = true) {
+            while (!closed) {
+                val socket = try { server.accept() } catch (_: Exception) { break }
+                if (!slots.tryAcquire()) { socket.close(); continue }
+                val open = synchronized(this) { if (closed) false else { sockets.add(socket); true } }
+                if (!open) { socket.close(); slots.release(); continue }
+                thread(name = "dsh-policy-query", isDaemon = true) {
+                    try { serve(socket) } finally { sockets.remove(socket); runCatching { socket.close() }; slots.release() }
+                }
+            }
+        }
+    }
+
+    private fun serve(socket: Socket) {
+        var accepted = false
+        try {
+            socket.soTimeout = 3_000
+            val input = socket.getInputStream()
+            val deadline = System.nanoTime() + 3_000_000_000L
+            val hello = JSONObject(line(input) {
+                val remaining = deadline - System.nanoTime()
+                require(remaining > 0) { "握手超时" }
+                socket.soTimeout = (remaining / 1_000_000L).coerceAtLeast(1).toInt()
+            } ?: return)
+            if (hello.keys().asSequence().toSet() != setOf("version", "instance", "token") || hello.get("version") != 1 ||
+                hello.optString("instance") != instance || !MessageDigest.isEqual(
+                    token.toByteArray(Charsets.UTF_8), hello.optString("token").toByteArray(Charsets.UTF_8))) return
+            synchronized(this) {
+                if (closed || client != null) return
+                policy.connected(instance)
+                client = socket
+                accepted = true
+            }
+            socket.soTimeout = 0
+            send(socket, JSONObject().put("id", 0).put("ok", true).put("state", snapshot()))
+            while (!closed) {
+                val request = JSONObject(line(input) ?: break)
+                val id = request.get("id")
+                require(id is Number && id.toDouble() == id.toLong().toDouble() && id.toLong() in 1..9_007_199_254_740_991L)
+                val response = JSONObject().put("id", id)
+                try {
+                    val method = request.getString("method")
+                    val allowed = when (method) {
+                        "register" -> setOf("id", "method", "session", "title", "parent")
+                        else -> setOf("id", "method", "session")
+                    }
+                    require(request.keys().asSequence().all { it in allowed }) { "查询不接受额外字段" }
+                    val session = request.optString("session")
+                    when (method) {
+                        "register" -> policy.register(instance, session, request.getString("title"), if (request.isNull("parent")) null else request.getString("parent"))
+                        "mode" -> policy.mode(instance, session)
+                        "end" -> policy.end(instance, session)
+                        else -> throw IllegalArgumentException("仅支持登记、查询和结束会话")
+                    }
+                    response.put("ok", true).put("state", snapshot())
+                } catch (_: Exception) {
+                    response.put("ok", false).put("error", "会话查询无效或不支持；不能通过连接修改权限。")
+                }
+                send(socket, response)
+            }
+        } catch (_: Exception) {
+            // No authentication material or raw request is written to diagnostics.
+        } finally {
+            if (accepted) {
+                val notify = synchronized(this) {
+                    if (!closed && client === socket) { closed = true; client = null; true } else false
+                }
+                if (notify) { release(); lost() }
+            }
+        }
+    }
+
+    private fun snapshot(): JSONObject {
+        val state = policy.state
+        return JSONObject().put("instance", state.instance).put("revision", state.revision).put("connected", state.connected)
+            .put("sessions", JSONArray(state.sessions.map { row ->
+                JSONObject().put("id", row.id).put("title", row.title).put("root", row.root).put("mode", row.mode)
+            }))
+    }
+
+    private fun send(socket: Socket, value: JSONObject) = synchronized(socket) {
+        socket.getOutputStream().apply { write((value.toString() + "\n").toByteArray(Charsets.UTF_8)); flush() }
+    }
+
+    override fun close() {
+        synchronized(this) { closed = true; client = null }
+        release()
+    }
+
+    private fun release() {
+        runCatching { server.close() }
+        sockets.forEach { runCatching { it.close() } }
+        policy.disconnect(instance)
+    }
+
+    companion object {
+        private fun line(input: InputStream, beforeRead: (() -> Unit)? = null): String? {
+            val bytes = ByteArrayOutputStream()
+            while (bytes.size() <= 8_192) {
+                beforeRead?.invoke()
+                val value = input.read()
+                if (value == -1) { require(bytes.size() == 0); return null }
+                if (value == 10) return bytes.toString("UTF-8")
+                bytes.write(value)
+            }
+            throw IllegalArgumentException("查询消息过长")
+        }
+    }
+}

@@ -1,0 +1,48 @@
+/* Android layout for the pinned official dsh page. Use its semantic slots
+   instead of generated class names; editor state and actions stay upstream. */
+@media (orientation: landscape) and (max-height: 240px) {
+    [data-slot="conversation.header"] > header,
+    [data-composer-dock] {
+        display: none;
+    }
+
+    [data-composer-seat] {
+        --dsh-composer-text-max-height: max(36px, calc(100dvh - 72px));
+    }
+}
+
+/* With a tall keyboard, place text beside the existing controls so a full
+   attachment rail, the current draft and Send can remain visible together. */
+@media (orientation: landscape) and (max-height: 160px) {
+    [data-composer-card] {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 4px;
+        padding: 2px 8px;
+    }
+
+    [data-slot="conversation.input.attachments"] > * {
+        grid-column: 1 / -1;
+        grid-row: 1;
+        margin: 0;
+        padding: 0;
+    }
+
+    [data-input-scroll] {
+        grid-column: 1;
+        grid-row: 2;
+        min-width: 0;
+        max-height: 42px;
+        margin: 0;
+    }
+
+    [data-composer-card] > :has([data-slot="conversation.input.model"]) {
+        grid-column: 2;
+        grid-row: 2;
+        padding: 0;
+        flex-wrap: nowrap;
+        /* Upstream inline-size containment otherwise reports zero intrinsic
+           width to the grid and pushes the controls outside the viewport. */
+        container-type: normal;
+    }
+}

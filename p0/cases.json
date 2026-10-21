@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "product_design": "2.4",
+  "prototype_version": "0.0.1-p0",
+  "T1": {
+    "status": "prototype-ready-user-study-pending",
+    "task": "从周会 Markdown 副本提取未完成事项，检查原文行号并另存为新文件",
+    "input": "prototype/src/main/assets/meeting.md",
+    "input_sha256": "84a66d1adce474cf2f8fc3d66ba51417214dfdc00a1e43f8675851eb8afb3711",
+    "expected": "prototype/src/main/assets/expected.md",
+    "expected_sha256": "339a79a4c6432ed3e88f8a174e65b342cc8274cf452d224df247642783be1350",
+    "execution": "deterministic-local-demo-no-model",
+    "external_success_evidence": "在另一个应用打开导出的文件并核对全文；尚未执行"
+  },
+  "T2": [
+    {
+      "id": "T2-1",
+      "status": "pending-selection",
+      "package": null,
+      "version": null,
+      "task": null,
+      "input": null,
+      "success_evidence": null,
+      "rejection_conditions": null
+    },
+    {
+      "id": "T2-2",
+      "status": "pending-selection",
+      "package": null,
+      "version": null,
+      "task": null,
+      "input": null,
+      "success_evidence": null,
+      "rejection_conditions": null
+    },
+    {
+      "id": "T2-3",
+      "status": "pending-selection",
+      "package": null,
+      "version": null,
+      "task": null,
+      "input": null,
+      "success_evidence": null,
+      "rejection_conditions": null
+    }
+  ],
+  "T3": {
+    "status": "pending-selection",
+    "package": null,
+    "version": null,
+    "dependency_lock": null,
+    "input": null,
+    "expected": null,
+    "review_evidence": null
+  },
+  "G0_user_study": {
+    "status": "not-run",
+    "participants": []
+  },
+  "G1_G6": {
+    "status": "not-run",
+    "note": "原型构建、JVM 测试和渲染不能替代 Android 真机 Gate"
+  },
+  "R1": {
+    "status": "not-run",
+    "participants": []
+  }
+}

@@ -1,0 +1,27 @@
+# local scratch
+.analysis-tmp/
+*.tmp
+*.bak
+.DS_Store
+
+# editor
+.idea/
+.vscode/
+
+# build artifacts (future implementation)
+build/
+.gradle/
+local.properties
+*.apk
+*.aab
+*.keystore
+*.jks
+node_modules/
+core/cache/
+app/src/main/assets/core.zip
+app/src/main/assets/core.json
+app/src/main/assets/core-info.json
+
+# python
+__pycache__/
+*.pyc

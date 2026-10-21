@@ -1,0 +1,28 @@
+- id: session-telemetry-otel
+  disabled: true
+- id: desktop-product-telemetry
+  disabled: true
+- id: product-analytics
+  disabled: true
+- id: fs-sandbox
+  disabled: true
+- id: sandbox-policy
+  config:
+    mode: danger-full-access
+- id: approval
+  config:
+    policy: never
+- id: permission
+  config:
+    defaultPreset: danger-full-access
+    presets:
+      danger-full-access:
+        sandbox: danger-full-access
+        approval: never
+- id: ui-permission
+  disabled: true
+- insert:
+    - id: dshx-android-files
+      name: 'file:@CORE@/files.mjs'
+    - id: dshx-android-guard
+      name: 'file:@CORE@/guard.mjs'
