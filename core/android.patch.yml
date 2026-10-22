@@ -21,8 +21,12 @@
         approval: never
 - id: ui-permission
   disabled: true
+- id: office-to-pdf
+  disabled: true
 - insert:
     - id: dshx-android-files
       name: 'file:@CORE@/files.mjs'
     - id: dshx-android-guard
       name: 'file:@CORE@/guard.mjs'
+    - id: dshx-android-phone
+      name: 'file:@CORE@/phone.mjs'

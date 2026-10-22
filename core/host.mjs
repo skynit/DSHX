@@ -1,6 +1,6 @@
 import { createConnection } from 'node:net';
 
-// One authenticated, query-only connection to the native instance. Losing it
+// One authenticated connection to the native instance. Losing it
 // clears every cached policy; reconnecting requires a new engine instance.
 export class PolicyHost {
   constructor({ port, instance, token } = {}) {
@@ -32,7 +32,7 @@ export class PolicyHost {
     this.socket.setEncoding('utf8');
     this.socket.on('data', chunk => {
       buffer += chunk;
-      if (Buffer.byteLength(buffer) > 65536) return this.fail();
+      if (Buffer.byteLength(buffer) > 4 * 1024 * 1024) return this.fail();
       let newline;
       while ((newline = buffer.indexOf('\n')) !== -1) {
         const line = buffer.slice(0, newline);
@@ -58,8 +58,9 @@ export class PolicyHost {
     if (!message.ok) {
       if (!pending) throw new Error('原生握手被拒绝。');
       clearTimeout(pending.timer);
+      pending.cleanup?.();
       this.pending.delete(message.id);
-      pending.reject(new Error('原生会话查询被拒绝，会话可能已结束。'));
+      pending.reject(new Error(pending.phone ? message.error || '手机操作失败，请重新观察界面。' : '原生会话查询被拒绝，会话可能已结束。'));
       return;
     }
     const state = message.state;
@@ -79,19 +80,30 @@ export class PolicyHost {
       this.resolveReady();
     } else {
       clearTimeout(pending.timer);
+      pending.cleanup?.();
       this.pending.delete(message.id);
-      pending.resolve();
+      pending.resolve(message.result);
     }
   }
 
-  async query(method, data) {
+  async query(method, data, signal) {
+    signal?.throwIfAborted();
     await this.connect();
+    signal?.throwIfAborted();
     if (this.failure || !this.connected) throw this.failure ?? new Error('原生工具权限连接不可用。');
     const id = ++this.sequence;
-    await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => this.fail(), 3000);
-      this.pending.set(id, { resolve, reject, timer });
+    return new Promise((resolve, reject) => {
+      const phone = method === 'phone';
+      const timer = setTimeout(() => this.fail(), phone ? (data.action === 'ask' ? 65000 : 25000) : 3000);
+      const abort = () => {
+        reject(new Error('手机操作已取消；已发出的动作结果需重新观察，不能自动重试。' +
+          (data.action === 'export' ? '导出可能已开始，授权目录可能残留不完整文件，请检查。' : '')));
+        this.query('phone-cancel', { session: data.session, call: id }).catch(() => {});
+      };
+      this.pending.set(id, { resolve, reject, timer, phone, cleanup: () => signal?.removeEventListener('abort', abort) });
       this.send({ id, method, ...data });
+      signal?.addEventListener('abort', abort, { once: true });
+      if (signal?.aborted) abort();
     });
   }
 
@@ -106,7 +118,7 @@ export class PolicyHost {
     this.sessions.clear();
     clearTimeout(this.timer);
     this.rejectReady?.(this.failure);
-    for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(this.failure); }
+    for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.cleanup?.(); pending.reject(this.failure); }
     this.pending.clear();
     this.socket?.destroy();
   }
@@ -129,6 +141,15 @@ export class PolicyHost {
 
   async end(session) {
     if (this.configured) await this.query('end', { session });
+  }
+
+  async finishPhone(session) {
+    if (this.configured) await this.query('phone-finish', { session });
+  }
+
+  async phone(action, args, session, signal) {
+    if (!this.configured || typeof session !== 'string' || !session) throw new Error('手机操作需要当前原生会话连接。');
+    return this.query('phone', { action, args, session }, signal);
   }
 
   close() { this.fail(); }

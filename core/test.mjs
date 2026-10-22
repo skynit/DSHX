@@ -2,7 +2,7 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { mkdtemp, open, writeFile, readFile, rm, link, stat, mkdir, symlink, rename, chmod, realpath } from 'node:fs/promises';
+import { mkdtemp, open, writeFile, readFile, readdir, rm, link, stat, mkdir, symlink, rename, chmod, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
@@ -19,6 +19,7 @@ const require = createRequire(join(core, 'lib/node_modules/package.json'));
 const native = require(join(core, 'native.node'));
 const { runTool, inFileTool } = await import(pathToFileURL(join(core, 'policy.mjs')));
 const { PolicyHost } = await import(pathToFileURL(join(core, 'host.mjs')));
+const { callPhone, phoneContent } = await import(pathToFileURL(join(core, 'phone.mjs')));
 const load = name => import(pathToFileURL(require.resolve(name)));
 const directory = await mkdtemp(join(tmpdir(), 'dshx-native-test-'));
 after(() => rm(directory, { recursive: true, force: true }));
@@ -118,6 +119,24 @@ test('Android assistant usage distinguishes missing zero cancelled thrown and ea
   assert.equal(rows.some(row => row.id === starts[0].id && row.event === 'usage'), false);
   assert.deepEqual(rows.find(row => row.id === starts[1].id && row.event === 'usage').usage, { inputTokens: 0, outputTokens: 0 });
   assert.deepEqual(rows.find(row => row.id === starts[3].id && row.event === 'usage').usage, { inputTokens: 2, outputTokens: 1 });
+});
+
+test('Android assistant final usage requires a provider terminal report even when zeros match', async () => {
+  const { usageStream, modelFetch, reportProviderUsage } = await import(pathToFileURL(join(core, 'assistant.mjs')));
+  const dir = await mkdtemp(join(directory, 'assistant-final-'));
+  for (const final of [false, true]) {
+    for await (const _ of usageStream({ provider: 'fixture', model: 'single' }, async function* () {
+      await modelFetch('data:application/json,{}');
+      reportProviderUsage({ inputTokens: 2, outputTokens: 0 });
+      if (final) reportProviderUsage({ inputTokens: 2, outputTokens: 0 }, true);
+      yield { type: 'usage', usage: { inputTokens: 2, outputTokens: 0 } };
+      yield { type: 'finish', reason: { kind: final ? 'stop' : 'aborted' } };
+    }, dir, true)) {}
+  }
+  const rows = (await readFile(join(dir, 'usage.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+  assert.deepEqual(rows.filter(row => row.event === 'usage').map(row => row.usageFinal), [false, false, true]);
+  assert.deepEqual(rows.filter(row => row.event === 'finish').map(row => row.usageFinal), [false, true]);
+  assert.ok(rows.filter(row => row.event === 'usage').every(row => row.usage.outputTokens === 0 && row.usage.totalTokens === undefined));
 });
 
 test('Android assistant actual LLM boundary records retries prepared title and compaction separately', async () => {
@@ -316,6 +335,8 @@ test('Android assistant real DeepSeek preserves message_start and partial delta 
   assert.equal(starts.length, fixture.requests.length);
   assert.ok(starts.every(row => row.dispatch === 'http-request' && row.purpose === 'other'));
   assert.deepEqual(rows.filter(row => row.event === 'finish').map(row => row.outcome), ['success', 'failed', 'cancelled']);
+  assert.deepEqual(rows.filter(row => row.event === 'finish').map(row => row.usageFinal), [true, false, false]);
+  assert.equal(rows.find(row => row.event === 'usage').usageFinal, false);
   assert.deepEqual(rows.filter(row => row.id === starts[1].id && row.event === 'usage').map(row => row.usage), [
     { inputTokens: 11, outputTokens: 0, cacheReadTokens: 3 },
     { inputTokens: 11, outputTokens: 0, cacheReadTokens: 3, cacheWriteTokens: 0 }
@@ -974,11 +995,12 @@ test('Android plugin actual loader starts stops reloads and restores a failing b
   } finally { clearTimeout(timeout); if (child.exitCode === null) child.kill('SIGKILL'); }
 });
 
-// The fixture imitates the query-only wire protocol. Kotlin's real authority
+// The fixture imitates the native wire protocol. Kotlin's real authority
 // and native-only mode changes are exercised separately in CoreTest.kt.
-async function policyServer() {
+async function policyServer({ phone } = {}) {
   const sockets = new Set();
   const sessions = new Map();
+  const requests = [];
   let revision = 1;
   const server = createServer(socket => {
     sockets.add(socket);
@@ -992,6 +1014,7 @@ async function policyServer() {
       while ((newline = buffer.indexOf('\n')) !== -1) {
         const request = JSON.parse(buffer.slice(0, newline));
         buffer = buffer.slice(newline + 1);
+        requests.push(request);
         if (request.version !== undefined && (request.token !== 'test-token' || request.instance !== 'test-instance')) {
           socket.destroy(); return;
         }
@@ -1002,19 +1025,1070 @@ async function policyServer() {
         }
         if (request.method === 'end') { sessions.delete(request.session); revision++; }
         if (request.method === 'mode' && request.session === 'lost-session') { socket.destroy(); return; }
+        const respond = (response = {}) => {
+          const ok = response.ok ?? true;
+          socket.write(JSON.stringify({ id: request.id ?? 0, ok, ...(ok ? { state: {
+            instance: 'test-instance', connected: true, revision, sessions: [...sessions.values()]
+          } } : {}), ...response }) + '\n');
+        };
+        if (phone && ['phone', 'phone-cancel'].includes(request.method)) {
+          phone(request, respond);
+          continue;
+        }
         const ok = request.method !== 'mode' || sessions.has(request.session) && request.session !== 'denied-session';
-        socket.write(JSON.stringify({ id: request.id ?? 0, ok, ...(ok ? { state: {
-          instance: 'test-instance', connected: true, revision, sessions: [...sessions.values()]
-        } } : { error: 'unknown session' }) }) + '\n');
+        respond(ok ? {} : { ok: false, error: 'unknown session' });
       }
     });
   });
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
   return {
     config: { port: server.address().port, instance: 'test-instance', token: 'test-token' },
+    requests,
     close: async () => { for (const socket of sockets) socket.destroy(); await new Promise(resolve => server.close(resolve)); }
   };
 }
+
+test('phone actions share one request usage without double counting and link subsequent result input', async () => {
+  const { Context } = await load('@deepseek-ai/cordis');
+  const { default: SystemPrompt } = await load('@deepseek-ai/dsh-system-prompt');
+  const { default: Tools, defineTool } = await load('@deepseek-ai/dsh-tools');
+  const { default: LlmRuntime, LlmAdapter, markAgentLoopRequest } = await load('@deepseek-ai/dsh-llm');
+  const { trackActions, forgetActions } = await import(pathToFileURL(join(core, 'assistant.mjs')));
+  const { policyHost } = await import(pathToFileURL(join(core, 'host.mjs')));
+  const dir = await mkdtemp(join(directory, 'action-shared-'));
+  const previousDirectory = process.env.DSHX_ASSISTANT_DIR;
+  const previousMode = policyHost.cachedMode;
+  process.env.DSHX_ASSISTANT_DIR = dir;
+  policyHost.cachedMode = () => 'full';
+  const ctx = new Context();
+  const usage = { inputTokens: 20, outputTokens: 8, cacheReadTokens: 3, reasoningTokens: 2 };
+  class Adapter extends LlmAdapter {
+    async *stream(options) {
+      if (!options.messages.length) for (const [index, name] of ['phone_observe', 'phone_screenshot'].entries()) {
+        const id = `call-${index}`;
+        yield { type: 'tool-call-delta', index, id: '', name, argumentsDelta: '' };
+        yield { type: 'tool-call-delta', index, id, name, argumentsDelta: '{"private":"never log"}' };
+        yield { type: 'block-end', index, block: { type: 'tool-call', id, name, arguments: '{}' } };
+      }
+      yield { type: 'usage', usage };
+      yield { type: 'usage', usage };
+      yield { type: 'finish', reason: { kind: options.messages.length ? 'stop' : 'tool-calls' } };
+    }
+  }
+  try {
+    await ctx.plugin(SystemPrompt);
+    await ctx.plugin(Tools);
+    await ctx.plugin(LlmRuntime);
+    trackActions(ctx);
+    ctx.llm.registerAdapter(['fixture'], new Adapter());
+    for (const name of ['phone_observe', 'phone_screenshot']) ctx.tools.register(defineTool({
+      name, description: 'fixture', parameters: {},
+      output: { schema: { type: 'object', additionalProperties: true }, render: () => [{ type: 'text', text: 'private result' }] },
+      execute: async () => name === 'phone_observe'
+        ? { ok: true, execution_state: 'completed', nodes: [{ text: 'private screen' }], truncated: true }
+        : { ok: true, image: { bytes: 120, width: 12, height: 8 } },
+    }));
+    const promptBefore = await ctx.systemPrompt.assemble();
+    const options = { provider: 'fixture', model: 'single', sessionId: 'shared-session', messages: [] };
+    for await (const _ of ctx.llm.stream(markAgentLoopRequest(options))) {}
+    const agent = { session: { id: options.sessionId } };
+    for (const [index, name] of ['phone_observe', 'phone_screenshot'].entries()) {
+      const result = await ctx.tools.execute({ name, callId: `call-${index}`, arguments: {}, agent, signal: new AbortController().signal });
+      assert.equal(result.isError, false, JSON.stringify(result));
+    }
+    for await (const _ of ctx.llm.stream(markAgentLoopRequest({ ...options,
+      messages: ['call-0', 'call-1'].map(toolCallId => ({ role: 'tool', toolCallId, content: [{ type: 'text', text: 'private tool content' }] })),
+    }))) {}
+    const text = await readFile(join(dir, 'actions.jsonl'), 'utf8');
+    assert.doesNotMatch(text, /private|never log|arguments|content/);
+    const rows = text.trim().split('\n').map(JSON.parse);
+    const plans = rows.filter(row => row.event === 'action-plan');
+    const ends = rows.filter(row => row.event === 'action-finish');
+    assert.equal(plans.length, 2, 'delta and complete block must not duplicate the plan');
+    assert.equal(ends.length, 2);
+    assert.equal(new Set(ends.map(row => row.requestId)).size, 1);
+    assert.equal(new Set(ends.map(row => row.id)).size, 2);
+    assert.deepEqual(ends.map(row => row.source), ['component-tree', 'screenshot']);
+    assert.ok(ends.every(row => row.requestActionCount === 2 && row.tokenScope === 'model-request' && row.usageStatus === 'reported' && row.usageSource === 'adapter'));
+    assert.ok(ends.every(row => row.dispatchReached && row.durationMs >= 0 && row.outcome === 'success'));
+    assert.deepEqual(ends.map(row => row.requestUsage), [usage, usage]);
+    assert.ok(ends.every(row => row.usageFinal === true));
+    assert.equal(ends[0].nodeCount, 1);
+    assert.equal(ends[0].treeTruncated, true);
+    assert.deepEqual([ends[1].bytes, ends[1].width, ends[1].height], [120, 12, 8]);
+    const requests = (await readFile(join(dir, 'usage.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+    const starts = requests.filter(row => row.event === 'start');
+    assert.equal(starts.length, 2);
+    assert.equal(ends[0].requestId, starts[0].id);
+    assert.deepEqual(starts[1].toolResultCallIds, ['call-0', 'call-1']);
+    assert.equal(requests.filter(row => row.event === 'usage').length, 2);
+    assert.deepEqual(await ctx.systemPrompt.assemble(), promptBefore, 'action statistics must not update model prompts');
+    assert.deepEqual(options.messages, [], 'accounting must not inject metadata into model context');
+  } finally {
+    forgetActions('shared-session', dir);
+    policyHost.cachedMode = previousMode;
+    if (previousDirectory === undefined) delete process.env.DSHX_ASSISTANT_DIR;
+    else process.env.DSHX_ASSISTANT_DIR = previousDirectory;
+    await ctx.fiber.dispose();
+  }
+});
+
+test('phone actions link real provider usage to the successful HTTP request after a failed send', async t => {
+  const { trackActions, forgetActions } = await import(pathToFileURL(join(core, 'assistant.mjs')));
+  const { markAgentLoopRequest } = await load('@deepseek-ai/dsh-llm');
+  let sends = 0;
+  const fixture = await assistantServer(t, (_request, response) => {
+    if (++sends === 1) { response.writeHead(503); response.end('{"error":{"message":"private failure"}}'); return; }
+    assistantEvents(response, [
+      { type: 'message_start', message: { id: 'fixture-message', model: 'single', usage: { input_tokens: 11, cache_read_input_tokens: 3 } } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'provider-call', name: 'phone_observe', input: {} } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{}' } },
+      { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 5 } },
+      { type: 'message_stop' },
+    ]);
+  });
+  const options = markAgentLoopRequest(await assistantDeepSeek(fixture));
+  t.after(() => forgetActions(options.sessionId, fixture.dir));
+  const handlers = new Map();
+  trackActions({ on: (name, handler) => handlers.set(name, handler), effect() {} }, fixture.dir);
+  assert.equal((await fixture.collect(fixture.ctx.llm.stream(options))).at(-1).reason.kind, 'error');
+  assert.equal((await fixture.collect(fixture.ctx.llm.stream(options))).at(-1).reason.kind, 'tool-calls');
+  const exec = { token: Symbol(), callId: 'provider-call', name: 'phone_observe', agent: { session: { id: options.sessionId } } };
+  handlers.get('tools/pre-execute')(exec, () => {});
+  handlers.get('tools/result')(exec, { isError: false, value: { ok: true, nodes: [] } });
+  const rows = (await readFile(join(fixture.dir, 'actions.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+  const end = rows.find(row => row.event === 'action-finish');
+  const requests = await fixture.rows();
+  const starts = requests.filter(row => row.event === 'start');
+  assert.equal(starts.length, 2);
+  assert.ok(starts.every(row => row.dispatch === 'http-request'));
+  assert.equal(end.requestId, starts[1].id);
+  assert.equal(end.usageSource, 'provider');
+  assert.deepEqual(end.requestUsage, { inputTokens: 11, cacheReadTokens: 3, outputTokens: 5 });
+  assert.equal(end.requestActionCount, 1);
+  assert.doesNotMatch(await readFile(join(fixture.dir, 'actions.jsonl'), 'utf8'), /private|fixture-private-key/);
+});
+
+test('phone actions isolate concurrent sessions retries missing usage and late manual calls', async () => {
+  const { usageStream, trackActions, forgetActions } = await import(pathToFileURL(join(core, 'assistant.mjs')));
+  const dir = await mkdtemp(join(directory, 'action-sessions-'));
+  const handlers = new Map();
+  trackActions({ on: (name, handler) => handlers.set(name, handler), effect() {} }, dir);
+  const stream = async (sessionId, usage, outcome = 'tool-calls') => {
+    for await (const _ of usageStream({ provider: 'fixture', model: 'single', sessionId, purpose: 'conversation' }, async function* () {
+      await delay(1);
+      yield { type: 'block-end', block: { type: 'tool-call', id: 'reused-call', name: 'phone_click', arguments: '{"private":"input"}' } };
+      if (usage) yield { type: 'usage', usage };
+      yield { type: 'finish', reason: { kind: outcome } };
+    }, dir)) {}
+  };
+  const result = (sessionId, nested = false) => {
+    const exec = { token: Symbol(), callId: nested ? 'child-call' : 'reused-call', rootCallId: 'reused-call',
+      name: nested ? 'read' : 'phone_click', agent: { session: { id: sessionId } } };
+    handlers.get('tools/pre-execute')(exec, () => {});
+    handlers.get('tools/result')(exec, { isError: false, value: { ok: true } });
+  };
+  try {
+    await Promise.all([stream('one', { inputTokens: 0, outputTokens: 0 }), stream('two', { outputTokens: 7 })]);
+    result('one'); result('two'); result('two', true);
+    await stream('one', undefined); result('one');
+    await stream('one', { inputTokens: 99 }, 'error'); result('one');
+    forgetActions('two', dir); result('two');
+    const rows = (await readFile(join(dir, 'actions.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+    const ends = rows.filter(row => row.event === 'action-finish');
+    assert.deepEqual(ends.map(row => row.requestUsage), [{ inputTokens: 0, outputTokens: 0 }, { outputTokens: 7 }, { outputTokens: 7 }, null, null, null]);
+    assert.deepEqual(ends.map(row => row.usageStatus), ['reported', 'partial', 'partial', 'unknown', 'unknown', 'unknown']);
+    assert.notEqual(ends[0].requestId, ends[1].requestId);
+    assert.equal(ends[1].requestId, ends[2].requestId, 'nested tools inherit the root decision request');
+    assert.equal(ends[2].tool, 'read');
+    assert.equal(ends[2].rootCallId, 'reused-call');
+    assert.notEqual(ends[0].requestId, ends[3].requestId);
+    assert.equal(ends[4].requestId, null, 'failed attempts must not own a later action');
+    assert.equal(ends[5].requestId, null, 'idle/disposal must clear old plans');
+    const plans = rows.filter(row => row.event === 'action-plan');
+    assert.equal(plans.at(-1).requestOutcome, 'failed');
+    assert.deepEqual(plans.at(-1).requestUsage, { inputTokens: 99 });
+  } finally { forgetActions('one', dir); forgetActions('two', dir); }
+});
+
+test('phone actions record native failure unknown cancellation and final policy rejection without replay', async () => {
+  const { Context } = await load('@deepseek-ai/cordis');
+  const { default: SystemPrompt } = await load('@deepseek-ai/dsh-system-prompt');
+  const { default: Tools, defineTool } = await load('@deepseek-ai/dsh-tools');
+  const { trackActions } = await import(pathToFileURL(join(core, 'assistant.mjs')));
+  const { policyHost } = await import(pathToFileURL(join(core, 'host.mjs')));
+  const original = policyHost.cachedMode;
+  policyHost.cachedMode = () => 'full';
+  const ctx = new Context();
+  const dir = await mkdtemp(join(directory, 'action-outcomes-'));
+  let bodies = 0;
+  try {
+    await ctx.plugin(SystemPrompt);
+    await ctx.plugin(Tools);
+    trackActions(ctx, dir);
+    ctx.tools.register(defineTool({
+      name: 'phone_click', description: 'fixture', parameters: {},
+      output: { schema: { type: 'object', additionalProperties: true }, render: () => [] },
+      execute: async (_args, exec) => {
+        bodies++;
+        if (exec.callId === 'throw') throw new Error('private failure details');
+        return exec.callId === 'unknown' ? { ok: false, execution_state: 'unknown', code: 'cancelled' }
+          : exec.callId === 'native' ? { ok: false, execution_state: 'not_started', code: 'stale_snapshot' } : { ok: true };
+      },
+    }));
+    ctx.tools.guard(exec => exec.callId === 'denied' ? 'private guard reason' : undefined);
+    ctx.on('tools/pre-execute', (exec, next) => exec.callId === 'policy-cancel' ? { kind: 'cancel' } : next());
+    ctx.on('tools/post-execute', (exec, _result, next) => exec.callId === 'post'
+      ? { kind: 'block', feedback: [{ type: 'text', text: 'private post reason' }] } : next());
+    for (const callId of ['native', 'unknown', 'throw', 'denied', 'cancelled', 'policy-cancel', 'post']) {
+      const controller = new AbortController();
+      if (callId === 'cancelled') controller.abort();
+      const result = await ctx.tools.execute({ name: 'phone_click', callId, arguments: {}, signal: controller.signal });
+      if (callId === 'policy-cancel') {
+        assert.equal(controller.signal.aborted, false);
+        assert.equal(result.error?.info?.code, 'ABORTED_BEFORE_DISPATCH');
+      }
+      if (callId === 'post') {
+        assert.equal(result.isError, true);
+        assert.deepEqual(result.content, [{ type: 'text', text: 'private post reason' }]);
+        assert.equal(result.error.message, 'private post reason');
+      }
+    }
+    const text = await readFile(join(dir, 'actions.jsonl'), 'utf8');
+    assert.doesNotMatch(text, /private/);
+    const rows = text.trim().split('\n').map(JSON.parse);
+    const ends = rows.filter(row => row.event === 'action-finish');
+    assert.equal(ends.length, 7);
+    assert.deepEqual(ends.map(row => row.outcome), ['failed', 'unknown', 'failed', 'failed', 'cancelled', 'cancelled', 'failed']);
+    assert.equal(ends[0].code, 'stale_snapshot');
+    assert.equal(ends[1].executionState, 'unknown');
+    assert.equal(ends[3].dispatchReached, false);
+    assert.equal(ends[4].dispatchReached, false);
+    assert.equal(ends[4].code, 'ABORTED_BEFORE_DISPATCH');
+    assert.equal(ends[5].dispatchReached, false);
+    assert.equal(ends[5].code, 'ABORTED_BEFORE_DISPATCH');
+    assert.ok(ends.every(row => row.requestId === null && row.requestUsage === null));
+    assert.equal(bodies, 4, 'recording must never replay a tool');
+    assert.equal(rows.filter(row => row.event === 'action-start').length, 7);
+    assert.equal((await stat(join(dir, 'actions.jsonl'))).mode & 0o777, 0o600);
+  } finally { policyHost.cachedMode = original; await ctx.fiber.dispose(); }
+});
+
+test('phone actions record queued cancellations from the real agent scheduler once outside model context', async () => {
+  const { Context } = await load('@deepseek-ai/cordis');
+  const { default: SystemPrompt } = await load('@deepseek-ai/dsh-system-prompt');
+  const { default: Tools, defineTool } = await load('@deepseek-ai/dsh-tools');
+  const { default: LlmRuntime, LlmAdapter, createUserMessage } = await load('@deepseek-ai/dsh-llm');
+  const { default: Agents } = await load('@deepseek-ai/dsh-agent');
+  const { default: Sessions } = await load('@deepseek-ai/dsh-session');
+  const { default: Projections } = await load('@deepseek-ai/dsh-session-projection');
+  const { default: AgentLoop } = await load('@deepseek-ai/dsh-agent-loop');
+  const { trackActions, forgetActions } = await import(pathToFileURL(join(core, 'assistant.mjs')));
+  const { policyHost } = await import(pathToFileURL(join(core, 'host.mjs')));
+  const dir = await mkdtemp(join(directory, 'action-queued-'));
+  const previousDirectory = process.env.DSHX_ASSISTANT_DIR;
+  const previousMode = policyHost.cachedMode;
+  process.env.DSHX_ASSISTANT_DIR = dir;
+  policyHost.cachedMode = () => 'full';
+  const ctx = new Context();
+  let bodies = 0;
+  class Adapter extends LlmAdapter {
+    async *stream() {
+      for (let index = 0; index < 2; index++) {
+        yield { type: 'tool-call-delta', index, id: '', name: 'phone_click', argumentsDelta: '' };
+        yield { type: 'tool-call-delta', index, id: `queued-${index}`, argumentsDelta: '{}' };
+      }
+      yield { type: 'usage', usage: { inputTokens: 9, outputTokens: 4 } };
+      yield { type: 'finish', reason: { kind: 'tool-calls' } };
+    }
+  }
+  try {
+    for (const plugin of [SystemPrompt, Tools, LlmRuntime, Agents, Sessions, Projections]) await ctx.plugin(plugin);
+    await ctx.plugin(AgentLoop, { agents: [], maxParallelToolCalls: 1 });
+    trackActions(ctx);
+    ctx.llm.registerAdapter(['fixture'], new Adapter());
+    ctx.tools.register(defineTool({
+      name: 'phone_click', description: 'fixture', parameters: {},
+      output: { schema: { type: 'object', additionalProperties: true }, render: () => [] },
+      execute: async (_args, exec) => { bodies++; exec.agent.cancel({ kind: 'user' }); return { ok: true }; },
+    }));
+    const events = [];
+    ctx.on('session/event', (session, event) => { if (session.id === 'queued-session') events.push(event); });
+    const agent = await ctx.agentLoop.create('queued-session', { provider: 'fixture', model: 'single' });
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'private request' }], source: { kind: 'user' } }));
+    await agent.whenIdle();
+    const results = events.filter(event => event.type === 'tool/result');
+    assert.equal(results.length, 2, `the scheduler must resolve both model calls: ${JSON.stringify(events)}`);
+    assert.equal(results[1].data.error.code, 'ABORTED_BEFORE_DISPATCH');
+    // Re-publishing the same skipped event cannot create another accounting row.
+    ctx.emit('session/event', agent.session, results[1]);
+    const rows = (await readFile(join(dir, 'actions.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+    const plans = rows.filter(row => row.event === 'action-plan');
+    const ends = rows.filter(row => row.event === 'action-finish');
+    assert.equal(bodies, 1);
+    assert.equal(plans.length, 2);
+    assert.equal(ends.length, 2);
+    assert.deepEqual(ends.map(row => row.callId), ['queued-0', 'queued-1']);
+    assert.ok(ends.every(row => row.outcome === 'cancelled' && row.requestActionCount === 2));
+    assert.equal(ends[1].executionState, 'not_started');
+    assert.equal(ends[1].dispatchReached, false);
+    assert.deepEqual(ends[1].requestUsage, { inputTokens: 9, outputTokens: 4 });
+    assert.equal(ends[0].requestId, ends[1].requestId);
+    assert.doesNotMatch(JSON.stringify(events), /requestUsage|requestActionCount|tokenScope|durationMs|action-finish/);
+  } finally {
+    forgetActions('queued-session', dir);
+    policyHost.cachedMode = previousMode;
+    if (previousDirectory === undefined) delete process.env.DSHX_ASSISTANT_DIR;
+    else process.env.DSHX_ASSISTANT_DIR = previousDirectory;
+    await ctx.fiber.dispose();
+  }
+});
+
+test('phone bridge real agent bounds stopped planning allows an explanation and clears the next turn', async () => {
+  const { Context } = await load('@deepseek-ai/cordis');
+  const { default: SystemPrompt } = await load('@deepseek-ai/dsh-system-prompt');
+  const { default: Tools, defineTool } = await load('@deepseek-ai/dsh-tools');
+  const { default: LlmRuntime, LlmAdapter, createUserMessage } = await load('@deepseek-ai/dsh-llm');
+  const { default: Agents } = await load('@deepseek-ai/dsh-agent');
+  const { default: Sessions } = await load('@deepseek-ai/dsh-session');
+  const { default: Projections } = await load('@deepseek-ai/dsh-session-projection');
+  const { default: AgentLoop } = await load('@deepseek-ai/dsh-agent-loop');
+  const { trackPhone } = await import(pathToFileURL(join(core, 'phone.mjs')));
+  const { policyHost } = await import(pathToFileURL(join(core, 'host.mjs')));
+  const previousMode = policyHost.cachedMode;
+  policyHost.cachedMode = () => 'full';
+  const ctx = new Context();
+  let requests = 0;
+  let sends = 0;
+  let explain = false;
+  const explanationStarted = Promise.withResolvers();
+  const finishExplanation = Promise.withResolvers();
+  class Adapter extends LlmAdapter {
+    async *stream(options) {
+      requests++;
+      if (requests > 6) throw new Error('fixture exceeded model request budget');
+      assert.doesNotMatch(JSON.stringify(options.messages), /needsObserve|failures|explained|usageFinal/);
+      if (explain && requests % 2 === 0) {
+        if (requests === 4) { explanationStarted.resolve(); await finishExplanation.promise; }
+        yield { type: 'text-delta', index: 0, text: '手机开关已关闭，请启用后重新操作。' };
+        yield { type: 'finish', reason: { kind: 'stop' } };
+      } else {
+        yield { type: 'tool-call-delta', index: 0, id: `stop-${requests}`, name: 'phone_observe', argumentsDelta: '{}' };
+        yield { type: 'finish', reason: { kind: 'tool-calls' } };
+      }
+    }
+  }
+  try {
+    for (const plugin of [SystemPrompt, Tools, LlmRuntime, Agents, Sessions, Projections]) await ctx.plugin(plugin);
+    await ctx.plugin(AgentLoop, { agents: [], maxParallelToolCalls: 1 });
+    trackPhone(ctx);
+    ctx.llm.registerAdapter(['fixture'], new Adapter());
+    ctx.tools.register(defineTool({
+      name: 'phone_observe', description: 'fixture', parameters: {},
+      output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => phoneContent(value) },
+      execute: (args, exec) => callPhone(ctx, { phone: async () => { sends++; return { ok: false, code: 'disabled', execution_state: 'not_started' }; } }, 'observe', args, exec),
+    }));
+    const agent = await ctx.agentLoop.create('stop-session', { provider: 'fixture', model: 'single' });
+    const prompt = (text = '打开手机应用') => agent.followup(createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } }));
+    prompt();
+    await agent.whenIdle();
+    assert.equal(requests, 2, 'an insistent model gets at most one explanation request');
+    assert.equal(sends, 1, 'no native call may be dispatched after disabled');
+    explain = true;
+    const events = [];
+    const statuses = [];
+    ctx.on('session/event', (session, event) => { if (session.id === agent.session.id) events.push(event); });
+    ctx.on('agent/status', ({ agent: current, status }) => { if (current === agent) statuses.push(status); });
+    prompt();
+    await Promise.race([explanationStarted.promise, agent.whenIdle().then(() => assert.fail('agent ended before explanation'))]);
+    assert.deepEqual(statuses, ['running']);
+    const queuedText = '请重新检查手机开关';
+    prompt(queuedText);
+    finishExplanation.resolve();
+    await agent.whenIdle();
+    assert.equal(requests, 6, 'a queued user turn must get its own phone check and explanation');
+    assert.equal(sends, 3);
+    assert.deepEqual(statuses, ['running', 'idle'], 'queued turns must reset state without an intervening idle');
+    assert.ok(events.some(event => event.type === 'user/message' && event.data.content.some(part => part.text === queuedText)),
+      'the queued user message must be committed rather than consumed by a rejected step');
+    assert.ok(events.some(event => JSON.stringify(event).includes('手机开关已关闭')));
+    assert.doesNotMatch(JSON.stringify(events), /needsObserve|failures|explained|usageFinal/);
+  } finally { finishExplanation.resolve(); policyHost.cachedMode = previousMode; await ctx.fiber.dispose(); }
+});
+
+test('phone window guard finishes only when the agent is idle, never between model requests', async () => {
+  const { apply } = await import(pathToFileURL(join(core, 'guard.mjs')));
+  const { policyHost } = await import(pathToFileURL(join(core, 'host.mjs')));
+  const original = policyHost.finishPhone;
+  const finished = [];
+  const handlers = new Map();
+  policyHost.finishPhone = async session => { finished.push(session); };
+  try {
+    await apply({
+      agents: { list: () => [] }, tools: { guard() {} }, systemPrompt: { section() {} },
+      on: (event, handler) => { handlers.set(event, handler); }, effect() {}, get() {},
+    });
+    const agent = { session: { id: 'window-session' } };
+    const config = { provider: 'fixture', model: 'fixture' };
+    assert.equal(await handlers.get('agent/request')({ agent }, async () => config), config);
+    handlers.get('agent/status')({ agent, status: 'running' });
+    assert.deepEqual(finished, []);
+    handlers.get('agent/status')({ agent, status: 'idle' });
+    assert.deepEqual(finished, ['window-session']);
+  } finally { policyHost.finishPhone = original; }
+});
+
+test('phone window PolicyHost finishes the window without ending the live conversation', async () => {
+  const fixture = await policyServer();
+  const host = new PolicyHost(fixture.config);
+  try {
+    await host.register('full-session', 'Window');
+    await host.finishPhone('full-session');
+    assert.equal(await host.mode('full-session'), 'full');
+    const request = fixture.requests.find(row => row.method === 'phone-finish');
+    assert.deepEqual(request, { id: request.id, method: 'phone-finish', session: 'full-session' });
+    assert.equal(fixture.requests.some(row => row.method === 'end'), false);
+  } finally { host.close(); await fixture.close(); }
+});
+
+test('phone bridge compact tree preserves exceptions credentials and the native result', () => {
+  const value = { ok: true, snapshot: 'snapshot-1', nodes: [{
+    id: 'node-1', text: '文字', actions: [], enabled: false, bounds: [0, 1, 2, 3],
+    editable: false, focused: false, checkable: false, checked: false, selected: false,
+    description: '', stateDescription: '', clickTarget: '', selectionStart: -1, selectionEnd: -1,
+    textTruncated: false,
+  }, { id: 'node-2', actions: ['input'], enabled: true, editable: true, textTruncated: true,
+    text: '部分文字', selectionStart: 0, selectionEnd: 2, description: '备注', clickTarget: 'node-3' }] };
+  const before = structuredClone(value);
+  const content = JSON.parse(phoneContent(value)[0].text);
+  assert.deepEqual(content.nodes[0], { id: 'node-1', text: '文字', actions: [], enabled: false, bounds: [0, 1, 2, 3] });
+  assert.deepEqual(content.nodes[1], value.nodes[1]);
+  assert.equal(content.snapshot, value.snapshot);
+  assert.deepEqual(value, before, 'compact rendering must not mutate the native receipt');
+});
+
+test('phone bridge failure state isolates agents requires observation and resets at idle', async () => {
+  const { trackPhone } = await import(pathToFileURL(join(core, 'phone.mjs')));
+  const handlers = new Map();
+  trackPhone({ on: (event, handler) => handlers.set(event, handler) });
+  const agent = { session: { id: 'failure-session' } };
+  const other = { session: { id: 'other-session' } };
+  let sends = 0;
+  const host = { phone: async action => {
+    sends++;
+    return action === 'click' ? { ok: false, code: 'stale_snapshot', execution_state: 'not_started' } : { ok: true };
+  } };
+  const call = (action, who = agent) => callPhone({}, host, action, {}, { agent: who });
+  assert.equal((await call('click')).code, 'stale_snapshot');
+  assert.equal((await call('click')).code, 'observation_required');
+  assert.equal(sends, 1, 'a failed action cannot be blindly replayed');
+  await call('observe');
+  assert.equal((await call('click')).code, 'stale_snapshot');
+  assert.equal((await call('observe')).code, 'phone_stopped');
+  assert.equal(sends, 3, 'observations must not reset a loop of stale actions');
+  assert.deepEqual(await call('observe', other), { ok: true });
+  const step = handlers.get('agent/pre-step');
+  assert.equal(step({ agent }, () => 'explanation'), 'explanation');
+  assert.deepEqual(step({ agent }, () => assert.fail('unbounded follow-up')), { kind: 'reject' });
+  handlers.get('agent/status')({ agent, status: 'idle' });
+  assert.deepEqual(await call('observe'), { ok: true });
+  for (const code of ['disabled', 'accessibility_offline', 'locked', 'screen_off']) {
+    handlers.get('agent/disposed')({ agent });
+    await callPhone({}, { phone: async () => ({ ok: false, code }) }, 'observe', {}, { agent });
+    assert.equal((await call('status')).code, 'phone_stopped');
+  }
+  handlers.get('agent/status')({ agent, status: 'idle' });
+  await callPhone({}, { phone: async () => ({ ok: true, enabled: false }) }, 'status', {}, { agent });
+  assert.equal((await call('observe')).code, 'phone_stopped');
+});
+
+test('phone bridge callPhone uses the executing session and signal instead of argument or agent lookalikes', async () => {
+  const controller = new AbortController();
+  const other = new AbortController();
+  other.abort();
+  const args = { snapshot: 'snapshot-1', node: 'node-1', session: 'argument-session' };
+  const exec = { signal: controller.signal, agent: { id: 'agent-id', signal: other.signal, session: { id: 'current-session' } } };
+  const result = { accepted: true, snapshot: 'snapshot-2' };
+  const calls = [];
+  const host = { phone: async (...values) => { calls.push(values); return result; } };
+  const ctx = { get: () => assert.fail('non-image actions must not resolve model or attachment services') };
+  assert.equal(await callPhone(ctx, host, 'click', args, exec), result);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0], ['click', args, 'current-session', controller.signal]);
+  assert.equal(calls[0][1], args);
+  assert.equal(calls[0][3], controller.signal);
+  assert.deepEqual(phoneContent(result), [{ type: 'text', text: JSON.stringify(result) }]);
+});
+
+test('phone bridge callPhone rejects pre-cancellation before any lookup or host send', async () => {
+  const controller = new AbortController();
+  const reason = new Error('fixture phone call already cancelled');
+  controller.abort(reason);
+  const ctx = { get: () => assert.fail('pre-cancellation must not resolve services') };
+  const host = { phone: () => assert.fail('pre-cancellation must not send a phone request') };
+  for (const action of ['status', 'screenshot']) {
+    await assert.rejects(callPhone(ctx, host, action, {}, {
+      signal: controller.signal, agent: { session: { id: 'current-session' } }
+    }), error => error === reason);
+  }
+});
+
+test('phone bridge callPhone discards a host result when cancellation arrives during the call', async () => {
+  const controller = new AbortController();
+  const reason = new Error('fixture phone call cancelled in flight');
+  let calls = 0;
+  const host = { phone: async () => { calls++; controller.abort(reason); return { accepted: true }; } };
+  await assert.rejects(callPhone({}, host, 'back', {}, {
+    signal: controller.signal, agent: { session: { id: 'current-session' } }
+  }), error => error === reason);
+  assert.equal(calls, 1);
+});
+
+test('phone bridge screenshot refuses text-only or undeclared image support before fetching a screen', async () => {
+  const signal = new AbortController().signal;
+  for (const inputModalities of [['text'], undefined]) {
+    const resolutions = [];
+    let captures = 0;
+    let saves = 0;
+    const services = {
+      llm: { resolveModelInfo: async (...args) => { resolutions.push(args); return { inputModalities }; } },
+      attachments: { saveImage: async () => { saves++; assert.fail('unsupported models must not save screenshots'); } }
+    };
+    const host = { phone: async () => { captures++; assert.fail('unsupported models must not fetch screenshots'); } };
+    await assert.rejects(callPhone({ get: name => services[name] }, host, 'screenshot', {}, {
+      signal, agent: {
+        options: { provider: 'default-provider', model: 'default-image-model' },
+        session: { id: 'current-session', requestHeader: () => ({ config: { provider: 'routed-provider', model: 'routed-text-model' } }) }
+      }
+    }), /未声明支持看图/);
+    assert.deepEqual(resolutions, [['routed-provider', 'routed-text-model', signal]]);
+    assert.equal(captures, 0);
+    assert.equal(saves, 0);
+  }
+});
+
+test('phone bridge screenshot model and attachment failures stop after three calls counted once each', async () => {
+  const { trackPhone } = await import(pathToFileURL(join(core, 'phone.mjs')));
+  const handlers = new Map();
+  trackPhone({ on: (event, handler) => handlers.set(event, handler) });
+  const step = handlers.get('agent/pre-step');
+  for (const phase of ['model', 'attachment']) {
+    const agent = { session: { id: `image-${phase}` }, options: { provider: 'fixture', model: 'image-model' } };
+    let resolutions = 0;
+    let captures = 0;
+    let saves = 0;
+    const attachmentError = new Error('fixture attachment save failed');
+    const services = {
+      llm: { resolveModelInfo: async () => {
+        resolutions++;
+        return { inputModalities: phase === 'model' ? ['text'] : ['image'] };
+      } },
+      attachments: { saveImage: async () => { saves++; throw attachmentError; } },
+    };
+    const host = { phone: async () => { captures++; return { ok: true, data: 'YWJj' }; } };
+    const call = () => callPhone({ get: name => services[name] }, host, 'screenshot', {}, { agent });
+    for (let attempt = 0; attempt < 3; attempt++) {
+      assert.equal(step({ agent, turn: 1 }, () => 'enter'), 'enter');
+      await assert.rejects(call(), error => phase === 'model' ? /未声明支持看图/.test(error.message) : error === attachmentError);
+    }
+    assert.equal((await call()).code, 'phone_stopped', phase);
+    assert.equal(resolutions, 3, 'each of the three failures must count exactly once');
+    assert.equal(captures, phase === 'model' ? 0 : 3);
+    assert.equal(saves, phase === 'model' ? 0 : 3);
+    assert.equal(step({ agent, turn: 1 }, () => 'explanation'), 'explanation');
+    assert.deepEqual(step({ agent, turn: 1 }, () => assert.fail('unbounded screenshot retry')), { kind: 'reject' });
+    assert.equal(step({ agent, turn: 2 }, () => 'new turn'), 'new turn');
+    await assert.rejects(call(), error => phase === 'model' ? /未声明支持看图/.test(error.message) : error === attachmentError);
+    assert.equal(resolutions, 4, 'a new turn must reset the screenshot failure budget');
+    handlers.get('agent/disposed')({ agent });
+  }
+});
+
+test('phone bridge screenshot saves a real image attachment and keeps base64 out of text content', async () => {
+  const { Context } = await load('@deepseek-ai/cordis');
+  const { default: Attachments } = await load('@deepseek-ai/dsh-attachment-local');
+  const sharp = require('sharp');
+  const ctx = new Context();
+  const signal = new AbortController().signal;
+  try {
+    await ctx.plugin(Attachments, { dshHome: join(directory, 'phone-image-home') });
+    const data = await sharp({ create: { width: 8, height: 6, channels: 3, background: '#2a64b4' } }).jpeg().toBuffer();
+    const encoded = data.toString('base64');
+    const resolutions = [];
+    const saves = [];
+    const services = {
+      llm: { resolveModelInfo: async (...args) => { resolutions.push(args); return { inputModalities: ['text', 'image'] }; } },
+      attachments: { saveImage: async input => { saves.push(input); return ctx.attachments.saveImage(input); } }
+    };
+    const calls = [];
+    const details = { width: 8, height: 6, mediaType: 'image/jpeg' };
+    const host = { phone: async (...args) => { calls.push(args); return { ...details, data: encoded }; } };
+    const exec = { signal, agent: { session: { id: 'image-session', requestHeader: () => undefined }, options: { provider: 'fixture', model: 'image-model' } } };
+    const value = await callPhone({ get: name => services[name] }, host, 'screenshot', {}, exec);
+    assert.deepEqual(resolutions, [['fixture', 'image-model', signal]]);
+    assert.deepEqual(calls, [['screenshot', {}, 'image-session', signal]]);
+    assert.deepEqual(saves, [{ data, mediaType: 'image/jpeg', name: 'phone-screen.jpg' }]);
+    assert.equal(Object.hasOwn(value, 'data'), false);
+    assert.ok(value.image.attachmentId);
+    const stored = await ctx.attachments.readImage(value.image);
+    const metadata = await sharp(stored.data).metadata();
+    assert.equal(metadata.width, 8);
+    assert.equal(metadata.height, 6);
+    const content = phoneContent(value);
+    assert.deepEqual(content, [{ type: 'text', text: JSON.stringify(details) }, { type: 'image', attachment: value.image }]);
+    assert.equal(content[1].attachment, value.image);
+    assert.equal(JSON.stringify(content).includes(encoded), false);
+    assert.equal(Object.hasOwn(JSON.parse(content[0].text), 'image'), false);
+    // Valid base64 containing non-image bytes must still fail the real store.
+    await assert.rejects(callPhone({ get: name => services[name] }, {
+      phone: async () => ({ data: Buffer.from('not a JPEG image').toString('base64') })
+    }, 'screenshot', {}, exec));
+  } finally { await ctx.fiber.dispose(); }
+});
+
+test('phone bridge screenshot rejects malformed or oversized base64 before saving an attachment', async () => {
+  let captures = 0;
+  let saves = 0;
+  const services = {
+    llm: { resolveModelInfo: async () => ({ inputModalities: ['image'] }) },
+    attachments: { saveImage: async () => { saves++; assert.fail('invalid screenshot data must not reach the attachment store'); } }
+  };
+  const invalid = [undefined, null, 123, '', '!not-base64!', 'data:image/jpeg;base64,YQ==', 'YQ\n==', 'Y===', 'Y=Q=', 'A'.repeat(3 * 1024 * 1024 + 1)];
+  for (const data of invalid) {
+    const exec = { signal: new AbortController().signal, agent: { session: { id: 'image-session' }, options: { provider: 'fixture', model: 'image-model' } } };
+    const host = { phone: async () => { captures++; return { data }; } };
+    await assert.rejects(callPhone({ get: name => services[name] }, host, 'screenshot', {}, exec), /手机截图数据无效/);
+  }
+  assert.equal(captures, invalid.length);
+  assert.equal(saves, 0);
+});
+
+test('phone bridge real plugin registers all 28 tools with validated schemas and native content rendering', async () => {
+  const { Context } = await load('@deepseek-ai/cordis');
+  const { default: SystemPrompt } = await load('@deepseek-ai/dsh-system-prompt');
+  const { default: Tools } = await load('@deepseek-ai/dsh-tools');
+  const Phone = await import(pathToFileURL(join(core, 'phone.mjs')));
+  const ctx = new Context();
+  const parameters = {
+    phone_status: [], phone_apps: ['query', 'userOnly'], phone_open: ['package'], phone_observe: [],
+    phone_click: ['snapshot', 'node'], phone_input: ['snapshot', 'node', 'text'],
+    phone_scroll: ['snapshot', 'node', 'direction'], phone_back: [], phone_home: [], phone_screenshot: [],
+    phone_device: [], phone_key: ['name'], phone_tap: ['screenshot', 'x', 'y'], phone_swipe: ['screenshot', 'x', 'y', 'endX', 'endY', 'ms'],
+    phone_clipboard: ['mode', 'text'], phone_read_file: ['path'], phone_export: ['path', 'name'],
+    phone_notify: ['title', 'text'], phone_toast: ['text'], phone_ask: ['question', 'options'], phone_vibrate: ['ms'],
+    phone_share: ['text', 'path'], phone_open_url: ['url'], phone_overlay: ['text'], phone_location: ['fresh'],
+    phone_sensors: [], phone_sensor: ['name'], phone_torch: ['on']
+  };
+  try {
+    await ctx.plugin(SystemPrompt);
+    await ctx.plugin(Tools);
+    await ctx.plugin(Phone);
+    assert.deepEqual([...ctx.tools.view().visible.keys()].sort(), Object.keys(parameters).sort());
+    for (const [name, fields] of Object.entries(parameters)) {
+      const tool = ctx.tools.get(name);
+      assert.ok(tool, name);
+      assert.ok(tool.description.length > 0, name);
+      assert.equal(tool.parameters.type, 'object', name);
+      assert.deepEqual(Object.keys(tool.parameters.properties).sort(), [...fields].sort(), name);
+      const definition = Phone.phoneTools.find(row => row.name === name);
+      const required = Object.entries(definition.parameters).filter(([, value]) => value.required).map(([key]) => key);
+      assert.deepEqual([...(tool.parameters.required ?? [])].sort(), required.sort(), name);
+      for (const field of fields) {
+        assert.equal(tool.parameters.properties[field].type, definition.parameters[field].type, `${name}.${field}`);
+        assert.ok(tool.parameters.properties[field].description.length > 0, `${name}.${field}`);
+      }
+      assert.deepEqual(tool.output.schema, { type: 'object', additionalProperties: true });
+      const args = Object.fromEntries(fields.map(field => [field, field === 'direction' ? 'forward' : field === 'text' ? '' : 'fixture']));
+      assert.equal(tool.isConcurrencySafe(args), false, name);
+      assert.deepEqual(tool.output.render({}, { accepted: true }), [{ type: 'text', text: '{"accepted":true}' }]);
+      if (required.length) await assert.rejects(tool.execute({}, {}), { code: 'INVALID_ARGS' });
+    }
+    assert.equal(Object.keys(parameters).length, 28);
+    for (const [name, args] of [
+      ['phone_tap', { screenshot: 's', x: 1.5, y: 0 }],
+      ['phone_torch', { on: 'true' }],
+      ['phone_ask', { question: 'q', options: [false] }],
+      ['phone_location', { fresh: 'true' }],
+      ['phone_key', { name: 'unknown' }],
+    ]) await assert.rejects(ctx.tools.get(name).execute(args, {}), { code: 'INVALID_ARGS' });
+    const scroll = ctx.tools.get('phone_scroll');
+    assert.deepEqual(scroll.parameters.properties.direction.enum, ['forward', 'backward']);
+    await assert.rejects(scroll.execute({ snapshot: 'snapshot-1', node: 'node-1', direction: 'left' }, {}), { code: 'INVALID_ARGS' });
+    await assert.rejects(ctx.tools.get('phone_input').execute({ snapshot: 'snapshot-1', node: 'node-1', text: 123 }, {}), { code: 'INVALID_ARGS' });
+    const image = { attachmentId: '0'.repeat(64), mediaType: 'image/jpeg', bytes: 100, width: 8, height: 6 };
+    assert.deepEqual(ctx.tools.get('phone_screenshot').output.render({}, { width: 8, height: 6, image }), [
+      { type: 'text', text: '{"width":8,"height":6}' }, { type: 'image', attachment: image }
+    ]);
+    const prompt = await ctx.systemPrompt.assemble();
+    assert.equal(prompt.sections.filter(section => section.name === 'android:phone').length, 1);
+    const phonePrompt = prompt.sections.find(section => section.name === 'android:phone').text;
+    assert.match(phonePrompt, /组件树为第一选择/);
+    assert.match(phonePrompt, /不得把截图作为每步操作前后的固定流程/);
+    assert.match(ctx.tools.get('phone_observe').description, /首选/);
+    assert.match(ctx.tools.get('phone_screenshot').description, /低优先级视觉后备/);
+  } finally { await ctx.fiber.dispose(); }
+});
+
+test('phone bridge PolicyHost rejects missing sessions and pre-cancellation without sending a request', async () => {
+  const local = new PolicyHost();
+  await assert.rejects(local.phone('status', {}, 'full-session'), /需要当前原生会话连接/);
+  const fixture = await policyServer();
+  const host = new PolicyHost(fixture.config);
+  try {
+    for (const session of [undefined, '', 123]) await assert.rejects(host.phone('status', {}, session), /需要当前原生会话连接/);
+    const controller = new AbortController();
+    const reason = new Error('fixture native phone already cancelled');
+    controller.abort(reason);
+    await assert.rejects(host.phone('status', {}, 'full-session', controller.signal), error => error === reason);
+    assert.deepEqual(fixture.requests, []);
+    assert.equal(host.sequence, 0);
+    assert.equal(host.pending.size, 0);
+    assert.equal(await host.register('full-session', 'Full'), 'full');
+  } finally { host.close(); await fixture.close(); }
+});
+
+test('phone bridge ask has a 65 second transport deadline and cancellation still consumes its late reply', async () => {
+  let delayed;
+  const fixture = await policyServer({ phone: (request, respond) => {
+    if (request.method === 'phone-cancel') respond({ result: { cancelled: true } });
+    else delayed = { request, respond };
+  } });
+  const host = new PolicyHost(fixture.config);
+  const controller = new AbortController();
+  try {
+    await host.register('full-session', 'Full');
+    const pending = host.phone('ask', { question: 'q', options: ['a'] }, 'full-session', controller.signal).catch(error => error);
+    await waitFor(() => delayed !== undefined, 'ask request absent');
+    assert.equal(host.pending.get(delayed.request.id).timer._idleTimeout, 65000);
+    controller.abort();
+    assert.match((await pending).message, /手机操作已取消/);
+    await waitFor(() => fixture.requests.some(row => row.method === 'phone-cancel'), 'cancel request absent');
+    await host.mode('full-session');
+    delayed.respond({ result: { ok: false, code: 'cancelled' } });
+    assert.equal(await host.mode('full-session'), 'full');
+    assert.equal(host.pending.size, 0);
+    assert.equal(host.connected, true);
+  } finally { host.close(); await fixture.close(); }
+});
+
+test('phone bridge export cancellation warns about an incomplete target before its late receipt', async () => {
+  let delayed;
+  const fixture = await policyServer({ phone: (request, respond) => {
+    if (request.method === 'phone-cancel') respond({ result: { cancelled: true } });
+    else delayed = { request, respond };
+  } });
+  const host = new PolicyHost(fixture.config); const controller = new AbortController();
+  try {
+    await host.register('full-session', 'Full');
+    const pending = host.phone('export', { path: 'workspace:a.txt' }, 'full-session', controller.signal).catch(error => error);
+    await waitFor(() => delayed !== undefined, 'export request absent');
+    controller.abort();
+    assert.match((await pending).message, /授权目录可能残留不完整文件/);
+    await waitFor(() => fixture.requests.some(row => row.method === 'phone-cancel'), 'cancel request absent');
+    await host.mode('full-session'); delayed.respond({ result: { ok: false, code: 'cancelled' } });
+    await host.mode('full-session'); assert.equal(host.pending.size, 0);
+  } finally { host.close(); await fixture.close(); }
+});
+
+test('phone bridge PolicyHost returns result and isolates phone errors from other sessions', async () => {
+  const result = { snapshot: 'snapshot-1', nodes: [{ id: 'node-1', text: '测试控件' }] };
+  const fixture = await policyServer({ phone: (request, respond) => {
+    if (request.action === 'click') respond({ ok: false, error: 'fixture stale phone snapshot' });
+    else if (request.action === 'input') respond({ ok: false });
+    else respond({ result });
+  } });
+  const host = new PolicyHost(fixture.config);
+  try {
+    await host.register('full-session', 'Full');
+    await host.register('write-session', 'Write');
+    assert.deepEqual(await host.phone('observe', {}, 'full-session'), result);
+    const request = fixture.requests.find(request => request.method === 'phone');
+    assert.deepEqual(request, { id: request.id, method: 'phone', action: 'observe', args: {}, session: 'full-session' });
+    assert.ok(Number.isSafeInteger(request.id) && request.id > 0);
+    await assert.rejects(host.phone('click', { snapshot: 'old', node: 'node-1' }, 'full-session'), /fixture stale phone snapshot/);
+    assert.equal(host.pending.size, 0);
+    assert.equal(await host.mode('write-session'), 'workspace-write');
+    await assert.rejects(host.phone('input', {}, 'full-session'), /手机操作失败，请重新观察界面/);
+    assert.equal(host.cachedMode('full-session'), 'full');
+    assert.equal(host.connected, true);
+    assert.deepEqual(await host.phone('observe', {}, 'full-session'), result);
+    assert.equal(host.pending.size, 0);
+  } finally { host.close(); await fixture.close(); }
+});
+
+for (const ok of [true, false]) {
+  test(`phone bridge cancellation sends phone-cancel and consumes a late ${ok ? 'result' : 'error'}`, { timeout: 15_000 }, async () => {
+    let delayed;
+    const fixture = await policyServer({ phone: (request, respond) => {
+      if (request.method === 'phone-cancel') respond({ result: { cancelled: true } });
+      else if (request.action === 'click') delayed = { request, respond };
+      else respond({ result: { enabled: true } });
+    } });
+    const host = new PolicyHost(fixture.config);
+    const controller = new AbortController();
+    try {
+      await host.register('full-session', 'Full');
+      await host.register('write-session', 'Write');
+      const pending = host.phone('click', { snapshot: 'snapshot-1', node: 'node-1' }, 'full-session', controller.signal)
+        .then(value => ({ value }), error => ({ error }));
+      await waitFor(() => delayed !== undefined, 'phone bridge did not send the phone request');
+      controller.abort();
+      const cancelled = await pending;
+      assert.ok(cancelled.error instanceof Error, 'the phone request must reject on cancellation');
+      assert.match(cancelled.error.message, /手机操作已取消.*不能自动重试/);
+      await waitFor(() => fixture.requests.some(request => request.method === 'phone-cancel'), 'phone bridge did not send phone-cancel');
+      const cancel = fixture.requests.find(request => request.method === 'phone-cancel');
+      assert.deepEqual(cancel, { id: cancel.id, method: 'phone-cancel', session: 'full-session', call: delayed.request.id });
+      assert.ok(cancel.id > delayed.request.id);
+      // A subsequent query is a wire-order barrier for the cancel response.
+      assert.equal(await host.mode('write-session'), 'workspace-write');
+      assert.equal(host.pending.has(cancel.id), false);
+      assert.equal(host.pending.has(delayed.request.id), true, 'the cancelled request must remain recognizable until its result arrives');
+      assert.equal(host.pending.size, 1);
+      delayed.respond(ok ? { result: { accepted: true } } : { ok: false, error: 'fixture late cancellation' });
+      assert.equal(await host.mode('write-session'), 'workspace-write');
+      assert.equal(host.pending.size, 0, 'a late result must consume the original pending request');
+      assert.equal(host.connected, true);
+      assert.equal(host.cachedMode('full-session'), 'full');
+      assert.deepEqual(await host.phone('status', {}, 'full-session'), { enabled: true });
+      assert.equal(fixture.requests.filter(request => request.method === 'phone' && request.action === 'click').length, 1);
+      assert.equal(fixture.requests.filter(request => request.method === 'phone-cancel').length, 1);
+      assert.equal(host.pending.size, 0);
+    } finally { host.close(); await fixture.close(); }
+  });
+}
+
+if (process.env.DSHX_PHONE_DEVICE_AUDIT === '1') {
+  test('phone bridge device performs native settings search and image attachment audit', { timeout: 120_000 }, async t => {
+    const { policyHost } = await import(pathToFileURL(join(core, 'host.mjs')));
+    // compat owns the authenticated singleton; close it after cleanup so Node can exit.
+    t.after(() => policyHost.close());
+    const output = process.env.DSHX_PHONE_AUDIT_OUTPUT;
+    assert.ok(output, 'DSHX_PHONE_AUDIT_OUTPUT must name a writable JSON report path');
+    const session = 'phone-device-audit';
+    const report = { status: 'running', checks: {} };
+    const codeOf = error => typeof error?.code === 'string' && /^[A-Za-z0-9_]{1,64}$/.test(error.code) ? error.code : 'test_failed';
+    const check = async (name, run) => {
+      report.checks[name] = { status: 'running' };
+      await writeFile(output, JSON.stringify(report, null, 2) + '\n', { mode: 0o600 });
+      try {
+        const value = await run();
+        report.checks[name] = { status: 'passed' };
+        await writeFile(output, JSON.stringify(report, null, 2) + '\n', { mode: 0o600 });
+        return value;
+      } catch (error) {
+        report.checks[name] = { status: 'failed', code: codeOf(error) };
+        throw error;
+      }
+    };
+    let ctx;
+    let sharp;
+    let registered = false;
+    let searchOpened = false;
+    let restoreNeeded = false;
+    let originalText;
+    let latest;
+    let failure;
+    const phone = async (action, args = {}, signal = t.signal) => {
+      latest = undefined;
+      const value = await policyHost.phone(action, args, session, signal);
+      if (value?.ok !== true) {
+        const code = codeOf(value);
+        throw Object.assign(new Error(`phone bridge device ${action} failed: ${code}`), { code });
+      }
+      assert.equal(value.execution_state, 'completed', `native ${action} did not complete`);
+      if (['open', 'click', 'input', 'scroll', 'back', 'home'].includes(action)) {
+        assert.equal(value.accepted, true, `Android did not accept ${action}`);
+      }
+      return value;
+    };
+    const observe = async (ready, signal = t.signal) => {
+      const deadline = Date.now() + 2000;
+      let lastCode = 'page_not_ready';
+      for (let attempt = 0; attempt < 5 && Date.now() < deadline; attempt++) {
+        signal.throwIfAborted();
+        try {
+          const frame = await phone('observe', {}, AbortSignal.any([signal, AbortSignal.timeout(Math.max(1, deadline - Date.now()))]));
+          assert.ok(typeof frame.snapshot === 'string' && frame.snapshot.length > 0, 'observe must return a snapshot');
+          assert.ok(Array.isArray(frame.nodes), 'observe must return nodes');
+          assert.ok(frame.nodes.every(node => typeof node.id === 'string' && Array.isArray(node.actions)), 'node ids must be strings with declared actions');
+          if (ready(frame)) { latest = frame; return frame; }
+          lastCode = 'page_not_ready';
+        } catch (error) {
+          if (!['no_window', 'window_changed', 'stale_snapshot'].includes(error.code)) throw error;
+          lastCode = error.code;
+        }
+        if (attempt < 4 && Date.now() < deadline) await delay(Math.min(200, deadline - Date.now()), undefined, { signal });
+      }
+      throw Object.assign(new Error(`phone bridge device observe did not settle: ${lastCode}`), { code: lastCode });
+    };
+    const act = async (action, node, extra = {}, signal = t.signal) => {
+      const frame = latest;
+      assert.ok(frame && frame.nodes.includes(node), 'action must use the latest observation');
+      const id = action === 'click' ? node.clickTarget : node.id;
+      assert.ok(typeof id === 'string' && id.length > 0, 'args.node must be a nonempty string');
+      const target = frame.nodes.find(candidate => candidate.id === id);
+      assert.ok(target?.actions.includes(action === 'scroll' ? extra.direction : action), 'target must declare the requested action');
+      return phone(action, { snapshot: frame.snapshot, node: id, ...extra }, signal);
+    };
+    const settingsPage = frame => frame.package === 'com.android.settings';
+    const searchPage = frame => ['com.android.settings', 'com.android.settings.intelligence', 'com.google.android.settings.intelligence'].includes(frame.package);
+    const searchLabel = node => /搜索|search/i.test(`${node.text ?? ''} ${node.description ?? ''}`);
+    const searchButton = frame => frame.nodes.find(node => searchLabel(node) &&
+      frame.nodes.some(target => target.id === node.clickTarget && target.actions.includes('click')));
+    const searchInput = frame => {
+      const inputs = frame.nodes.filter(node => node.editable === true && node.actions.includes('input') &&
+        typeof node.text === 'string' && node.textTruncated === false);
+      return inputs.find(searchLabel) ?? (inputs.length === 1 ? inputs[0] : undefined);
+    };
+    try {
+      await check('session', async () => {
+        assert.equal(policyHost.configured, true, 'Instrumentation must configure DSHX_POLICY_*');
+        assert.equal(policyHost.connected, true, 'compat must authenticate the singleton before the test');
+        const mode = await policyHost.register(session, '手机桥设备验收');
+        registered = true;
+        assert.equal(mode, 'full');
+      });
+      await check('attachments', async () => {
+        const { Context } = await load('@deepseek-ai/cordis');
+        const { default: Attachments } = await load('@deepseek-ai/dsh-attachment-local');
+        sharp = require('sharp');
+        ctx = new Context();
+        await ctx.plugin(Attachments, { dshHome: await mkdtemp(join(directory, 'phone-device-images-')) });
+      });
+      await check('status', async () => {
+        const status = await phone('status');
+        assert.equal(status.ready, true, 'enable phone control and accessibility, unlock the screen and keep it awake');
+        assert.equal(status.screenshotSupported, true, 'the device audit requires Android API 30 or newer');
+        assert.equal(status.screenshotReady, true);
+      });
+      await check('apps', async () => {
+        const value = await phone('apps');
+        assert.ok(value.apps.some(app => app.package === 'com.android.settings'), 'Settings must appear in the native app catalog');
+      });
+      await check('open_settings', async () => {
+        await phone('open', { package: 'com.android.settings' });
+        await delay(500, undefined, { signal: t.signal });
+      });
+      let frame = await check('observe_settings', () => observe(value => settingsPage(value) &&
+        value.nodes.some(node => node.editable === false && node.actions.length === 0 && typeof node.text === 'string' && node.text.trim().length > 0)));
+      const scroll = frame.nodes.find(node => node.actions.includes('forward')) ?? frame.nodes.find(node => node.actions.includes('backward'));
+      if (scroll) {
+        await check('scroll', async () => {
+          const previous = frame.snapshot;
+          await act('scroll', scroll, { direction: scroll.actions.includes('forward') ? 'forward' : 'backward' });
+          await delay(1000, undefined, { signal: t.signal });
+          frame = await observe(value => settingsPage(value) && value.snapshot !== previous && Boolean(searchButton(value)));
+        });
+      } else report.checks.scroll = { status: 'skipped', reason: 'no_scroll_node' };
+      await check('click_search', async () => {
+        frame = await observe(value => settingsPage(value) && Boolean(searchButton(value)));
+        await act('click', searchButton(frame));
+        searchOpened = true;
+      });
+      await check('input_chinese', async () => {
+        // Wait for the search activity and keyboard transition before creating the action snapshot.
+        await delay(1500, undefined, { signal: t.signal });
+        frame = await observe(value => searchPage(value) && Boolean(searchInput(value)));
+        const input = searchInput(frame);
+        originalText = input.text;
+        // Restore once with a fresh observation even if the input receipt is uncertain.
+        restoreNeeded = true;
+        await act('input', input, { text: '手机桥测试' });
+        frame = await observe(value => searchPage(value) && searchInput(value)?.text === '手机桥测试');
+      });
+      await check('screenshot', async () => {
+        await delay(400, undefined, { signal: t.signal });
+        // One native screenshot request only; throttling and all other errors fail honestly.
+        const screen = await check('native_screenshot', () => phone('screenshot'));
+        assert.equal(screen.mime, 'image/jpeg');
+        assert.ok(Number.isInteger(screen.width) && screen.width > 0 && screen.width <= 1280);
+        assert.ok(Number.isInteger(screen.height) && screen.height > 0 && screen.height <= 1280);
+        assert.ok(typeof screen.data === 'string' && screen.data.length > 0 && screen.data.length <= 3 * 1024 * 1024, 'screenshot must contain bounded base64');
+        const data = Buffer.from(screen.data, 'base64');
+        assert.ok(data.length > 0, 'JPEG must not be empty');
+        await writeFile(join(directory, 'device-screen.jpg'), data);
+        const metadata = await check('decode_screenshot', () => sharp(data).metadata());
+        assert.equal(metadata.format, 'jpeg');
+        assert.equal(metadata.width, screen.width);
+        assert.equal(metadata.height, screen.height);
+        const image = await check('save_screenshot_attachment', () => ctx.attachments.saveImage({ data, mediaType: 'image/jpeg', name: 'phone-device-audit.jpg' }));
+        const stored = await ctx.attachments.readImage(image);
+        assert.ok(stored.data.length > 0, 'the actual attachment store must verify the screenshot');
+        const { data: encoded, ...details } = screen;
+        const content = phoneContent({ ...details, image });
+        assert.ok(content.some(part => part.type === 'image' && part.attachment === image), 'screenshot must render native image content');
+        assert.equal(JSON.stringify(content).includes(encoded), false, 'rendered content must not contain base64');
+        assert.equal(Object.hasOwn(JSON.parse(content[0].text), 'data'), false);
+      });
+    } catch (error) { failure = error; }
+    finally {
+      const cleanup = async (name, run) => {
+        try { await check(name, run); }
+        catch (error) { failure ??= error; }
+      };
+      if (restoreNeeded) await cleanup('restore_search', async () => {
+        const signal = AbortSignal.timeout(12_000);
+        const frame = await observe(value => searchPage(value) && Boolean(searchInput(value)), signal);
+        await act('input', searchInput(frame), { text: originalText }, signal);
+        await observe(value => searchPage(value) && searchInput(value)?.text === originalText, signal);
+      });
+      if (registered && searchOpened) await cleanup('back', () => phone('back', {}, AbortSignal.timeout(10_000)));
+      if (registered) {
+        await cleanup('home', () => phone('home', {}, AbortSignal.timeout(10_000)));
+        await cleanup('end_session', () => policyHost.end(session));
+      }
+      if (ctx) await cleanup('dispose_attachments', () => ctx.fiber.dispose());
+      report.status = failure ? 'failed' : 'passed';
+      // Only fixed step names, validation states and error codes leave the test.
+      await writeFile(output, JSON.stringify(report, null, 2) + '\n', { mode: 0o600 });
+    }
+    if (failure) throw failure;
+  });
+}
+
+test('phone bridge authenticated image workers share no extra native connection', { timeout: 25_000 }, async () => {
+  const fixture = await policyServer();
+  const sample = join(directory, 'phone-preload-image.jpg');
+  await writeFile(sample, Buffer.from('/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAYEBQYFBAYGBQYHBwYIChAKCgkJChQODwwQFxQYGBcUFhYaHSUfGhsjHBYWICwgIyYnKSopGR8tMC0oMCUoKSj/2wBDAQcHBwoIChMKChMoGhYaKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCj/wAARCAAGAAgDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDj6KKK+5Plj//Z', 'base64'));
+  const script = `
+    import assert from 'node:assert/strict';
+    import { createRequire } from 'node:module';
+    import { join } from 'node:path';
+    import { readFile } from 'node:fs/promises';
+    import { pathToFileURL } from 'node:url';
+    const core = process.env.DSHX_CORE;
+    const require = createRequire(join(core, 'lib/node_modules/package.json'));
+    const { policyHost } = await import(pathToFileURL(join(core, 'host.mjs')));
+    assert.equal(policyHost.connected, true);
+    const sharp = require('sharp');
+    const metadata = await sharp(await readFile(${JSON.stringify(sample)})).metadata();
+    assert.equal(metadata.width, 8);
+    assert.equal(metadata.height, 6);
+    assert.equal(policyHost.connected, true);
+    assert.equal(await policyHost.register('full-session', 'image worker check'), 'full');
+    assert.equal(await policyHost.mode('full-session'), 'full');
+    policyHost.close();
+    console.log('authenticated image workers completed');
+  `;
+  const launcher = join(directory, 'phone-image-workers.mjs');
+  await writeFile(launcher, script);
+  const child = spawn(process.execPath, ['--expose-internals', '--import', join(core, 'compat.mjs'), launcher], {
+    env: { ...process.env, DSHX_POLICY_PORT: String(fixture.config.port), DSHX_POLICY_INSTANCE: fixture.config.instance, DSHX_POLICY_TOKEN: fixture.config.token },
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  let output = '';
+  child.stdout.on('data', chunk => { output += chunk; });
+  child.stderr.on('data', chunk => { output += chunk; });
+  const timeout = setTimeout(() => child.kill('SIGKILL'), 15_000);
+  try {
+    const code = await new Promise((resolve, reject) => { child.once('error', reject); child.once('close', resolve); });
+    assert.equal(code, 0, output || 'authenticated image worker did not finish');
+    assert.match(output, /authenticated image workers completed/);
+    assert.equal(fixture.requests.filter(request => request.version === 1).length, 1, 'only the main thread may authenticate the native connection');
+  } finally { clearTimeout(timeout); if (child.exitCode === null) child.kill('SIGKILL'); await fixture.close(); }
+});
 
 test('native policy client rejects partial configuration and bad authentication', async () => {
   const incomplete = new PolicyHost({ instance: 'test-instance' });
@@ -1046,8 +2120,12 @@ test('unknown or ended session queries stay closed without breaking other sessio
   } finally { host.close(); if (fixture) await fixture.close(); }
 });
 
-test('configured native modes constrain real catalogs, final execution and nested file writes', async () => {
-  const fixture = await policyServer();
+test('configured native modes constrain phone bridge catalogs, final execution and nested file writes', async () => {
+  const phoneRequests = [];
+  const fixture = await policyServer({ phone: (request, respond) => {
+    phoneRequests.push(request);
+    respond({ result: { snapshot: 'catalog-snapshot', nodes: [] } });
+  } });
   const script = `
     import assert from 'node:assert/strict';
     import { createRequire } from 'node:module';
@@ -1064,6 +2142,7 @@ test('configured native modes constrain real catalogs, final execution and neste
     const { default: Tools } = await load('@deepseek-ai/dsh-tools');
     const { default: Agents } = await load('@deepseek-ai/dsh-agent');
     const Guard = await import(pathToFileURL(join(core, 'guard.mjs')));
+    const Phone = await import(pathToFileURL(join(core, 'phone.mjs')));
     const { default: AndroidFiles } = await import(pathToFileURL(join(core, 'files.mjs')));
     const ctx = new Context();
     const full = { mode: 'danger-full-access', workspaceRoot: process.env.DSHX_WORKSPACE };
@@ -1073,6 +2152,7 @@ test('configured native modes constrain real catalogs, final execution and neste
       await policyHost.register('write-session', 'Write');
       await policyHost.register('full-session', 'Full');
       await ctx.plugin(SystemPrompt); await ctx.plugin(Tools); await ctx.plugin(Agents);
+      await ctx.plugin(Phone);
       await ctx.plugin(AndroidFiles, { cwd: process.env.DSHX_WORKSPACE });
       let writes = 0;
       for (const name of ['read', 'write', 'edit', 'glob', 'grep', 'bash']) ctx.tools.register({
@@ -1082,6 +2162,9 @@ test('configured native modes constrain real catalogs, final execution and neste
       });
       const read = { id: 'read-session', session: { id: 'read-session', header: {} } };
       const write = { id: 'write-session', session: { id: 'write-session', header: { parentSession: 'inactive-history-parent' } } };
+      const fullAgent = { id: 'full-session', session: { id: 'full-session', header: {} } };
+      const unknown = { id: 'unknown-session', session: { id: 'unknown-session' } };
+      const phoneNames = [...Phone.phoneToolNames].sort();
       ctx.agents.enter(read); ctx.agents.enter(write);
       await ctx.plugin(Guard);
       const childAgent = { id: 'child-session', session: { id: 'child-session', header: {} } };
@@ -1091,11 +2174,29 @@ test('configured native modes constrain real catalogs, final execution and neste
       await ctx.agents.announce(childAgent, 'create');
       assert.equal(announced, 1, 'policy registration must not bail out of official creation listeners');
       assert.equal(policyHost.cachedMode(childAgent.id), 'read-only', 'live child inherits its creator mode');
-      for (const method of ['schemas', 'sdkSchemas']) {
-        assert.deepEqual(ctx.tools[method](read).map(t => t.name).sort(), ['glob', 'grep', 'read']);
-        assert.deepEqual(ctx.tools[method](write).map(t => t.name).sort(), ['edit', 'glob', 'grep', 'read', 'write']);
+      for (const catalog of [agent => ctx.tools.schemas(agent), agent => ctx.tools.sdkSchemas(agent), agent => ctx.tools.wireSchemas(agent).schemas]) {
+        assert.deepEqual(catalog(read).map(t => t.name).sort(), ['glob', 'grep', 'read']);
+        assert.deepEqual(catalog(childAgent).map(t => t.name).sort(), ['glob', 'grep', 'read']);
+        assert.deepEqual(catalog(write).map(t => t.name).sort(), ['edit', 'glob', 'grep', 'read', 'write']);
+        assert.deepEqual(catalog(fullAgent).map(t => t.name).sort(), ['bash', 'edit', 'glob', 'grep', 'read', 'write', ...phoneNames].sort());
+        assert.deepEqual(catalog(unknown), []);
+        assert.deepEqual(catalog(undefined), []);
       }
-      assert.deepEqual(ctx.tools.wireSchemas(read).schemas.map(t => t.name).sort(), ['glob', 'grep', 'read']);
+      const phoneCall = (agent, name = 'phone_observe', args = {}) => ctx.tools.execute({
+        agent, name, arguments: args, signal: new AbortController().signal, callId: 'phone-bridge-catalog-test'
+      });
+      for (const agent of [read, childAgent, write, unknown, undefined]) {
+        const result = await phoneCall(agent);
+        assert.equal(result.isError, true, JSON.stringify(result));
+        assert.match(JSON.stringify(result), /当前会话尚未连接/);
+      }
+      const observed = await phoneCall(fullAgent);
+      assert.equal(observed.isError, false, JSON.stringify(observed));
+      assert.deepEqual(observed.value, { snapshot: 'catalog-snapshot', nodes: [] });
+      assert.deepEqual(observed.content, [{ type: 'text', text: JSON.stringify(observed.value) }]);
+      const escalated = await phoneCall(fullAgent, 'phone_observe', { sandbox_permissions: 'danger-full-access' });
+      assert.equal(escalated.isError, true);
+      assert.match(JSON.stringify(escalated), /不支持单次沙箱提权参数/);
       const call = agent => ctx.tools.execute({ agent, name: 'write', arguments: {}, signal: new AbortController().signal, callId: 'native-policy-test' });
       await call(read); assert.equal(writes, 0);
       await call(write); assert.equal(writes, 1);
@@ -1118,7 +2219,6 @@ test('configured native modes constrain real catalogs, final execution and neste
       const rejection = await call(denied);
       assert.match(JSON.stringify(rejection), /查询被拒绝/); assert.equal(writes, 2);
       await call(write); assert.equal(writes, 3, 'a rejected query must not stop another session');
-      const fullAgent = { id: 'full-session', session: { id: 'full-session', header: {} } };
       assert.equal(policyHost.cachedMode(fullAgent.id), 'full');
       assert.ok(ctx.tools.schemas(fullAgent).some(t => t.name === 'bash'));
       assert.ok(!ctx.tools.schemas(write).some(t => t.name === 'bash'));
@@ -1133,6 +2233,8 @@ test('configured native modes constrain real catalogs, final execution and neste
       const disconnected = await call(lost);
       assert.match(JSON.stringify(disconnected), /原生工具权限连接中断/); assert.equal(writes, 3);
       assert.deepEqual(ctx.tools.schemas(write), []);
+      assert.deepEqual(ctx.tools.schemas(fullAgent), []);
+      assert.equal((await phoneCall(fullAgent)).isError, true);
       await call(write); assert.equal(writes, 3);
     } finally { policyHost.close(); await ctx.fiber.dispose(); }
   `;
@@ -1145,6 +2247,8 @@ test('configured native modes constrain real catalogs, final execution and neste
   try {
     const code = await new Promise((resolve, reject) => { child.once('error', reject); child.once('close', resolve); });
     assert.equal(code, 0, output);
+    assert.equal(phoneRequests.length, 1, 'only the admitted Full call may reach the phone host');
+    assert.deepEqual(phoneRequests[0], { id: phoneRequests[0].id, method: 'phone', action: 'observe', args: {}, session: 'full-session' });
   } finally { clearTimeout(timer); child.kill(); await fixture.close(); }
 });
 
@@ -1301,7 +2405,38 @@ test('real upstream profile composition disables the original files and mounts t
   const entries = composeEntries(patches, message => warnings.push(message));
   assert.deepEqual(warnings, [], 'Android boot patches must not be skipped');
   assert.equal(entries.find(row => row.id === 'fs-sandbox')?.disabled, true);
+  assert.equal(entries.find(row => row.id === 'office-to-pdf')?.disabled, true);
   assert.equal(entries.find(row => row.id === 'dshx-android-files')?.name, `file:${core}/files.mjs`);
+  const sdk = composeEntries([
+    loadOverlayPatches('dshx-test', join(core, 'lib/node_modules/@deepseek-ai/dsh-base/cordis.patch.yml')),
+    loadOverlayPatches('dshx-test', join(core, 'lib/node_modules/@deepseek-ai/dsh-sdk-app/cordis.patch.yml')),
+  ], message => warnings.push(message));
+  assert.deepEqual(warnings, []);
+  assert.equal(sdk.find(row => row.id === 'skill-office')?.disabled, true);
+});
+
+test('Android slim runtime omits LibreOffice and shares the pinned schema dependency', async () => {
+  const modules = join(core, 'lib/node_modules');
+  const packages = await readdir(join(modules, '@deepseek-ai'));
+  assert.equal(packages.some(name => name === 'libreoffice-kit' || name.startsWith('libreoffice-kit-')), false);
+  const shared = require.resolve('zod');
+  let consumers = 0;
+  for (const name of packages) {
+    const path = join(modules, '@deepseek-ai', name, 'package.json');
+    const metadata = JSON.parse(await readFile(path, 'utf8'));
+    if (metadata.dependencies?.zod !== '4.4.3') continue;
+    const local = createRequire(path);
+    assert.equal(local.resolve('zod'), shared, `${name} must use the shared schema package`);
+    assert.equal(local('zod').z.string().parse('手机桥'), '手机桥');
+    consumers++;
+  }
+  assert.ok(consumers >= 50, 'check every pinned upstream consumer');
+  assert.equal(require('zod/package.json').version, '4.4.3');
+  assert.match(new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', year: 'numeric' }).format(new Date('2026-10-22T00:00:00Z')), /2026/);
+  const { DatabaseSync } = await import('node:sqlite');
+  const db = new DatabaseSync(':memory:');
+  try { assert.equal(db.prepare('SELECT 1 AS value').get().value, 1); }
+  finally { db.close(); }
 });
 
 test('Android model catalogs expose only available tools and preserve known history names', async () => {

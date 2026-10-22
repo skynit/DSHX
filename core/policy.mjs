@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { lstat, realpath } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { policyHost } from './host.mjs';
+import { phoneToolNames } from './phone.mjs';
 
 // The workspace is the default directory, not a sandbox for Full sessions.
 const workspace = process.env.DSHX_WORKSPACE;
@@ -58,13 +59,13 @@ export async function modelPath(path, cwd = workspace, signal) {
 
 export function toolAvailable(name, agent) {
   const mode = policyHost.cachedMode(agent?.session?.id);
-  return Boolean(workspace) && (fileTools.has(name) || name === 'bash' && mode === 'full') && mode !== 'unavailable' &&
+  return Boolean(workspace) && (fileTools.has(name) || (name === 'bash' || phoneToolNames.has(name)) && mode === 'full') && mode !== 'unavailable' &&
     !(mode === 'read-only' && ['write', 'edit'].includes(name));
 }
 
 export function toolReason(exec) {
   if (!workspace) return 'Android 工作区尚未配置，工具不可用。';
-  if (!fileTools.has(exec.name) && exec.name !== 'bash') return '此 Android 开发版尚未适配该模型工具。';
+  if (!fileTools.has(exec.name) && exec.name !== 'bash' && !phoneToolNames.has(exec.name)) return '此 Android 开发版尚未适配该模型工具。';
   if (!toolAvailable(exec.name, exec.agent)) return '当前会话尚未连接，工具暂不可用。';
   if (exec.arguments?.sandbox_permissions !== undefined) return 'Android 当前默认完全权限，不支持单次沙箱提权参数。';
   if (exec.name === 'bash' && exec.arguments?.run_in_background === true) return 'Android 当前仅开放前台命令。';

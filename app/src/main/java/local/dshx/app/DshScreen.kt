@@ -1,7 +1,10 @@
 package local.dshx.app
 
 import android.app.Activity
+import android.content.Intent
 import android.graphics.Rect
+import android.provider.Settings
+import android.widget.Toast
 import android.view.View
 import android.view.ViewTreeObserver
 import androidx.activity.compose.BackHandler
@@ -106,6 +109,7 @@ fun DshScreen(
     onTheme: (String) -> Unit, onStart: () -> Unit, onStop: () -> Unit,
     diagnostics: () -> String, pageError: String?, onReload: () -> Unit,
     assistantStore: AssistantStore,
+    phone: PhoneControl, phoneRevision: Int, onPhonePermission: (String) -> Unit,
     chat: @Composable (Modifier) -> Unit,
 ) {
     var tab by rememberSaveable { mutableIntStateOf(0) }
@@ -213,7 +217,7 @@ fun DshScreen(
                                 Divider()
                                 Info("网页组件", if (webReady) "可用 · ${webVersion?.substringBefore('.')}" else "需升级至 126 或更新版本")
                                 Divider()
-                                Info("运行环境", "${bundle.abi} · ${bundle.unpackedSize / 1024 / 1024} MB")
+                                Info("运行环境", "${bundle.abi} · ${bundle.unpackedSize / 1024 / 1024} MiB")
                             }
                             Note("数据保存在本机，模型请求发送至你配置的服务商。")
                         }
@@ -227,6 +231,7 @@ fun DshScreen(
                         }
                         else -> {
                             savedPages.SaveableStateProvider("assistant") { AssistantSettings(assistantStore) }
+                            PhoneSettings(phone, phoneRevision, onPhonePermission)
                             Section("工具与权限")
                             Panel {
                                 Text("完全权限", fontSize = 14.sp, fontWeight = FontWeight.Medium)
@@ -261,6 +266,58 @@ fun DshScreen(
                   }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun PhoneSettings(phone: PhoneControl, revision: Int, permission: (String) -> Unit) {
+    var status by remember(revision) { mutableStateOf(phone.status()) }
+    val context = LocalView.current.context
+    Section("手机操作")
+    Panel {
+        val enabled = status.optBoolean("enabled")
+        val connected = status.optBoolean("accessibility")
+        Text(if (enabled && connected) "设备与屏幕能力已开启" else if (enabled) "设备能力已开启，屏幕操作待授权" else "手机操作已暂停", fontSize = 14.sp, fontWeight = FontWeight.Medium)
+        Spacer(Modifier.height(8.dp))
+        Note("提供设备信息、应用、屏幕操作、文件、交互和感知共 23 项能力，不含虚拟屏幕。屏幕操作需要无障碍服务；下面的敏感能力可分别开启。读取的内容会提供给你配置的模型服务。")
+        Spacer(Modifier.height(12.dp))
+        Action(if (enabled) "暂停手机操作" else "开启手机操作", onClick = {
+            phone.setEnabled(!enabled)
+            status = phone.status()
+        }, modifier = Modifier.fillMaxWidth())
+        Spacer(Modifier.height(8.dp))
+        Action("打开无障碍设置", onClick = {
+            try { context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+            catch (_: RuntimeException) { Toast.makeText(context, "无法打开系统设置，请手动进入无障碍设置。", Toast.LENGTH_SHORT).show() }
+        }, modifier = Modifier.fillMaxWidth())
+        Spacer(Modifier.height(8.dp))
+        Action("刷新状态", onClick = { status = phone.status() }, modifier = Modifier.fillMaxWidth())
+        Spacer(Modifier.height(8.dp))
+        Note(if (status.optBoolean("screenshotSupported")) "当前系统支持截图；截图需要支持图片的模型。" else "当前使用控件操作，截图需要 Android 11 或更高版本。")
+        Spacer(Modifier.height(12.dp))
+        val capabilities = status.getJSONObject("capabilities")
+        val labels = linkedMapOf("clipboard" to "剪贴板", "files" to "文件访问", "location" to "位置", "sensors" to "传感器", "torch" to "手电筒", "overlay" to "悬浮提示")
+        for ((name, label) in labels) {
+            val allowed = capabilities.optBoolean(name)
+            Action("${if (allowed) "关闭" else "开启"}$label", onClick = {
+                phone.setAllowed(name, !allowed); status = phone.status()
+            }, modifier = Modifier.fillMaxWidth())
+            Spacer(Modifier.height(6.dp))
+        }
+        Note("剪贴板仅在 DSHX 窗口位于前台时读写。文件仅限应用工作区和下方授权目录；关闭文件访问会撤销目录授权。位置、相机、步数和悬浮提示还需要系统允许。")
+        Spacer(Modifier.height(8.dp))
+        Note("系统权限：位置${if (capabilities.optBoolean("locationPermission")) "已允许" else "未允许"} · 相机${if (capabilities.optBoolean("cameraPermission")) "已允许" else "未允许"} · 步数${if (capabilities.optBoolean("stepsPermission")) "已允许" else "未允许"} · 通知${if (capabilities.optBoolean("notificationsPermission")) "已允许" else "未允许"} · 悬浮提示${if (capabilities.optBoolean("overlayPermission")) "已允许" else "未允许"}")
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            for ((name, label) in linkedMapOf("location" to "位置权限", "torch" to "相机权限", "steps" to "步数权限", "notifications" to "通知设置", "overlay" to "悬浮提示权限")) {
+                Action(label, onClick = { permission(name) })
+            }
+        }
+        Spacer(Modifier.height(8.dp))
+        Note(if (capabilities.optBoolean("directoryReady")) "手机目录已授权${if (capabilities.optBoolean("directoryWritable")) "，可读取与导出" else "，仅可读取"}。" else "尚未授权手机目录；应用工作区仍可在开启文件访问后读取。")
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Action("选择手机文件目录", onClick = { permission("directory") }, enabled = capabilities.optBoolean("files"))
+            Action("撤销目录授权", onClick = { permission("revoke"); status = phone.status() }, enabled = capabilities.optBoolean("directoryReady"))
         }
     }
 }

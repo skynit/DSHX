@@ -1,6 +1,9 @@
 package local.dshx.app
 
 import android.annotation.SuppressLint
+import android.Manifest
+import android.os.Build
+import android.provider.Settings
 import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
@@ -23,6 +26,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.viewinterop.AndroidView
@@ -30,6 +34,7 @@ import org.json.JSONObject
 import java.net.URI
 
 class MainActivity : ComponentActivity() {
+    private var phoneRevision by mutableIntStateOf(0)
     private val engine get() = (application as DshApp).engine
     private val assistantStore by lazy { AssistantStore(filesDir) }
     private var browser: WebView? = null
@@ -40,6 +45,22 @@ class MainActivity : ComponentActivity() {
     private var fileInstance: String? = null
     private var fileMultiple = false
     private var filePending = false
+    private val phonePermissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { phoneRevision++ }
+    private val phoneDirectory = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        val data = result.data
+        val uri = data?.data
+        if (result.resultCode == RESULT_OK && uri != null && engine.phone.allowed("files")) {
+            val files = engine.phone.device.files
+            val version = files.requestGrant()
+            kotlin.concurrent.thread(name = "phone-directory", isDaemon = true) {
+                val result = runCatching { files.grant(uri, data.flags, version) }
+                runOnUiThread {
+                    phoneRevision++
+                    if (result.isFailure) Toast.makeText(this, "目录授权失败，请重新选择。", Toast.LENGTH_LONG).show()
+                }
+            }
+        } else phoneRevision++
+    }
     private val filePicker = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         filePending = false
         val current = fileCallback != null && fileBrowser === browser && fileInstance == engine.state.url &&
@@ -76,9 +97,29 @@ class MainActivity : ComponentActivity() {
                 diagnostics = engine::diagnostics, pageError = pageError,
                 onReload = { pageError = null; browser?.reload() },
                 assistantStore = assistantStore,
+                phone = engine.phone, phoneRevision = phoneRevision,
+                onPhonePermission = ::phonePermission,
                 chat = { modifier -> state.url?.let { instance -> AndroidView(modifier = modifier, factory = { webView(instance) }) } }
             )
         }
+    }
+
+    override fun onResume() { super.onResume(); engine.phone.device.attach(this); phoneRevision++ }
+    override fun onPause() { engine.phone.device.detach(this); super.onPause() }
+
+    private fun phonePermission(action: String) {
+        try {
+            when (action) {
+                "location" -> phonePermissions.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION))
+                "torch" -> phonePermissions.launch(arrayOf(Manifest.permission.CAMERA))
+                "steps" -> if (Build.VERSION.SDK_INT >= 29) phonePermissions.launch(arrayOf(Manifest.permission.ACTIVITY_RECOGNITION))
+                "notifications" -> startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, packageName))
+                "overlay" -> startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                "directory" -> phoneDirectory.launch(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).addFlags(
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION))
+                "revoke" -> { engine.phone.revokeDirectory(); phoneRevision++ }
+            }
+        } catch (_: RuntimeException) { Toast.makeText(this, "无法打开系统授权页面，请检查系统设置。", Toast.LENGTH_LONG).show() }
     }
 
     @SuppressLint("SetJavaScriptEnabled")

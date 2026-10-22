@@ -4,11 +4,14 @@ import promises from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { policyHost } from './host.mjs';
+import { isMainThread } from 'node:worker_threads';
 
 // Finish authentication before loading the full official profile. Its cold
 // module initialization can otherwise delay socket callbacks past the native
 // handshake deadline while every model call correctly remains unavailable.
-if (policyHost.configured) await policyHost.connect();
+// Image workers inherit --import and environment; only the main thread owns
+// the authenticated connection. Reconnecting here would stall WASM startup.
+if (isMainThread && policyHost.configured) await policyHost.connect();
 
 const native = createRequire(import.meta.url)('./native.node');
 const originalLink = promises.link.bind(promises);

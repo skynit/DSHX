@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -36,6 +37,28 @@ def download(item):
     return target
 
 
+def copy_libraries(usr, bundle):
+    # Keep the exact names requested by Android's loader. Package symlinks
+    # otherwise turn one ICU library into three full copies in the archive.
+    system = {"libc.so", "libdl.so", "libm.so", "liblog.so", "libandroid.so"}
+    pending = [file for file in bundle.rglob("*") if file.is_file() and
+               (file.parent == bundle / "bin" or file.suffix == ".node")]
+    copied = set()
+    while pending:
+        file = pending.pop()
+        dynamic = subprocess.check_output(["readelf", "-dW", str(file)], text=True)
+        for name in re.findall(r"\(NEEDED\).*?\[([^\]]+)\]", dynamic):
+            if name in copied or name in system:
+                continue
+            source = usr / "lib" / name
+            if not source.is_file():
+                raise ValueError("Missing Android library: " + name)
+            target = bundle / "lib" / name
+            shutil.copy2(source.resolve(), target)
+            copied.add(name)
+            pending.append(target)
+
+
 def build(abi):
     CACHE.mkdir(parents=True, exist_ok=True)
     ASSETS.mkdir(parents=True, exist_ok=True)
@@ -62,9 +85,6 @@ def build(abi):
         executables = {"bin/node", "bin/bash", "bin/rg", "bin/dshx-run"}
         for name in ("node", "bash", "rg"):
             shutil.copy2(usr / "bin" / name, bundle / "bin" / name)
-        for lib in (usr / "lib").glob("*.so*"):
-            if lib.is_file():
-                shutil.copy2(lib.resolve(), bundle / "lib" / lib.name)
         cert = bundle / "etc/tls/cert.pem"
         cert.parent.mkdir(parents=True)
         shutil.copy2(usr / "etc/tls/cert.pem", cert)
@@ -72,12 +92,13 @@ def build(abi):
             source = usr / "share" / name
             if source.exists():
                 shutil.copytree(source, bundle / "share" / name, symlinks=False)
-        # Preserve all shipped JS, frontend assets, manifests and licenses.
-        # Platform binaries from npm are never suitable Android binaries.
+        # Preserve runtime JS, frontend assets, manifests and licenses. Office
+        # conversion is not part of the phone app; no LibreOffice engine ships.
         def exclude(directory, names):
-            return [name for name in names if name in (".bin", ".cache") or
-                    name.endswith((".map", ".d.ts", ".node", ".so", ".dll", ".exe", ".dylib")) or
+            return [name for name in names if name in (".bin", ".cache", "test", "tests", "__tests__", "prebuilds") or
+                    name.endswith((".map", ".d.ts", ".d.cts", ".d.mts", ".pdb", ".node", ".so", ".dll", ".exe", ".dylib")) or
                     name.lower().startswith(("readme.", "changelog.")) or
+                    name == "libreoffice-kit" or name.startswith("libreoffice-kit-") or
                     name.startswith(("node-addon-system-linux-", "sherpa-onnx-linux-", "sharp-linux-", "sharp-libvips-linux-"))]
         modules = bundle / "lib/node_modules"
         shutil.copytree(SOURCE / "node_modules", modules, ignore=exclude, symlinks=False)
@@ -104,6 +125,14 @@ def build(abi):
             initial = digest(file)
             file.write_text(old.replace(before, after))
             patches.append({"path": path, "before": initial, "after": digest(file)})
+
+        patch("@deepseek-ai/dsh-sdk-app/cordis.patch.yml",
+              '      disabled: !!js "!(process.env.DSH_PRIMARY_RUNTIME ?? process.env.DSH_BUNDLED_PRIMARY_RUNTIME) && !process.env.DSH_BUNDLED_OFFICE_CLI"',
+              "      disabled: true")
+        # Leave ordinary PDF, image, text and spreadsheet previews available.
+        patch("@deepseek-ai/dsh-client-ui-sidebar-documentpreview/lib/client.js",
+              "\t\t\tapply$2(ctx, config.office);",
+              "\t\t\t// Office conversion is not bundled on Android.")
 
         # A restarted engine uses a new origin. Seed only the selected session;
         # all execution grants still come from the authenticated native bridge.
@@ -297,7 +326,7 @@ def build(abi):
               '\t\t\tupdateUsage(usage, object(event.message).usage);\n\t\t\treportProviderUsage({ ...usage });')
         patch('@deepseek-ai/dsh-llm-deepseek/lib/index.js',
               '\t\t\tif (event.usage !== void 0) updateUsage(usage, event.usage);',
-              '\t\t\tif (event.usage !== void 0) {\n\t\t\t\tupdateUsage(usage, event.usage);\n\t\t\t\treportProviderUsage({ ...usage });\n\t\t\t}')
+              '\t\t\tif (event.usage !== void 0) {\n\t\t\t\tupdateUsage(usage, event.usage);\n\t\t\t\treportProviderUsage({ ...usage }, object(event.delta).stop_reason != null && Number.isSafeInteger(object(event.usage).output_tokens) && object(event.usage).output_tokens >= 0);\n\t\t\t}')
         patch('@deepseek-ai/dsh-llm-deepseek/lib/index.js',
               '\t\t\tusage.totalTokens = usage.inputTokens + usage.outputTokens + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0);',
               '\t\t\t// Keep unreported totals unknown; earlier snapshots are already durable.')
@@ -325,7 +354,7 @@ def build(abi):
         patch('@deepseek-ai/dsh-llm-pi-ai/lib/index.js',
               '\t\t\tyield {\n\t\t\t\ttype: "usage",\n\t\t\t\tusage: mapUsage(event.error.usage)\n\t\t\t};',
               '\t\t\tif (providerUsage() !== void 0) yield {\n\t\t\t\ttype: "usage",\n\t\t\t\tusage: providerUsage()\n\t\t\t};')
-        for filename in ("start.mjs", "plugins.mjs", "assistant.mjs", "compat.mjs", "guard.mjs", "policy.mjs", "files.mjs", "host.mjs", "recover.mjs", "android.patch.yml"):
+        for filename in ("start.mjs", "plugins.mjs", "assistant.mjs", "compat.mjs", "guard.mjs", "policy.mjs", "files.mjs", "host.mjs", "phone.mjs", "recover.mjs", "android.patch.yml"):
             shutil.copy2(SOURCE / filename, bundle / filename)
         ndk = Path(os.environ.get("ANDROID_NDK_HOME", "/home/skynit/Android/Sdk/ndk/28.2.13676358"))
         compiler = ndk / "toolchains/llvm/prebuilt/linux-x86_64/bin" / (
@@ -343,6 +372,7 @@ def build(abi):
                         "-Wl,-z,max-page-size=16384", "-I/usr/include/node",
                         "-I" + str(SOURCE / "node_modules/node-addon-api"),
                         str(SOURCE / "node_modules/node-pty/src/unix/pty.cc"), "-o", str(pty)], check=True)
+        copy_libraries(usr, bundle)
         # Node addons are at the core root, outside npm's namespace layout.
         # ELF inventory catches accidentally retained Linux executables too.
         elf = []

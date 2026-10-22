@@ -2,6 +2,22 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.ACTIVITY_RECOGNITION" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
+    <uses-feature android:name="android.hardware.location" android:required="false" />
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
     <application
         android:name=".DshApp"
         android:allowBackup="false"
@@ -18,5 +34,23 @@
             </intent-filter>
         </activity>
         <service android:name=".EngineService" android:exported="false" android:stopWithTask="false" />
+        <activity android:name=".PhoneWindowActivity" android:exported="false"
+            android:supportsPictureInPicture="true" android:resizeableActivity="true"
+            android:taskAffinity="local.dshx.app.phone" android:excludeFromRecents="true"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|uiMode" />
+        <provider android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.phone.files" android:exported="false" android:grantUriPermissions="true">
+            <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/phone_files" />
+        </provider>
+        <service android:name=".PhoneService" android:exported="true"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            android:label="@string/phone_service_name">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data android:name="android.accessibilityservice"
+                android:resource="@xml/phone_service" />
+        </service>
     </application>
 </manifest>

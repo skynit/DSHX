@@ -12,10 +12,16 @@ import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Semaphore
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
-/** Authenticated JSON-lines queries for the current engine and its live sessions. */
-class PolicyBridge(private val policy: ToolPolicy, val instance: String, private val lost: () -> Unit) : Closeable {
+/** One authenticated connection for live sessions and cancellable native phone calls. */
+class PolicyBridge(
+    private val policy: ToolPolicy, val instance: String,
+    private val phone: ((String, JSONObject, String, () -> Boolean) -> JSONObject)? = null,
+    private val phoneFinished: ((String) -> Unit)? = null,
+    private val lost: () -> Unit,
+) : Closeable {
     val token = UUID.randomUUID().toString() + UUID.randomUUID().toString()
     private val server = ServerSocket(0, 8, InetAddress.getByName("127.0.0.1"))
     val port get() = server.localPort
@@ -23,6 +29,8 @@ class PolicyBridge(private val policy: ToolPolicy, val instance: String, private
     private val slots = Semaphore(4)
     @Volatile private var closed = false
     @Volatile private var client: Socket? = null
+    private data class Call(val id: Long, val session: String, val cancelled: AtomicBoolean = AtomicBoolean())
+    @Volatile private var phoneCall: Call? = null
 
     fun start() {
         thread(name = "dsh-policy-listener", isDaemon = true) {
@@ -69,17 +77,55 @@ class PolicyBridge(private val policy: ToolPolicy, val instance: String, private
                     val method = request.getString("method")
                     val allowed = when (method) {
                         "register" -> setOf("id", "method", "session", "title", "parent")
+                        "phone" -> setOf("id", "method", "session", "action", "args")
+                        "phone-cancel" -> setOf("id", "method", "session", "call")
                         else -> setOf("id", "method", "session")
                     }
                     require(request.keys().asSequence().all { it in allowed }) { "查询不接受额外字段" }
                     val session = request.optString("session")
+                    if (method == "phone") {
+                        policy.mode(instance, session)
+                        val owner = policy.state.sessions.first { it.id == session }
+                        val handler = requireNotNull(phone) { "手机功能桥未配置" }
+                        val action = request.getString("action")
+                        val args = request.getJSONObject("args")
+                        val call = Call(id.toLong(), session)
+                        synchronized(this) {
+                            require(phoneCall == null) { "已有手机操作正在执行，请等待回执后重新观察界面" }
+                            phoneCall = call
+                        }
+                        thread(name = "dsh-phone-call", isDaemon = true) {
+                            val result = JSONObject().put("id", id)
+                            try {
+                                val value = handler(action, args, session) {
+                                    !closed && !call.cancelled.get() &&
+                                        policy.state.sessions.any { it === owner } &&
+                                        runCatching { policy.mode(instance, session) == ToolPolicy.FULL }.getOrDefault(false)
+                                }
+                                require(!closed && !call.cancelled.get()) { "手机操作已取消，实际界面结果需重新观察" }
+                                result.put("ok", true).put("result", value)
+                            } catch (error: Exception) {
+                                result.put("ok", false).put("error", (error.message?.take(180) ?: "手机操作失败，请重新观察界面") +
+                                    if (action == "export") "；导出可能已开始，授权目录可能残留不完整文件，请检查。" else "")
+                            } finally {
+                                synchronized(this) { if (phoneCall === call) phoneCall = null }
+                            }
+                            runCatching { send(socket, result) }
+                        }
+                        continue
+                    }
                     when (method) {
                         "register" -> policy.register(instance, session, request.getString("title"), if (request.isNull("parent")) null else request.getString("parent"))
                         "mode" -> policy.mode(instance, session)
                         "end" -> policy.end(instance, session)
+                        "phone-finish" -> { policy.mode(instance, session); phoneFinished?.invoke(session) }
+                        "phone-cancel" -> {
+                            val call = request.getLong("call")
+                            phoneCall?.takeIf { it.id == call && it.session == session }?.cancelled?.set(true)
+                        }
                         else -> throw IllegalArgumentException("仅支持登记、查询和结束会话")
                     }
-                    response.put("ok", true).put("state", snapshot())
+                    response.put("ok", true)
                 } catch (_: Exception) {
                     response.put("ok", false).put("error", "会话查询无效或不支持；不能通过连接修改权限。")
                 }
@@ -106,6 +152,7 @@ class PolicyBridge(private val policy: ToolPolicy, val instance: String, private
     }
 
     private fun send(socket: Socket, value: JSONObject) = synchronized(socket) {
+        if (value.optBoolean("ok")) value.put("state", snapshot())
         socket.getOutputStream().apply { write((value.toString() + "\n").toByteArray(Charsets.UTF_8)); flush() }
     }
 
@@ -115,6 +162,7 @@ class PolicyBridge(private val policy: ToolPolicy, val instance: String, private
     }
 
     private fun release() {
+        phoneCall?.cancelled?.set(true)
         runCatching { server.close() }
         sockets.forEach { runCatching { it.close() } }
         policy.disconnect(instance)
@@ -123,7 +171,7 @@ class PolicyBridge(private val policy: ToolPolicy, val instance: String, private
     companion object {
         private fun line(input: InputStream, beforeRead: (() -> Unit)? = null): String? {
             val bytes = ByteArrayOutputStream()
-            while (bytes.size() <= 8_192) {
+            while (bytes.size() <= 32_768) {
                 beforeRead?.invoke()
                 val value = input.read()
                 if (value == -1) { require(bytes.size() == 0); return null }

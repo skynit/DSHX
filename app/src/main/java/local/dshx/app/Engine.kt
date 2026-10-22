@@ -18,6 +18,7 @@ data class EngineState(val phase: String = "未启动", val message: String = "�
 
 /** Owned by the Application; only the foreground service starts or stops it. */
 class Engine(private val context: Context, private val worker: Executor = Executors.newSingleThreadExecutor()) {
+    val phone = PhoneControl(context)
     private val main = Handler(Looper.getMainLooper())
     private val listeners = CopyOnWriteArraySet<(EngineState) -> Unit>()
     private val cancelled = AtomicBoolean(false)
@@ -78,7 +79,7 @@ class Engine(private val context: Context, private val worker: Executor = Execut
                 patch.writeText(File(core, "android.patch.yml").readText().replace("@CORE@", core.path))
                 val instance = UUID.randomUUID().toString()
                 tools.begin(instance)
-                val policyBridge = PolicyBridge(tools, instance) {
+                val policyBridge = PolicyBridge(tools, instance, phone::execute, phone::finish) {
                     main.post {
                         if (bridge?.instance == instance && !cancelled.get()) {
                             record("原生工具权限连接中断，已请求停止 dsh；旧会话权限不会恢复。")

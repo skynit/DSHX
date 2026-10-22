@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="phone_window_title">DSH · 手机操作</string>
+    <string name="phone_service_name">DSHX 手机操作</string>
+    <string name="phone_service_description">在你开启 DSHX 手机操作开关后，允许当前助手会话读取前台应用中的可见文字和控件、点击、设置非密码文本、滚动、系统按键，以及在 Android 11 及更新版本截取屏幕并根据最近截图点击和滑动。界面文字和截图会作为工具结果提供给你配置的模型服务。锁屏或息屏时拒绝操作；关闭 DSHX 中的开关立即撤销待执行请求，也可在系统无障碍设置中停用本服务。</string>
+</resources>
