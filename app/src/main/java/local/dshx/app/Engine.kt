@@ -65,6 +65,9 @@ class Engine(private val context: Context, private val worker: Executor = Execut
                 }
                 if (cancelled.get()) throw InterruptedException()
                 val home = File(context.filesDir, "home").apply { mkdirs() }
+                // Recover legacy settings before Node can read them, even if
+                // the user starts chat without opening the native settings page.
+                AssistantStore(context.filesDir).readSettings()
                 val workspace = File(context.filesDir, "workspace").apply { mkdirs() }
                 val temp = File(context.cacheDir, "engine").apply { mkdirs() }
                 val patch = File(context.filesDir, "android.patch.yml")
@@ -88,7 +91,7 @@ class Engine(private val context: Context, private val worker: Executor = Execut
                 val builder = ProcessBuilder(
                     File(core, "bin/dshx-run").path,
                     File(core, "bin/node").path, "--expose-internals", "--import", File(core, "compat.mjs").path,
-                    File(core, "lib/node_modules/@deepseek-ai/dsh/lib/bin.js").path,
+                    File(core, "start.mjs").path,
                     "--profile", "web", "--patch", patch.path,
                     "--no-open", "--host", "127.0.0.1", "--port", "0"
                 ).directory(workspace).redirectErrorStream(true)
@@ -98,6 +101,7 @@ class Engine(private val context: Context, private val worker: Executor = Execut
                     put("HOME", home.path)
                     put("DSH_HOME", File(home, ".dsh").path)
                     put("DSHX_WORKSPACE", workspace.path)
+                    put("DSHX_ASSISTANT_DIR", File(context.filesDir, "assistant").path)
                     put("DSHX_DATA_ROOT", context.applicationInfo.dataDir)
                     put("DSHX_POLICY_PORT", policyBridge.port.toString())
                     put("DSHX_POLICY_INSTANCE", instance)

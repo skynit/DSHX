@@ -39,7 +39,7 @@ class CoreStore(private val root: File) {
                 require(entries.isNotEmpty() && entries.values.all { it.size >= 0 && it.hash.matches(Regex("[a-f0-9]{64}")) }) {
                     "运行环境文件清单无效"
                 }
-                require(listOf("bin/node", "lib/node_modules/@deepseek-ai/dsh/lib/bin.js", "android.patch.yml", "guard.mjs", "native.node").all { it in entries }) {
+                require(startupFiles.all { it in entries }) {
                     "运行环境缺少启动文件"
                 }
                 return Manifest(version, json.getString("abi"), json.getString("sha256"), json.getLong("archiveSize"), entries)
@@ -58,7 +58,7 @@ class CoreStore(private val root: File) {
         if (Files.isSymbolicLink(root.toPath()) || Files.isSymbolicLink(base) ||
             !Files.isRegularFile(marker, NOFOLLOW_LINKS) || Files.size(marker) != manifest.archiveHash.length.toLong() ||
             marker.toFile().readText() != manifest.archiveHash) return null
-        for (name in listOf("bin/node", "lib/node_modules/@deepseek-ai/dsh/lib/bin.js", "android.patch.yml", "guard.mjs", "native.node")) {
+        for (name in startupFiles) {
             checkCancel(cancelled)
             val entry = manifest.entries[name] ?: return null
             val path = base.resolve(name)
@@ -227,6 +227,14 @@ class CoreStore(private val root: File) {
     }
 
     companion object {
+        private val startupFiles = listOf(
+            "bin/node", "start.mjs", "plugins.mjs", "assistant.mjs",
+            "lib/node_modules/@deepseek-ai/dsh/lib/bin.js",
+            "lib/node_modules/pnpm/bin/pnpm.cjs", "lib/node_modules/pnpm/dist/pnpm.cjs",
+            "lib/node_modules/npm/bin/npm-cli.js", "lib/node_modules/npm/lib/cli.js",
+            "android.patch.yml", "guard.mjs", "native.node"
+        )
+
         fun sha256(input: InputStream, cancelled: () -> Boolean = { false }): String {
             val digest = MessageDigest.getInstance("SHA-256")
             val buffer = ByteArray(64 * 1024)

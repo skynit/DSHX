@@ -31,6 +31,7 @@ import java.net.URI
 
 class MainActivity : ComponentActivity() {
     private val engine get() = (application as DshApp).engine
+    private val assistantStore by lazy { AssistantStore(filesDir) }
     private var browser: WebView? = null
     private var browserInstance: String? = null
     private var pageError by mutableStateOf<String?>(null)
@@ -74,6 +75,7 @@ class MainActivity : ComponentActivity() {
                 onStop = { startService(Intent(this, EngineService::class.java).setAction("stop")) },
                 diagnostics = engine::diagnostics, pageError = pageError,
                 onReload = { pageError = null; browser?.reload() },
+                assistantStore = assistantStore,
                 chat = { modifier -> state.url?.let { instance -> AndroidView(modifier = modifier, factory = { webView(instance) }) } }
             )
         }

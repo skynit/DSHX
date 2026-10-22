@@ -11,10 +11,15 @@ import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.input.TextFieldState
+import androidx.compose.foundation.text.input.TextFieldLineLimits
+import androidx.compose.foundation.text.input.rememberTextFieldState
+import androidx.compose.foundation.text.input.setTextAndPlaceCursorAtEnd
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -24,6 +29,9 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import com.composables.icons.lucide.House
 import com.composables.icons.lucide.Lucide
 import com.composables.icons.lucide.MessageSquare
@@ -79,12 +87,14 @@ fun DshScreen(
     state: EngineState, bundle: BundleInfo, webVersion: String?, theme: String,
     onTheme: (String) -> Unit, onStart: () -> Unit, onStop: () -> Unit,
     diagnostics: () -> String, pageError: String?, onReload: () -> Unit,
+    assistantStore: AssistantStore,
     chat: @Composable (Modifier) -> Unit,
 ) {
     var tab by rememberSaveable { mutableIntStateOf(0) }
     var logs by rememberSaveable { mutableStateOf(false) }
     var logText by remember { mutableStateOf("") }
     val scroll = remember(tab, logs) { ScrollState(0) }
+    val savedPages = rememberSaveableStateHolder()
     val running = state.url != null
     val active = running || state.busy
     val webReady = (webVersion?.substringBefore('.')?.toIntOrNull() ?: 0) >= 126
@@ -107,7 +117,7 @@ fun DshScreen(
         Scaffold(
             contentWindowInsets = WindowInsets(0, 0, 0, 0),
             bottomBar = {
-                if (!(tab == 1 && !logs && keyboardOpen)) NavigationBar(defaultWindowInsetsPadding = false) {
+                if (!(tab in 1..2 && !logs && keyboardOpen)) NavigationBar(defaultWindowInsetsPadding = false) {
                     listOf(Triple("工作台", Lucide.House, 0), Triple("聊天", Lucide.MessageSquare, 1), Triple("设置", Lucide.Settings2, 2)).forEach { (label, icon, index) ->
                         NavigationBarItem(selected = tab == index && !logs, onClick = { tab = index; logs = false }, icon = icon, label = label)
                     }
@@ -187,6 +197,7 @@ fun DshScreen(
                             TextButton("返回工作台", onClick = { tab = 0 }, minHeight = 48.dp)
                         }
                         else -> {
+                            savedPages.SaveableStateProvider("assistant") { AssistantSettings(assistantStore) }
                             Section("工具与权限")
                             Panel {
                                 Text("完全权限 · 默认", fontSize = 16.sp, fontWeight = FontWeight.Medium)
@@ -216,6 +227,89 @@ fun DshScreen(
             }
         }
     }
+}
+
+@Composable
+private fun AssistantSettings(store: AssistantStore) {
+    val name = rememberTextFieldState()
+    val identity = rememberTextFieldState()
+    val prompt = rememberTextFieldState()
+    var initialized by rememberSaveable { mutableStateOf(false) }
+    var saved by remember { mutableStateOf<AssistantStore.Settings?>(null) }
+    var loading by remember { mutableStateOf(true) }
+    var saving by remember { mutableStateOf(false) }
+    var settingsError by remember { mutableStateOf<String?>(null) }
+    var message by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+
+    fun fill(value: AssistantStore.Settings) {
+        name.setTextAndPlaceCursorAtEnd(value.name)
+        identity.setTextAndPlaceCursorAtEnd(value.identity)
+        prompt.setTextAndPlaceCursorAtEnd(value.prompt)
+        initialized = true
+    }
+    fun readSettings() {
+        loading = true
+        settingsError = null
+        scope.launch {
+            val result = withContext(Dispatchers.IO) { runCatching { store.readSettings() } }
+            result.onSuccess {
+                saved = it
+                if (!initialized) fill(it)
+            }.onFailure { settingsError = "读取设置失败：${it.message ?: "请重试"}。可重试读取，或编辑后保存、恢复默认。" }
+            loading = false
+        }
+    }
+    fun save(value: AssistantStore.Settings, defaults: Boolean) {
+        saving = true
+        message = null
+        settingsError = null
+        scope.launch {
+            val result = withContext(Dispatchers.IO) { runCatching { store.saveSettings(value) } }
+            result.onSuccess {
+                saved = it
+                fill(it)
+                message = if (defaults) "已恢复上游默认设置。" else "助手设置已保存。"
+            }.onFailure { settingsError = "保存设置失败：${it.message ?: "请重试"}" }
+            saving = false
+        }
+    }
+    LaunchedEffect(store) { readSettings() }
+
+    Section("助手人设")
+    Panel {
+        Note("人设是助手的名字、身份和回答指令，由你填写并保存在本机，不改变工具权限。每个字段留空时使用上游默认值。")
+        Spacer(Modifier.height(14.dp))
+        AssistantField("名字", name, 80, loading || saving, 1)
+        AssistantField("身份", identity, 2000, loading || saving, 4)
+        AssistantField("自定义提示词", prompt, 16000, loading || saving, 8)
+        Note("长度按 UTF-16 单位计算：常见汉字计 1，部分表情计 2；保存时去掉首尾空白。")
+        Spacer(Modifier.height(12.dp))
+        Button(onClick = { save(AssistantStore.Settings(name.text.toString(), identity.text.toString(), prompt.text.toString()), false) },
+            enabled = !loading && !saving, modifier = Modifier.fillMaxWidth(), minHeight = 48.dp,
+            colors = ButtonDefaults.buttonColorsPrimary()) {
+            Text(if (loading) "正在读取…" else if (saving) "正在保存…" else "保存人设")
+        }
+        TextButton("恢复上游默认设置", onClick = { save(AssistantStore.Settings(), true) },
+            enabled = !loading && !saving, modifier = Modifier.fillMaxWidth(), minHeight = 48.dp)
+        if (settingsError != null) {
+            Note(settingsError!!)
+            TextButton("重试读取设置", onClick = ::readSettings, enabled = !loading && !saving, minHeight = 48.dp)
+        }
+        val dirty = saved?.let { it != AssistantStore.Settings(name.text.toString(), identity.text.toString(), prompt.text.toString()) } ?: initialized
+        if (dirty) Note("有未保存的编辑。") else message?.let { Note(it) }
+        Spacer(Modifier.height(8.dp))
+        Note("保存后，从下一次对话步骤起使用新设置，包括已有会话；正在进行的调用和历史消息不变。自动标题和摘要仍使用专用指令。")
+    }
+}
+
+@Composable
+private fun AssistantField(label: String, state: TextFieldState, limit: Int, disabled: Boolean, lines: Int) {
+    TextField(state = state, label = label, enabled = !disabled, modifier = Modifier.fillMaxWidth(),
+        lineLimits = if (lines == 1) TextFieldLineLimits.SingleLine else TextFieldLineLimits.MultiLine(maxHeightInLines = lines))
+    val size = state.text.toString().trim().length
+    Note("$label · $size / $limit${if (size > limit) " · 超出长度限制，请缩短后保存" else ""}")
+    Spacer(Modifier.height(12.dp))
 }
 
 @Composable
