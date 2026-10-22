@@ -7,6 +7,9 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:net';
+import { createServer as createHttpServer } from 'node:http';
+import { createHash } from 'node:crypto';
+import { gzipSync } from 'node:zlib';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -21,6 +24,955 @@ const directory = await mkdtemp(join(tmpdir(), 'dshx-native-test-'));
 after(() => rm(directory, { recursive: true, force: true }));
 const workspace = await mkdtemp(join(process.env.DSHX_WORKSPACE, 'dshx-test-'));
 after(() => rm(workspace, { recursive: true, force: true }));
+
+test('Android assistant persona updates the next assembly including complete scoped presets and literal braces', async () => {
+  const { Context } = await load('@deepseek-ai/cordis');
+  const { createScope } = await load('@deepseek-ai/dsh-scope');
+  const { default: SystemPrompt, renderPrompt } = await load('@deepseek-ai/dsh-system-prompt');
+  const dir = await mkdtemp(join(directory, 'assistant-persona-'));
+  const previous = process.env.DSHX_ASSISTANT_DIR;
+  process.env.DSHX_ASSISTANT_DIR = dir;
+  const ctx = new Context();
+  try {
+    await ctx.plugin(SystemPrompt, { personaPrefix: 'upstream persona' });
+    const original = await ctx.systemPrompt.assemble();
+    assert.match(renderPrompt(original), /upstream persona/);
+    assert.equal(original.sections.some(section => section.name === 'android:assistant'), false);
+    const settings = { version: 1, name: '小禾', identity: '手机助手', prompt: '保留字面 {{name}}，使用中文' };
+    await writeFile(join(dir, 'settings.json'), JSON.stringify(settings));
+    const current = await ctx.systemPrompt.assemble();
+    assert.match(renderPrompt(current), /小禾/);
+    assert.match(renderPrompt(current), /字面 \{\{name\}\}/);
+    assert.equal(renderPrompt(original).includes('小禾'), false, 'accepted/history snapshots stay unchanged');
+    const key = {};
+    const scope = createScope(ctx, key);
+    try {
+      await scope.ctx.plugin(await load('@deepseek-ai/dsh-persona'), { prefix: 'complete preset', complete: true });
+      const complete = await ctx.systemPrompt.assemble({ scope: key });
+      assert.deepEqual(complete.sections.map(section => section.name), ['deployment:persona-prefix', 'android:assistant']);
+      assert.match(renderPrompt(complete), /complete preset.*小禾/s);
+    } finally { await scope.dispose(); }
+    await writeFile(join(dir, 'settings.json'), JSON.stringify({ ...settings, name: '新的名字' }));
+    assert.match(renderPrompt(await ctx.systemPrompt.assemble()), /新的名字/);
+    await writeFile(join(dir, 'settings.json'), JSON.stringify({ version: 1, name: '', identity: '', prompt: '' }));
+    assert.deepEqual(await ctx.systemPrompt.assemble(), original);
+    await writeFile(join(dir, 'settings.json'), JSON.stringify({ ...settings, name: 'x'.repeat(81) }));
+    await assert.rejects(ctx.systemPrompt.assemble(), /格式或长度无效/);
+    await writeFile(join(dir, 'settings.json'), '{broken');
+    await assert.rejects(ctx.systemPrompt.assemble(), /无法读取/);
+  } finally {
+    if (previous === undefined) delete process.env.DSHX_ASSISTANT_DIR;
+    else process.env.DSHX_ASSISTANT_DIR = previous;
+    await ctx.fiber.dispose();
+  }
+});
+
+test('Android assistant usage records concurrent snapshots once and preserves partial failed usage without content', async () => {
+  const { usageStream } = await import(pathToFileURL(join(core, 'assistant.mjs')));
+  const dir = await mkdtemp(join(directory, 'assistant-usage-'));
+  const collect = async stream => { const chunks = []; for await (const chunk of stream) chunks.push(chunk); return chunks; };
+  const options = { provider: 'fixture', model: 'single', sessionId: 'test-session', messages: [{ text: 'private prompt' }], apiKey: 'private-key' };
+  const usage = { inputTokens: 10, outputTokens: 6, cacheReadTokens: 4, cacheWriteTokens: 2, reasoningTokens: 3, totalTokens: 22 };
+  const good = [{ type: 'usage', usage }, { type: 'usage', usage }, { type: 'finish', reason: { kind: 'stop' } }];
+  const bad = [{ type: 'usage', usage: { outputTokens: 7, inputTokens: -1, extra: 'private response' } },
+    { type: 'finish', reason: { kind: 'error', failure: { message: 'private error' } } }];
+  const run = (chunks, extra) => collect(usageStream({ ...options, ...extra }, async function* () {
+    for (const chunk of chunks) { await delay(1); yield chunk; }
+  }, dir));
+  assert.deepEqual(await Promise.all([run(good), run(bad, { purpose: 'compaction' })]), [good, bad]);
+  const text = await readFile(join(dir, 'usage.jsonl'), 'utf8');
+  assert.doesNotMatch(text, /private|extra|apiKey|messages/);
+  const rows = text.trim().split('\n').map(JSON.parse);
+  const starts = rows.filter(row => row.event === 'start');
+  assert.equal(starts.length, 2);
+  assert.deepEqual(starts.map(row => row.purpose), ['other', 'compaction']);
+  for (const start of starts) assert.equal(rows.filter(row => row.id === start.id && row.event === 'finish').length, 1);
+  assert.deepEqual(rows.filter(row => row.event === 'usage').map(row => row.usage), [usage, { outputTokens: 7 }]);
+  assert.deepEqual(rows.filter(row => row.event === 'finish').map(row => row.outcome).sort(), ['failed', 'success']);
+});
+
+test('Android assistant usage distinguishes missing zero cancelled thrown and early closed calls', async () => {
+  const { usageStream } = await import(pathToFileURL(join(core, 'assistant.mjs')));
+  const dir = await mkdtemp(join(directory, 'assistant-outcomes-'));
+  const collect = async stream => { for await (const _ of stream) {} };
+  const options = { provider: 'fixture', model: 'single' };
+  await collect(usageStream(options, async function* () { yield { type: 'finish', reason: { kind: 'stop' } }; }, dir));
+  await collect(usageStream(options, async function* () {
+    yield { type: 'usage', usage: { inputTokens: 0, outputTokens: 0 } };
+    yield { type: 'finish', reason: { kind: 'max-tokens' } };
+  }, dir));
+  await collect(usageStream(options, async function* () { yield { type: 'finish', reason: { kind: 'aborted' } }; }, dir));
+  await assert.rejects(collect(usageStream(options, async function* () {
+    yield { type: 'usage', usage: { inputTokens: 2, outputTokens: 1 } };
+    throw new Error('fixture network failure');
+  }, dir)), /fixture network failure/);
+  let closed = false;
+  for await (const _ of usageStream(options, async function* () {
+    try { yield { type: 'usage', usage: { inputTokens: 3, outputTokens: 2 } }; }
+    finally { closed = true; }
+  }, dir)) break;
+  assert.equal(closed, true);
+  const rows = (await readFile(join(dir, 'usage.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+  assert.deepEqual(rows.filter(row => row.event === 'finish').map(row => row.outcome), ['success', 'success', 'cancelled', 'failed', 'incomplete']);
+  const starts = rows.filter(row => row.event === 'start');
+  assert.equal(rows.some(row => row.id === starts[0].id && row.event === 'usage'), false);
+  assert.deepEqual(rows.find(row => row.id === starts[1].id && row.event === 'usage').usage, { inputTokens: 0, outputTokens: 0 });
+  assert.deepEqual(rows.find(row => row.id === starts[3].id && row.event === 'usage').usage, { inputTokens: 2, outputTokens: 1 });
+});
+
+test('Android assistant actual LLM boundary records retries prepared title and compaction separately', async () => {
+  const { Context } = await load('@deepseek-ai/cordis');
+  const { default: LlmRuntime, LlmAdapter, markAgentLoopRequest } = await load('@deepseek-ai/dsh-llm');
+  const { executeSessionTitleLlm } = await load('@deepseek-ai/dsh-session-title-llm');
+  const { default: BasicCompactionEngine } = await load('@deepseek-ai/dsh-compaction-basic');
+  const dir = await mkdtemp(join(directory, 'assistant-llm-'));
+  const previous = process.env.DSHX_ASSISTANT_DIR;
+  process.env.DSHX_ASSISTANT_DIR = dir;
+  const ctx = new Context();
+  let calls = 0;
+  class Adapter extends LlmAdapter {
+    async *stream() {
+      calls++;
+      if (calls === 1) throw new Error('fixture first attempt');
+      yield { type: 'text-delta', index: 0, text: 'fixture title or summary' };
+      yield { type: 'usage', usage: { inputTokens: 10, outputTokens: 4 } };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    }
+  }
+  try {
+    await ctx.plugin(LlmRuntime);
+    ctx.llm.registerAdapter(['fixture'], new Adapter());
+    const options = markAgentLoopRequest({ provider: 'fixture', model: 'single', messages: [], sessionId: 'same-session' });
+    const collect = async stream => { const chunks = []; for await (const chunk of stream) chunks.push(chunk); return chunks; };
+    assert.equal((await collect(ctx.llm.stream(options))).at(-1).reason.kind, 'error');
+    await collect(ctx.llm.stream(options));
+    const sessionEvents = [];
+    await executeSessionTitleLlm(ctx, { maxInputBytes: 1000, maxOutputTokens: 64, timeoutMs: 1000 }, {
+      session: { id: 'same-session', append: (...args) => sessionEvents.push(args) }, route: { provider: 'fixture', model: 'single' },
+      signal: new AbortController().signal
+    }, 'fixture-title', { system: 'title system', input: 'title input', messageSeqs: [1], selectReasoningEffort: () => undefined });
+    assert.equal(sessionEvents[0][0], 'session/title-llm-request');
+    const compaction = new BasicCompactionEngine(ctx, { auto: false });
+    const summary = await compaction.summarize({ system: '', messages: [] }, {
+      options, session: { id: 'same-session', requestHeader: () => undefined, toolHistory: () => [] }
+    }, new AbortController().signal);
+    assert.equal(summary.summary[0].text, 'fixture title or summary');
+    await collect(ctx.llm.stream({ ...options, purpose: 'future-auxiliary' }));
+    // Translator-style calls omit purpose and are not main agent-loop requests.
+    await collect(ctx.llm.stream({ ...options }));
+    const prepared = await ctx.llm.prepareCall({ provider: 'fixture', model: 'single' });
+    await collect(prepared.stream({ ...options, ...prepared.config }));
+    class InvalidMetadata extends Adapter {
+      async prepareCall() { throw new Error('fixture metadata failure'); }
+    }
+    ctx.llm.registerAdapter(['bad-metadata'], new InvalidMetadata());
+    assert.equal((await collect(ctx.llm.stream({ ...options, provider: 'unregistered' }))).at(-1).reason.kind, 'error');
+    assert.equal((await collect(ctx.llm.stream({ ...options, provider: 'bad-metadata' }))).at(-1).reason.kind, 'error');
+    await assert.rejects(ctx.llm.prepareCall({ provider: 'bad-metadata', model: 'single' }), /metadata failure/);
+    const rows = (await readFile(join(dir, 'usage.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+    const starts = rows.filter(row => row.event === 'start');
+    assert.equal(calls, 7);
+    assert.equal(starts.length, calls);
+    assert.ok(starts.every(row => row.dispatch === 'adapter-attempt'));
+    assert.ok(starts.every(row => /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(row.id)));
+    assert.deepEqual(starts.map(row => row.purpose), ['conversation', 'conversation', 'session-title', 'compaction', 'other', 'other', 'other']);
+    assert.equal(new Set(starts.map(row => row.id)).size, calls);
+    assert.deepEqual(rows.filter(row => row.event === 'finish').map(row => row.outcome), ['failed', 'success', 'success', 'success', 'success', 'success', 'success']);
+  } finally {
+    if (previous === undefined) delete process.env.DSHX_ASSISTANT_DIR;
+    else process.env.DSHX_ASSISTANT_DIR = previous;
+    await ctx.fiber.dispose();
+  }
+});
+
+// These fixtures exercise the installed provider and pi-ai parsers over real
+// loopback HTTP. They never read credentials or contact a paid model endpoint.
+async function assistantServer(t, respond) {
+  const { Context } = await load('@deepseek-ai/cordis');
+  const { default: LlmRuntime } = await load('@deepseek-ai/dsh-llm');
+  const dir = await mkdtemp(join(process.env.DSHX_WORKSPACE, 'assistant-provider-'));
+  const previous = process.env.DSHX_ASSISTANT_DIR;
+  process.env.DSHX_ASSISTANT_DIR = dir;
+  const ctx = new Context();
+  const errors = [];
+  const requests = [];
+  const server = createHttpServer(async (request, response) => {
+    try {
+      const buffers = [];
+      for await (const data of request) buffers.push(data);
+      const body = Buffer.concat(buffers);
+      requests.push({ path: request.url, body });
+      await respond(request, response, body);
+    } catch (error) { errors.push(error); response.destroy(); }
+  });
+  t.after(async () => {
+    await ctx.fiber.dispose();
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+    if (previous === undefined) delete process.env.DSHX_ASSISTANT_DIR;
+    else process.env.DSHX_ASSISTANT_DIR = previous;
+    await rm(dir, { recursive: true, force: true });
+    assert.deepEqual(errors, []);
+  });
+  await ctx.plugin(LlmRuntime);
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  return {
+    ctx, dir, requests, url: `http://127.0.0.1:${server.address().port}/v1`,
+    async rows() {
+      try { return (await readFile(join(dir, 'usage.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse); }
+      catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+    },
+    async collect(stream) { const chunks = []; for await (const chunk of stream) chunks.push(chunk); return chunks; }
+  };
+}
+
+function assistantEvents(response, events, end = true) {
+  response.writeHead(200, { 'content-type': 'text/event-stream' });
+  for (const event of events) response.write(`${event.type ? `event: ${event.type}\n` : ''}data: ${JSON.stringify(event)}\n\n`);
+  if (end) response.end();
+}
+
+async function assistantWait(check) {
+  const until = Date.now() + 5000;
+  while (!await check()) {
+    assert.ok(Date.now() < until, 'provider fixture did not report before timeout');
+    await delay(10);
+  }
+}
+
+function assistantMessages(usage = { input_tokens: 11, output_tokens: 0, cache_read_input_tokens: 3 }) {
+  return [
+    { type: 'message_start', message: { id: 'fixture-message', model: 'single', usage } },
+    { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+    { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'fixture response' } },
+    { type: 'content_block_stop', index: 0 },
+    { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 5 } },
+    { type: 'message_stop' }
+  ];
+}
+
+async function assistantDeepSeek(fixture, extra = {}) {
+  const { DeepSeekAdapter, resolveAdapterOptions } = await load('@deepseek-ai/dsh-llm-deepseek');
+  const connection = resolveAdapterOptions({
+    baseURL: fixture.url, models: [{ id: 'single', inputModalities: ['text', 'image'] }],
+    streamIdleTimeoutMs: 2000
+  });
+  const adapter = new DeepSeekAdapter({
+    options: () => connection,
+    resolveAuth: async () => ({ headers: { 'x-api-key': 'fixture-private-key' } }),
+    resolveUserId: () => 'fixture-user',
+    prepareExtensions: async () => ({ fields: {}, accept: async () => {} }),
+    ...extra
+  });
+  fixture.ctx.llm.registerAdapter(['deepseek-fixture'], adapter);
+  return { provider: 'deepseek-fixture', model: 'single', messages: [], sessionId: 'deepseek-session' };
+}
+
+async function assistantPi(fixture, api, provider = api) {
+  const { PiAiAdapter } = await load('@deepseek-ai/dsh-llm-pi-ai');
+  const protocol = await import(pathToFileURL(join(core, `lib/node_modules/@earendil-works/pi-ai/dist/api/${api}.js`)));
+  const model = {
+    id: 'single', name: 'fixture', provider, api,
+    baseUrl: api === 'anthropic-messages' ? fixture.url.replace(/\/v1$/, '') : fixture.url,
+    input: ['text'], reasoning: false, contextWindow: 32000, maxTokens: 128,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+  };
+  const piProvider = {
+    id: provider, name: 'fixture', getModels: () => [model],
+    stream: protocol.stream, streamSimple: protocol.streamSimple,
+    auth: { apiKey: { resolve: async () => ({ auth: { apiKey: 'fixture-private-key' } }) } }
+  };
+  const profiles = new Map([[provider, {
+    piProvider, modelErrors: new Map(), configuredMaxTokens: new Map(),
+    streamIdleTimeoutMs: 2000, requestImagePixelBudget: 4194304, requestImageMaxBytes: 1048576
+  }]]);
+  fixture.ctx.llm.registerAdapter([provider], new PiAiAdapter({
+    profiles: () => profiles, resolveApiKey: async () => 'fixture-private-key'
+  }));
+  return { provider, model: 'single', messages: [], sessionId: `${provider}-session` };
+}
+
+test('Android assistant real DeepSeek preserves message_start and partial delta usage on disconnect and cancellation', async t => {
+  const fixture = await assistantServer(t, (request, response, body) => {
+    const mode = JSON.parse(body).messages[0].content[0].text;
+    const events = assistantMessages();
+    if (mode === 'disconnect') assistantEvents(response, [events[0], { type: 'message_delta', delta: {}, usage: { cache_creation_input_tokens: 0 } }]);
+    else if (mode === 'cancel') assistantEvents(response, [events[0]], false);
+    else assistantEvents(response, events);
+  });
+  const options = await assistantDeepSeek(fixture);
+  const messages = text => [{ role: 'user', content: [{ type: 'text', text }] }];
+  const success = await fixture.collect(fixture.ctx.llm.stream({ ...options, messages: messages('success') }));
+  assert.equal(success.at(-1).reason.kind, 'stop');
+  const broken = await fixture.collect(fixture.ctx.llm.stream({ ...options, messages: messages('disconnect') }));
+  assert.equal(broken.at(-1).reason.kind, 'error');
+  const abort = new AbortController();
+  const pending = fixture.collect(fixture.ctx.llm.stream({ ...options, messages: messages('cancel'), signal: abort.signal }));
+  await assistantWait(async () => (await fixture.rows()).filter(row => row.event === 'start').length === 3 && (await fixture.rows()).at(-1).event === 'usage');
+  abort.abort();
+  await pending;
+  const rows = await fixture.rows();
+  const starts = rows.filter(row => row.event === 'start');
+  assert.equal(starts.length, fixture.requests.length);
+  assert.ok(starts.every(row => row.dispatch === 'http-request' && row.purpose === 'other'));
+  assert.deepEqual(rows.filter(row => row.event === 'finish').map(row => row.outcome), ['success', 'failed', 'cancelled']);
+  assert.deepEqual(rows.filter(row => row.id === starts[1].id && row.event === 'usage').map(row => row.usage), [
+    { inputTokens: 11, outputTokens: 0, cacheReadTokens: 3 },
+    { inputTokens: 11, outputTokens: 0, cacheReadTokens: 3, cacheWriteTokens: 0 }
+  ]);
+  assert.ok(rows.filter(row => row.event === 'usage').every(row => row.usageSource === 'provider' && row.usage.totalTokens === undefined));
+  assert.doesNotMatch(JSON.stringify(rows), /fixture-private-key|fixture response|messages|content/);
+});
+
+test('Android assistant real DeepSeek stale files retry records both sends and excludes uploads credentials and metadata', async t => {
+  let uploads = 0;
+  let sends = 0;
+  const fixture = await assistantServer(t, async (request, response, body) => {
+    if (request.url === '/v1/models' || request.url === '/v1/credentials/refresh') {
+      response.end('{}');
+      return;
+    }
+    if (request.url === '/v1/files') {
+      uploads++;
+      const form = await new Response(body, { headers: { 'content-type': request.headers['content-type'] } }).formData();
+      const file = form.get('file');
+      response.setHeader('content-type', 'application/json');
+      response.end(JSON.stringify({
+        id: `file-fixture-${uploads}`, type: 'file', mime_type: file.type,
+        size_bytes: file.size, filename: file.name, created_at: new Date().toISOString()
+      }));
+      return;
+    }
+    assert.equal(request.url, '/v1/messages');
+    sends++;
+    const payload = JSON.parse(body);
+    const image = payload.messages[0].content.find(block => block.type === 'image');
+    assert.equal(image.source.file_id, `file-fixture-${sends}`);
+    if (sends === 1) {
+      response.writeHead(400, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ error: { type: 'invalid_request_error', message: 'file_id file-fixture-1 expired' } }));
+    } else assistantEvents(response, assistantMessages());
+  });
+  const { default: Attachments } = await load('@deepseek-ai/dsh-attachment-local');
+  await fixture.ctx.plugin(Attachments, { dshHome: join(fixture.dir, 'image-home'), normalizedImageMaxPixels: 4096 });
+  const sharp = require('sharp');
+  const data = await sharp({ create: { width: 8, height: 8, channels: 3, background: '#abcdef' } }).png().toBuffer();
+  const [attachment] = await fixture.ctx.attachments.saveImages([{ data, mediaType: 'image/png', name: 'fixture.png' }]);
+  const { DeepSeekFileStore, DeepSeekUploadIndex, resolveAdapterOptions } = await load('@deepseek-ai/dsh-llm-deepseek');
+  const files = new DeepSeekFileStore({ index: new DeepSeekUploadIndex(join(fixture.dir, 'uploads.json')) });
+  const options = await assistantDeepSeek(fixture, {
+    connect: async () => {
+      await fetch(`${fixture.url}/models`);
+      return resolveAdapterOptions({ baseURL: fixture.url, models: [{ id: 'single', inputModalities: ['text', 'image'] }], streamIdleTimeoutMs: 2000 });
+    },
+    resolveAuth: async () => {
+      await fetch(`${fixture.url}/credentials/refresh`);
+      return { headers: { 'x-api-key': 'fixture-private-key' } };
+    },
+    resolveFiles: () => files,
+    resolveAttachments: () => fixture.ctx.attachments
+  });
+  const chunks = await fixture.collect(fixture.ctx.llm.stream({ ...options, messages: [{ role: 'user', content: [{ type: 'image', attachment }] }] }));
+  assert.equal(chunks.at(-1).reason.kind, 'stop', JSON.stringify(chunks.at(-1)));
+  assert.equal(sends, 2);
+  assert.equal(uploads, 2);
+  assert.equal(fixture.requests.length, 6);
+  const rows = await fixture.rows();
+  const starts = rows.filter(row => row.event === 'start');
+  assert.equal(starts.length, 2);
+  assert.ok(starts.every(row => row.dispatch === 'http-request'));
+  assert.notEqual(starts[0].id, starts[1].id);
+  assert.deepEqual(rows.filter(row => row.event === 'finish').map(row => row.outcome), ['failed', 'success']);
+  assert.equal(rows.filter(row => row.id === starts[0].id && row.event === 'usage').length, 0);
+  assert.equal(rows.findIndex(row => row.event === 'finish' && row.id === starts[0].id) < rows.indexOf(starts[1]), true);
+});
+
+test('Android assistant real DeepSeek preflight failure never creates a send record', async t => {
+  const fixture = await assistantServer(t, () => assert.fail('preflight must not send a model request'));
+  const options = await assistantDeepSeek(fixture, { prepareExtensions: async () => { throw new Error('fixture extension failure'); } });
+  const chunks = await fixture.collect(fixture.ctx.llm.stream(options));
+  assert.equal(chunks.at(-1).reason.kind, 'error');
+  assert.deepEqual(await fixture.rows(), []);
+  assert.deepEqual(fixture.requests, []);
+});
+
+test('Android assistant real piAI completions distinguishes absent zero partial choice usage and disconnect', async t => {
+  const fixture = await assistantServer(t, (request, response, body) => {
+    const mode = JSON.parse(body).messages[0].content;
+    const first = { id: 'fixture', choices: [{ index: 0, delta: { role: 'assistant', content: 'fixture response' }, finish_reason: null }] };
+    const stop = { id: 'fixture', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] };
+    const raw = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, prompt_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 }, completion_tokens_details: { reasoning_tokens: 0 } };
+    if (mode === 'zero') assistantEvents(response, [first, { ...stop, usage: raw }]);
+    else if (mode === 'partial') assistantEvents(response, [first, { ...stop, usage: { prompt_tokens: 7 } }]);
+    else if (mode === 'choice') assistantEvents(response, [first, { id: 'fixture', choices: [{ ...stop.choices[0], usage: { completion_tokens: 0 } }] }]);
+    else if (mode === 'disconnect') assistantEvents(response, [{ ...first, usage: { prompt_tokens: 13, prompt_cache_hit_tokens: 4 } }]);
+    else if (mode === 'fail') { response.writeHead(503); response.end('{"error":{"message":"fixture failure"}}'); }
+    else assistantEvents(response, [first, stop]);
+  });
+  const options = await assistantPi(fixture, 'openai-completions');
+  for (const mode of ['absent', 'zero', 'partial', 'choice', 'disconnect', 'fail']) {
+    const chunks = await fixture.collect(fixture.ctx.llm.stream({ ...options, messages: [{ role: 'user', content: [{ type: 'text', text: mode }] }] }));
+    assert.equal(chunks.at(-1).reason.kind, ['disconnect', 'fail'].includes(mode) ? 'error' : 'stop', mode);
+    if (['absent', 'partial', 'choice', 'disconnect', 'fail'].includes(mode)) assert.equal(chunks.some(chunk => chunk.type === 'usage'), false, mode);
+    for (const chunk of chunks.filter(chunk => chunk.type === 'usage')) {
+      assert.ok(Number.isSafeInteger(chunk.usage.inputTokens) && Number.isSafeInteger(chunk.usage.outputTokens));
+    }
+  }
+  const rows = await fixture.rows();
+  const starts = rows.filter(row => row.event === 'start');
+  assert.equal(starts.length, 6);
+  assert.equal(starts.length, fixture.requests.length);
+  const usage = start => rows.filter(row => row.id === start.id && row.event === 'usage').map(row => row.usage);
+  assert.deepEqual(starts.map(usage), [[], [{ inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, totalTokens: 0 }],
+    [{ inputTokens: 7 }], [{ outputTokens: 0 }], [{ inputTokens: 9, cacheReadTokens: 4 }], []]);
+  assert.ok(starts.every(row => row.dispatch === 'http-request'));
+  assert.ok(rows.filter(row => row.event === 'usage').every(row => row.usageSource === 'provider'));
+});
+
+test('Android assistant real piAI responses and anthropic preserve only provider fields on success and failure', async t => {
+  let mode;
+  const fixture = await assistantServer(t, (request, response) => {
+    if (mode === 'fail') { response.writeHead(503); response.end('{"error":{"message":"fixture failure"}}'); return; }
+    if (new URL(request.url, 'http://fixture').pathname === '/v1/messages') {
+      const events = assistantMessages(mode.startsWith('absent') ? {} : { input_tokens: 0, cache_read_input_tokens: 0 });
+      events[4].usage = mode.startsWith('absent') ? {} : { output_tokens: 0 };
+      assistantEvents(response, mode.endsWith('disconnect') ? [events[0]] : events);
+    } else {
+      const usage = mode.startsWith('absent') ? undefined : { input_tokens: 0, output_tokens: 0, total_tokens: 0 };
+      const item = { id: 'fixture-item', type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'fixture response', annotations: [] }] };
+      assistantEvents(response, [
+        { type: 'response.created', response: { id: 'fixture-response', status: 'in_progress', ...(mode.endsWith('disconnect') ? { usage } : {}) } },
+        ...(mode.endsWith('disconnect') ? [] : [
+          { type: 'response.output_item.added', output_index: 0, item: { ...item, content: [] } },
+          { type: 'response.content_part.added', item_id: item.id, output_index: 0, content_index: 0, part: { type: 'output_text', text: '', annotations: [] } },
+          { type: 'response.output_text.delta', item_id: item.id, output_index: 0, content_index: 0, delta: 'fixture response' },
+          { type: 'response.output_item.done', output_index: 0, item },
+          { type: 'response.completed', response: { id: 'fixture-response', status: 'completed', output: [item], ...(usage === undefined ? {} : { usage }) } }
+        ])
+      ]);
+    }
+  });
+  for (const api of ['openai-responses', 'anthropic-messages']) {
+    const options = await assistantPi(fixture, api);
+    for (mode of ['absent', 'zero', 'disconnect', 'absent-disconnect', 'fail']) {
+      const before = (await fixture.rows()).length;
+      const chunks = await fixture.collect(fixture.ctx.llm.stream(options));
+      assert.equal(chunks.at(-1).reason.kind, mode.endsWith('disconnect') || mode === 'fail' ? 'error' : 'stop', `${api}/${mode}, paths=${fixture.requests.map(request => request.path)}: ${JSON.stringify(chunks.at(-1))}`);
+      const rows = (await fixture.rows()).slice(before);
+      const usages = rows.filter(row => row.event === 'usage');
+      if (mode.startsWith('absent') || mode === 'fail') {
+        assert.deepEqual(usages, []);
+        assert.equal(chunks.some(chunk => chunk.type === 'usage'), false);
+      }
+      else {
+        assert.ok(usages.length > 0, `${api}/${mode}`);
+        const usage = usages.at(-1).usage;
+        if (api === 'openai-responses') assert.deepEqual(usage, { inputTokens: 0, outputTokens: 0, totalTokens: 0 });
+        else assert.deepEqual(usage, { inputTokens: 0, cacheReadTokens: 0, ...(mode === 'disconnect' ? {} : { outputTokens: 0 }) });
+      }
+      assert.equal(rows[0].dispatch, 'http-request');
+    }
+  }
+  assert.equal((await fixture.rows()).filter(row => row.event === 'start').length, fixture.requests.length);
+});
+
+test('Android assistant real piAI Google catalog protocol remains an execution attempt with unknown usage', async t => {
+  const fixture = await assistantServer(t, (request, response) => assistantEvents(response, [{
+    candidates: [{ content: { role: 'model', parts: [{ text: 'fixture response' }] }, finishReason: 'STOP' }],
+    usageMetadata: { promptTokenCount: 0, candidatesTokenCount: 0, totalTokenCount: 0 }
+  }]));
+  const options = await assistantPi(fixture, 'google-generative-ai');
+  const chunks = await fixture.collect(fixture.ctx.llm.stream({ ...options, messages: [{ role: 'user', content: [{ type: 'text', text: 'fixture' }] }] }));
+  assert.equal(chunks.at(-1).reason.kind, 'stop', JSON.stringify(chunks.at(-1)));
+  assert.equal(chunks.some(chunk => chunk.type === 'usage'), false);
+  const rows = await fixture.rows();
+  assert.deepEqual(rows.map(row => row.event), ['start', 'finish']);
+  assert.equal(rows[0].dispatch, 'adapter-attempt');
+  assert.equal(rows[1].outcome, 'success');
+  assert.equal(fixture.requests.length, 1);
+});
+
+test('Android assistant real provider concurrent sends keep route session purpose and cumulative cache normalization isolated', async t => {
+  const fixture = await assistantServer(t, async (request, response, body) => {
+    const payload = JSON.parse(body);
+    if (request.url === '/v1/messages') {
+      await delay(20);
+      assistantEvents(response, assistantMessages({ input_tokens: 31, output_tokens: 0 }));
+      return;
+    }
+    const name = payload.messages[0].content;
+    const input = name === 'title' ? 17 : 23;
+    const first = { choices: [{ index: 0, delta: { content: 'fixture response' } }] };
+    response.writeHead(200, { 'content-type': 'text/event-stream' });
+    response.write(`data: ${JSON.stringify({ ...first, usage: { prompt_tokens: input } })}\n\n`);
+    await delay(name === 'title' ? 40 : 10);
+    response.end(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { completion_tokens: 2, prompt_tokens_details: { cached_tokens: 3 } } })}\n\n`);
+  });
+  const { markAgentLoopRequest } = await load('@deepseek-ai/dsh-llm');
+  const deepseek = markAgentLoopRequest(await assistantDeepSeek(fixture));
+  const pi = await assistantPi(fixture, 'openai-completions');
+  const prepared = await fixture.ctx.llm.prepareCall({ provider: pi.provider, model: pi.model });
+  const request = (text, purpose) => ({ ...pi, sessionId: `${text}-session`, purpose, messages: [{ role: 'user', content: [{ type: 'text', text }] }] });
+  await Promise.all([
+    fixture.collect(fixture.ctx.llm.stream(deepseek)),
+    fixture.collect(fixture.ctx.llm.stream(request('title', 'session-title'))),
+    fixture.collect(prepared.stream({ ...request('translator', undefined), ...prepared.config }))
+  ]);
+  const rows = await fixture.rows();
+  const starts = rows.filter(row => row.event === 'start');
+  assert.equal(starts.length, 3);
+  assert.equal(fixture.requests.length, 3);
+  for (const start of starts) {
+    const own = rows.filter(row => row.id === start.id);
+    assert.equal(own.at(-1).outcome, 'success');
+    const usage = own.filter(row => row.event === 'usage').at(-1).usage;
+    if (start.provider === deepseek.provider) {
+      assert.equal(start.sessionId, 'deepseek-session');
+      assert.equal(start.purpose, 'conversation');
+      assert.deepEqual(usage, { inputTokens: 31, outputTokens: 5 });
+    } else {
+      const title = start.sessionId === 'title-session';
+      assert.equal(start.purpose, title ? 'session-title' : 'other');
+      assert.deepEqual(usage, { inputTokens: (title ? 17 : 23) - 3, outputTokens: 2, cacheReadTokens: 3 });
+    }
+  }
+});
+
+test('Android assistant real piAI contradictory cache usage stays unknown instead of producing zero input', async t => {
+  const fixture = await assistantServer(t, (request, response) => assistantEvents(response, [
+    { choices: [{ index: 0, delta: { content: 'fixture response' } }], usage: { prompt_tokens: 2, completion_tokens: 0 } },
+    { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens_details: { cached_tokens: 4 } } }
+  ]));
+  const options = await assistantPi(fixture, 'openai-completions');
+  const chunks = await fixture.collect(fixture.ctx.llm.stream(options));
+  assert.equal(chunks.at(-1).reason.kind, 'stop');
+  assert.equal(chunks.some(chunk => chunk.type === 'usage'), false);
+  const usages = (await fixture.rows()).filter(row => row.event === 'usage');
+  assert.equal(usages[0].usage.inputTokens, 2);
+  assert.deepEqual(usages.at(-1).usage, { outputTokens: 0, cacheReadTokens: 4 });
+  assert.equal(usages.at(-1).usageAnomaly, 'cache-exceeds-input');
+});
+
+test('Android assistant real providers preserve input-only usage before SIGKILL without exposing partial business chunks', async t => {
+  const fixture = await assistantServer(t, (request, response) => {
+    const event = request.url === '/v1/messages'
+      ? assistantMessages({ input_tokens: 12, cache_read_input_tokens: 3 })[0]
+      : { choices: [], usage: { prompt_tokens: 15, prompt_tokens_details: { cached_tokens: 3 } } };
+    assistantEvents(response, [event], false);
+  });
+  for (const kind of ['deepseek', 'pi']) {
+    const dir = join(fixture.dir, kind);
+    await mkdir(dir);
+    const source = `import { createRequire } from 'node:module';
+      import { join } from 'node:path';
+      import { pathToFileURL } from 'node:url';
+      const core = ${JSON.stringify(core)};
+      const require = createRequire(join(core, 'lib/node_modules/package.json'));
+      const load = name => import(pathToFileURL(require.resolve(name)));
+      const { Context } = await load('@deepseek-ai/cordis');
+      const { default: LlmRuntime } = await load('@deepseek-ai/dsh-llm');
+      const ctx = new Context(); await ctx.plugin(LlmRuntime);
+      const fixture = {ctx, url:${JSON.stringify(fixture.url)}, dir:${JSON.stringify(dir)}};
+      const options = await (${kind === 'deepseek' ? assistantDeepSeek.toString() : assistantPi.toString()})(fixture${kind === 'pi' ? ", 'openai-completions'" : ''});
+      for await (const chunk of ctx.llm.stream(options)) {
+        if (chunk.type === 'usage') throw new Error('partial usage escaped into business stream');
+      }`;
+    const child = spawn(process.execPath, ['--input-type=module', '-e', source], {
+      env: { ...process.env, DSHX_ASSISTANT_DIR: dir }, stdio: ['ignore', 'pipe', 'pipe']
+    });
+    let errors = '';
+    child.stderr.on('data', data => { errors += data; });
+    try {
+      await assistantWait(async () => {
+        assert.equal(child.exitCode, null, errors);
+        try { return (await readFile(join(dir, 'usage.jsonl'), 'utf8')).includes('"event":"usage"'); }
+        catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+      });
+    } finally {
+      const closed = new Promise(resolve => child.once('close', resolve));
+      child.kill('SIGKILL');
+      await closed;
+    }
+    assert.equal(errors, '');
+    const rows = (await readFile(join(dir, 'usage.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+    assert.deepEqual(rows.map(row => row.event), ['start', 'usage']);
+    assert.equal(rows[0].dispatch, 'http-request');
+    assert.deepEqual(rows[1].usage, { inputTokens: 12, cacheReadTokens: 3 });
+    assert.equal(rows[1].usageSource, 'provider');
+  }
+});
+
+test('Android assistant crash preserves reported usage and separates a torn record on restart', async () => {
+  const dir = await mkdtemp(join(directory, 'assistant-crash-'));
+  const module = pathToFileURL(join(core, 'assistant.mjs')).href;
+  const source = `import { usageStream } from ${JSON.stringify(module)};
+    for await (const chunk of usageStream({provider:'fixture',model:'single'}, async function* () {
+      yield {type:'usage',usage:{inputTokens:12,outputTokens:3}};
+      await new Promise(() => {});
+    }, ${JSON.stringify(dir)})) { process.stdout.write('ready\\n'); setInterval(() => {}, 1000); }`;
+  const child = spawn(process.execPath, ['--input-type=module', '-e', source], { stdio: ['ignore', 'pipe', 'pipe'] });
+  let errors = '';
+  child.stderr.on('data', data => { errors += data; });
+  try {
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`child did not report usage: ${errors}`)), 5000);
+      child.stdout.once('data', () => { clearTimeout(timer); resolve(); });
+      child.once('error', error => { clearTimeout(timer); reject(error); });
+      child.once('exit', code => { clearTimeout(timer); reject(new Error(`child exited ${code}: ${errors}`)); });
+    });
+  } finally {
+    const exited = new Promise(resolve => child.once('close', resolve));
+    child.kill('SIGKILL');
+    await exited;
+  }
+  let rows = (await readFile(join(dir, 'usage.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+  assert.deepEqual(rows.map(row => row.event), ['start', 'usage']);
+  assert.deepEqual(rows[1].usage, { inputTokens: 12, outputTokens: 3 });
+  const file = await open(join(dir, 'usage.jsonl'), 'a');
+  await file.write('{torn'); await file.close();
+  const { usageStream } = await import(module);
+  for await (const _ of usageStream({ provider: 'fixture', model: 'single' }, async function* () {
+    yield { type: 'finish', reason: { kind: 'stop' } };
+  }, dir)) {}
+  const lines = (await readFile(join(dir, 'usage.jsonl'), 'utf8')).trim().split('\n');
+  assert.equal(lines[2], '{torn');
+  assert.equal(JSON.parse(lines[3]).event, 'start');
+  assert.equal(JSON.parse(lines[4]).outcome, 'success');
+});
+
+test('Android assistant refuses an unrecorded attempt when durable storage fails', async () => {
+  const { usageStream } = await import(pathToFileURL(join(core, 'assistant.mjs')));
+  const file = join(directory, 'assistant-not-directory');
+  await writeFile(file, 'keep');
+  let called = false;
+  await assert.rejects(async () => {
+    for await (const _ of usageStream({ provider: 'fixture', model: 'single' }, async function* () {
+      called = true;
+    }, file)) {}
+  });
+  assert.equal(called, false);
+  assert.equal(await readFile(file, 'utf8'), 'keep');
+  for (const closeFails of [false, true]) {
+    const dir = await mkdtemp(join(directory, 'assistant-finish-storage-'));
+    let closed = false;
+    const stream = usageStream({ provider: 'fixture', model: 'single' }, async function* () {
+      try { yield { type: 'text-delta', index: 0, text: 'started' }; }
+      finally {
+        closed = true;
+        if (closeFails) throw new Error('fixture cleanup failure');
+      }
+    }, dir);
+    await stream.next();
+    const ledger = join(dir, 'usage.jsonl');
+    await rm(ledger);
+    await mkdir(ledger);
+    await assert.rejects(stream.return(), error => error.code === 'EISDIR');
+    assert.equal(closed, true, 'storage failure must not skip provider cleanup');
+  }
+});
+
+test('Android plugin content checks follow selected transitive packages without scanning stale store entries', async () => {
+  const { checkPlugins } = await import(pathToFileURL(join(core, 'plugins.mjs')));
+  const modules = join(await mkdtemp(join(directory, 'plugin-tree-')), 'node_modules');
+  const selected = join(modules, '.pnpm/selected/node_modules');
+  const dependency = join(modules, '.pnpm/dependency/node_modules/dependency');
+  const stale = join(modules, '.pnpm/stale/node_modules/stale');
+  await mkdir(join(selected, 'selected'), { recursive: true });
+  await mkdir(dependency, { recursive: true });
+  await mkdir(stale, { recursive: true });
+  await writeFile(join(selected, 'selected/package.json'), '{"name":"selected"}');
+  await writeFile(join(dependency, 'package.json'), '{"name":"dependency"}');
+  await writeFile(join(dependency, 'code.wasm'), Buffer.from([0, 97, 115, 109]));
+  await writeFile(join(stale, 'unsupported.node'), 'unselected leftover');
+  await symlink(join(selected, 'selected'), join(modules, 'selected'));
+  await symlink(dependency, join(selected, 'dependency'));
+  await symlink(join(selected, 'selected'), join(dependency, 'loop'));
+  await checkPlugins(modules);
+  const binary = join(dependency, 'hidden-native');
+  await writeFile(binary, Buffer.from([127, 69, 76, 70]));
+  await assert.rejects(checkPlugins(modules), /原生二进制/);
+  await rm(binary);
+  const external = await mkdtemp(join(directory, 'outside-plugin-'));
+  await writeFile(join(external, 'keep.txt'), 'keep');
+  await symlink(external, join(dependency, 'outside'));
+  await assert.rejects(checkPlugins(modules), /安装目录之外/);
+  assert.equal(await readFile(join(external, 'keep.txt'), 'utf8'), 'keep');
+});
+
+test('Android plugin manager installs disables enables and removes a local bundle while scripts and hooks stay off', async () => {
+  const { packageManager } = await import(pathToFileURL(join(core, 'plugins.mjs')));
+  const { Context } = await load('@deepseek-ai/cordis');
+  const { default: PluginManager } = await load('@deepseek-ai/dsh-plugin-manager');
+  const dir = await mkdtemp(join(directory, 'plugin-profile-'));
+  const source = await mkdtemp(join(directory, 'plugin-source-'));
+  const marker = join(dir, 'must-not-run');
+  const script = `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`;
+  await writeFile(join(source, 'package.json'), JSON.stringify({
+    name: 'dshx-test-bundle', version: '1.0.0',
+    dsh: { bundle: { patch: './cordis.patch.yml' } },
+    scripts: { postinstall: `node -e ${JSON.stringify(script)}` }
+  }));
+  await writeFile(join(source, 'cordis.patch.yml'), '[]\n');
+  await writeFile(join(dir, 'package.json'), JSON.stringify({ private: true, dsh: { profile: { bundles: [] } } }));
+  await writeFile(join(dir, 'cordis.patch.yml'), '[]\n');
+  await writeFile(join(dir, '.npmrc'), 'ignore-scripts=false\nignore-pnpmfile=false\n');
+  await writeFile(join(dir, '.pnpmfile.cjs'), `${script}; module.exports = {};`);
+  const invocation = packageManager(core);
+  const ctx = new Context();
+  ctx.provide('loader', { entries: () => [] });
+  ctx.provide('profileContext', {
+    name: 'test', dir, patchPath: join(dir, 'cordis.patch.yml'),
+    installAnchor: require.resolve('@deepseek-ai/dsh/package.json'), cwd: dir, home: dir,
+    startedBundles: [], overlays: [],
+    packageManager: { ...invocation, env: { ...invocation.env, npm_config_offline: 'true' } }
+  });
+  try {
+    await ctx.plugin(PluginManager, { fallbackRegistries: [] });
+    const manager = ctx.pluginManager;
+    assert.equal((await manager.inspect(`file:${source}`)).status, 'accepted');
+    const original = await readFile(join(dir, 'package.json'), 'utf8');
+    const approved = await manager.installBundle(`file:${source}`, { approvedBuilds: ['example'] });
+    assert.equal(approved.application, 'failed');
+    assert.match(approved.error.diagnostic, /始终禁用构建脚本/);
+    assert.equal(await readFile(join(dir, 'package.json'), 'utf8'), original);
+    const installed = await manager.installBundle(`file:${source}`, { requestId: 'local-bundle' });
+    assert.equal(installed.application, 'restart-required', JSON.stringify(installed));
+    assert.equal((await manager.listBundles()).find(row => row.name === 'dshx-test-bundle').enabled, true);
+    assert.equal((await manager.setBundleEnabled('dshx-test-bundle', false)).application, 'restart-required');
+    assert.equal((await manager.listBundles()).find(row => row.name === 'dshx-test-bundle').enabled, false);
+    assert.equal((await manager.setBundleEnabled('dshx-test-bundle', true)).application, 'restart-required');
+    await assert.rejects(stat(marker), { code: 'ENOENT' });
+    const before = await readFile(join(dir, 'package.json'), 'utf8');
+    const failed = await manager.installBundle('link:unsupported');
+    assert.equal(failed.application, 'failed');
+    assert.equal(await readFile(join(dir, 'package.json'), 'utf8'), before);
+    const removed = await manager.removeBundle('dshx-test-bundle');
+    assert.equal(removed.application, 'restart-required', JSON.stringify(removed));
+    assert.equal((await manager.listBundles()).some(row => row.name === 'dshx-test-bundle'), false);
+    assert.equal((await manager.cancelInstall('unknown')).status, 'not-running');
+    await assert.rejects(stat(marker), { code: 'ENOENT' });
+    const saved = await readFile(join(dir, 'package.json'), 'utf8');
+    const lock = await readFile(join(dir, 'pnpm-lock.yaml'), 'utf8');
+    // Exercise the real manager's rollback after its runtime adapter rejects activation.
+    ctx.provide('hmr', {
+      runExclusive: operation => operation(),
+      reconcileProfile: async () => {
+        const manifest = JSON.parse(await readFile(join(dir, 'package.json'), 'utf8'));
+        if (manifest.dsh.profile.bundles.includes('dshx-test-bundle')) throw new Error('fixture activation failed');
+        return { warnings: [], pending: [] };
+      }
+    });
+    const broken = await manager.installBundle(`file:${source}`);
+    assert.equal(broken.application, 'failed', JSON.stringify(broken));
+    assert.match(broken.error.diagnostic, /fixture activation failed/);
+    assert.equal(await readFile(join(dir, 'package.json'), 'utf8'), saved);
+    assert.equal(await readFile(join(dir, 'pnpm-lock.yaml'), 'utf8'), lock);
+  } finally { await ctx.fiber.dispose(); }
+});
+
+// A loopback registry exercises pnpm's metadata, integrity and tarball paths
+// without relying on a mutable public package or spending model tokens.
+async function pluginRegistry(packages, stalled) {
+  function tar(files) {
+    const blocks = [];
+    for (const [name, content] of Object.entries(files)) {
+      const data = Buffer.from(content);
+      const header = Buffer.alloc(512);
+      header.write(`package/${name}`);
+      header.write('0000644\0', 100);
+      header.write('0000000\0', 108); header.write('0000000\0', 116);
+      header.write(data.length.toString(8).padStart(11, '0') + '\0', 124);
+      header.write('00000000000\0', 136); header.fill(32, 148, 156);
+      header.write('0', 156); header.write('ustar\0', 257); header.write('00', 263);
+      header.write([...header].reduce((sum, byte) => sum + byte, 0).toString(8).padStart(6, '0') + '\0 ', 148);
+      blocks.push(header, data, Buffer.alloc((512 - data.length % 512) % 512));
+    }
+    return gzipSync(Buffer.concat([...blocks, Buffer.alloc(1024)]));
+  }
+  const archives = new Map(Object.entries(packages).map(([name, files]) => [name, tar(files)]));
+  const requests = [];
+  let received, disconnected;
+  const started = new Promise(resolve => { received = resolve; });
+  const closed = new Promise(resolve => { disconnected = resolve; });
+  const server = createHttpServer((req, res) => {
+    requests.push(req.url);
+    const name = decodeURIComponent(req.url.slice(1).replace(/\.tgz$/, ''));
+    const archive = archives.get(name);
+    if (!archive) { res.writeHead(404); res.end('{}'); return; }
+    if (req.url.endsWith('.tgz')) {
+      res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': archive.length });
+      if (name === stalled) {
+        res.write(archive.subarray(0, 10));
+        res.once('close', disconnected); received();
+      } else res.end(archive);
+    } else {
+      const manifest = JSON.parse(packages[name]['package.json']);
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ ...manifest, 'dist-tags': { latest: '1.0.0' }, versions: {
+        '1.0.0': { ...manifest, dist: {
+          tarball: `http://127.0.0.1:${server.address().port}/${name}.tgz`,
+          integrity: 'sha512-' + createHash('sha512').update(archive).digest('base64')
+        } }
+      } }));
+    }
+  });
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  return {
+    url: `http://127.0.0.1:${server.address().port}/`, requests, started, closed,
+    close: () => { server.closeAllConnections(); return new Promise(resolve => server.close(resolve)); }
+  };
+}
+
+test('Android plugin registry downloads reject native dependencies and cancellation stops the actual download', { timeout: 90000 }, async () => {
+  const { packageManager } = await import(pathToFileURL(join(core, 'plugins.mjs')));
+  const { Context } = await load('@deepseek-ai/cordis');
+  const { default: PluginManager } = await load('@deepseek-ai/dsh-plugin-manager');
+  const bundle = (name, extra = {}, files = {}) => ({
+    'package.json': JSON.stringify({ name, version: '1.0.0', dsh: { bundle: { patch: './cordis.patch.yml' } }, ...extra }),
+    'cordis.patch.yml': '[]\n', ...files
+  });
+  const registry = await pluginRegistry({
+    'dshx-registry-good': bundle('dshx-registry-good'),
+    'dshx-registry-slow': bundle('dshx-registry-slow'),
+    'dshx-registry-native': bundle('dshx-registry-native', { dependencies: { 'dshx-native-dependency': '1.0.0' } }),
+    'dshx-native-dependency': { 'package.json': '{"name":"dshx-native-dependency","version":"1.0.0"}', 'addon.node': 'unsupported' },
+    'dshx-registry-plain': { 'package.json': '{"name":"dshx-registry-plain","version":"1.0.0"}' },
+    'dshx-registry-bad-patch': bundle('dshx-registry-bad-patch', {}, { 'cordis.patch.yml': '[unclosed' })
+  }, 'dshx-registry-slow');
+  const dir = await mkdtemp(join(directory, 'plugin-registry-'));
+  await writeFile(join(dir, 'package.json'), '{"private":true,"dsh":{"profile":{"bundles":[]}}}');
+  await writeFile(join(dir, 'cordis.patch.yml'), '[]\n');
+  // A fresh store proves each run actually downloads, rather than reusing the
+  // same content-addressed archive from an earlier test invocation.
+  await writeFile(join(dir, '.npmrc'), `store-dir=${join(dir, 'store')}\n`);
+  const invocation = packageManager(core);
+  const ctx = new Context();
+  ctx.provide('loader', { entries: () => [] });
+  ctx.provide('profileContext', {
+    name: 'registry', dir, patchPath: join(dir, 'cordis.patch.yml'), cwd: dir, home: dir,
+    installAnchor: require.resolve('@deepseek-ai/dsh/package.json'), startedBundles: [], overlays: [],
+    packageManager: { ...invocation, env: { ...invocation.env, npm_config_offline: 'false' } }
+  });
+  try {
+    await ctx.plugin(PluginManager, { registry: registry.url, fallbackRegistries: [] });
+    const manager = ctx.pluginManager;
+    const inspection = await manager.inspect('dshx-registry-good');
+    assert.equal(inspection.status, 'accepted', JSON.stringify(inspection));
+    const installed = await manager.installBundle('dshx-registry-good');
+    assert.equal(installed.application, 'restart-required', JSON.stringify(installed));
+    assert.ok(registry.requests.includes('/dshx-registry-good.tgz'));
+    assert.equal(JSON.parse(await readFile(join(dir, 'package.json'), 'utf8')).dependencies['dshx-registry-good'], '1.0.0');
+    const saved = await Promise.all(['package.json', 'pnpm-lock.yaml', 'cordis.patch.yml'].map(file => readFile(join(dir, file), 'utf8')));
+    const unchanged = async () => assert.deepEqual(await Promise.all(['package.json', 'pnpm-lock.yaml', 'cordis.patch.yml'].map(file => readFile(join(dir, file), 'utf8'))), saved);
+    for (const [name, reason] of [['dshx-registry-native', /原生依赖/], ['dshx-registry-plain', /not.*bundle/i], ['dshx-registry-bad-patch', /parse|YAML|flow|expected/i]]) {
+      const failed = await manager.installBundle(name);
+      assert.equal(failed.application, 'failed', JSON.stringify(failed));
+      assert.match(failed.error.diagnostic ?? failed.error.code, reason);
+      await unchanged();
+    }
+    const pending = manager.installBundle('dshx-registry-slow', { requestId: 'slow-download' });
+    const waitForDownload = async (event, label) => {
+      let timer;
+      try { await Promise.race([event, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(label)), 25000); })]); }
+      finally { clearTimeout(timer); }
+    };
+    await waitForDownload(registry.started, 'tarball download did not start');
+    assert.equal((await manager.cancelInstall('slow-download')).status, 'cancelled');
+    const cancelled = await pending;
+    assert.equal(cancelled.application, 'cancelled', JSON.stringify(cancelled));
+    await waitForDownload(registry.closed, 'cancelled pnpm kept the download connection open');
+    await unchanged();
+    assert.equal((await manager.cancelInstall('slow-download')).status, 'not-running');
+    assert.equal((await manager.listBundles()).find(row => row.name === 'dshx-registry-good').enabled, true);
+    const removed = await manager.removeBundle('dshx-registry-good');
+    assert.equal(removed.application, 'restart-required', JSON.stringify(removed));
+  } finally { await ctx.fiber.dispose(); await registry.close(); }
+});
+
+test('Android plugin actual loader starts stops reloads and restores a failing bundle', { timeout: 90000 }, async () => {
+  const dir = await mkdtemp(join(directory, 'plugin-live-'));
+  const script = `
+    import assert from 'node:assert/strict';
+    import { createRequire } from 'node:module';
+    import { pathToFileURL } from 'node:url';
+    import { join } from 'node:path';
+    import { mkdirSync, writeFileSync, readFileSync } from 'node:fs';
+    const core = process.env.DSHX_CORE;
+    const dir = ${JSON.stringify(dir)};
+    const require = createRequire(join(core, 'lib/node_modules/package.json'));
+    const load = name => import(pathToFileURL(require.resolve(name)));
+    const { packageManager } = await import(pathToFileURL(join(core, 'plugins.mjs')));
+    const { runProfile } = await load('@deepseek-ai/dsh/profile-boot');
+    const { loadProfileDirectory } = await load('@deepseek-ai/dsh-app-boot');
+    const { createLaunchEnvironmentSnapshot } = await load('@deepseek-ai/dsh-launch-environment');
+    const profile = join(dir, 'profile'); mkdirSync(profile);
+    const marker = join(dir, 'lifecycle');
+    const makeBundle = (name, code) => {
+      const source = join(dir, name); mkdirSync(source);
+      writeFileSync(join(source, 'package.json'), JSON.stringify({ name, version: '1.0.0', type: 'module', main: './index.mjs', dsh: { bundle: { patch: './cordis.patch.yml' } } }));
+      writeFileSync(join(source, 'index.mjs'), code);
+      writeFileSync(join(source, 'cordis.patch.yml'), JSON.stringify([{ insert: [{ id: name, name }] }]));
+      return 'file:' + source;
+    };
+    const good = makeBundle('dshx-live-good',
+      'import { appendFileSync } from "node:fs"; export function apply(ctx) { appendFileSync(' + JSON.stringify(marker) + ', "start\\\\n"); ctx.effect(() => () => appendFileSync(' + JSON.stringify(marker) + ', "stop\\\\n")); }');
+    const broken = makeBundle('dshx-live-broken', 'export function apply() { throw new Error("actual activation failed"); }');
+    writeFileSync(join(profile, 'package.json'), '{"private":true,"dsh":{"profile":{"bundles":[]}}}');
+    writeFileSync(join(profile, 'cordis.patch.yml'), JSON.stringify([{ insert: [
+      { id: 'timer', name: pathToFileURL(require.resolve('@deepseek-ai/cordis-plugin-timer')).href },
+      { id: 'hmr', name: pathToFileURL(require.resolve('@deepseek-ai/dsh-hmr')).href, config: { root: [] } },
+      { id: 'plugin-manager', name: pathToFileURL(require.resolve('@deepseek-ai/dsh-plugin-manager')).href }
+    ] }]));
+    const anchor = require.resolve('@deepseek-ai/dsh/package.json');
+    const invocation = packageManager(core);
+    const app = await runProfile({ environment: createLaunchEnvironmentSnapshot([]), profile: 'live-test', patchFiles: [], args: [],
+      resolvedProfile: { profile: loadProfileDirectory('dsh', profile, anchor), installAnchor: anchor },
+      packageManager: { ...invocation, env: { ...invocation.env, npm_config_offline: 'true' } }
+    });
+    try {
+      const { ctx } = app;
+      assert.ok(ctx.get('hmr'), 'real HMR must be mounted');
+      const manager = ctx.pluginManager;
+      const installed = await manager.installBundle(good);
+      assert.equal(installed.application, 'applied', JSON.stringify(installed));
+      assert.equal(readFileSync(marker, 'utf8'), 'start\\n');
+      assert.equal((await manager.setBundleEnabled('dshx-live-good', false)).application, 'applied');
+      assert.equal(readFileSync(marker, 'utf8'), 'start\\nstop\\n');
+      assert.equal((await manager.setBundleEnabled('dshx-live-good', true)).application, 'applied');
+      assert.equal(readFileSync(marker, 'utf8'), 'start\\nstop\\nstart\\n');
+      const plugin = (await manager.listPlugins()).find(row => row.moduleName === 'dshx-live-good');
+      assert.ok(plugin && !plugin.readOnlyReason, JSON.stringify(plugin));
+      assert.equal((await manager.setPluginEnabled(plugin.entryId, false)).application, 'applied');
+      assert.equal(readFileSync(marker, 'utf8'), 'start\\nstop\\nstart\\nstop\\n');
+      assert.equal((await manager.setPluginEnabled(plugin.entryId, true)).application, 'applied');
+      assert.equal(readFileSync(marker, 'utf8'), 'start\\nstop\\nstart\\nstop\\nstart\\n');
+      const files = ['package.json', 'pnpm-lock.yaml', 'cordis.patch.yml'];
+      const saved = files.map(file => readFileSync(join(profile, file), 'utf8'));
+      const failed = await manager.installBundle(broken);
+      assert.equal(failed.application, 'failed', JSON.stringify(failed));
+      assert.match(failed.error.diagnostic, /actual activation failed/);
+      assert.deepEqual(files.map(file => readFileSync(join(profile, file), 'utf8')), saved);
+      assert.equal((await manager.listBundles()).find(row => row.name === 'dshx-live-good').enabled, true);
+      const removed = await manager.removeBundle('dshx-live-good');
+      assert.ok(['applied', 'restart-required'].includes(removed.application), JSON.stringify(removed));
+      if (removed.application === 'restart-required') assert.equal(removed.restartReason, 'module-comparison', JSON.stringify(removed));
+      assert.equal(readFileSync(marker, 'utf8').split('start\\n').length - 1, readFileSync(marker, 'utf8').split('stop\\n').length - 1);
+      assert.equal((await manager.listBundles()).some(row => row.name === 'dshx-live-good'), false);
+      console.log('Actual plugin lifecycle and activation rollback passed');
+    } finally { await app.shutdown.shutdown(0); }
+  `;
+  const child = spawn(process.execPath, ['--expose-internals', '--import', join(core, 'compat.mjs'), '--input-type=module', '-e', script], {
+    env: { ...process.env, DSH_HOME: join(dir, 'home') }, stdio: ['ignore', 'pipe', 'pipe']
+  });
+  let output = '';
+  child.stdout.on('data', chunk => { output += chunk; }); child.stderr.on('data', chunk => { output += chunk; });
+  const timeout = setTimeout(() => child.kill('SIGKILL'), 80000);
+  try {
+    const code = await new Promise((resolve, reject) => { child.once('error', reject); child.once('close', resolve); });
+    assert.equal(code, 0, output);
+    assert.match(output, /Actual plugin lifecycle and activation rollback passed/);
+  } finally { clearTimeout(timeout); if (child.exitCode === null) child.kill('SIGKILL'); }
+});
 
 // The fixture imitates the query-only wire protocol. Kotlin's real authority
 // and native-only mode changes are exercised separately in CoreTest.kt.

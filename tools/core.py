@@ -239,7 +239,93 @@ def build(abi):
         patch("@deepseek-ai/dsh-terminal-bash/lib/index.js",
               'const DEFAULT_BASH_SHELL = "/bin/bash";',
               'const DEFAULT_BASH_SHELL = process.platform === "android" ? process.execPath.replace(/node$/, "bash") : "/bin/bash";')
-        for filename in ("compat.mjs", "guard.mjs", "policy.mjs", "files.mjs", "host.mjs", "recover.mjs", "android.patch.yml"):
+        patch("@deepseek-ai/dsh-plugin-manager/lib/index.js",
+              'if (options?.approvedBuilds !== void 0) {',
+              'if (process.platform === "android" && options?.approvedBuilds?.length > 0) throw new Error("Android 插件安装始终禁用构建脚本，请安装已构建的纯 JS/WASM 发布包");\n'
+              '\t\t\t\tif (options?.approvedBuilds !== void 0) {')
+        patch("@deepseek-ai/dsh-plugin-manager/lib/index.js",
+              'const RESTORED_FILES = ["package.json", "pnpm-lock.yaml"];',
+              'const RESTORED_FILES = ["package.json", "pnpm-lock.yaml", "cordis.patch.yml"];')
+        patch("@deepseek-ai/dsh-plugin-manager/lib/index.js",
+              'const before = this.diskState();',
+              'const before = this.diskState();\n'
+              '\t\t\t\tconst androidFiles = process.platform === "android" && reason !== "remove" ? await this.readRestoredFiles() : void 0;')
+        patch("@deepseek-ai/dsh-plugin-manager/lib/index.js",
+              '} catch (error) {\n\t\t\t\t\tif (error instanceof InstallCancelledError)',
+              '} catch (error) {\n'
+              '\t\t\t\t\tif (androidFiles !== void 0) {\n'
+              '\t\t\t\t\t\tawait this.restoreFiles(androidFiles);\n'
+              '\t\t\t\t\t\ttry { await this.configure(() => this.publishAndReload()); }\n'
+              '\t\t\t\t\t\tcatch (restoreError) { error = new Error(`${messageOf(error)}\\n配置已还原，但运行状态恢复失败，请停止后重新启动：${messageOf(restoreError)}`); }\n'
+              '\t\t\t\t\t}\n'
+              '\t\t\t\t\tif (error instanceof InstallCancelledError)')
+        # Wrap the final public assembly so complete scoped personas retain
+        # their original behavior while receiving literal Android settings.
+        patch("@deepseek-ai/dsh-system-prompt/lib/index.js",
+              'import { Service } from "@deepseek-ai/cordis";',
+              'import { Service } from "@deepseek-ai/cordis";\n'
+              'import { personaAssembly } from "../../../../../assistant.mjs";')
+        patch("@deepseek-ai/dsh-system-prompt/lib/index.js",
+              '\tasync assemble(context = {}) {',
+              '\tasync assemble(context = {}) {\n'
+              '\t\tconst assembly = await this.androidAssemble(context);\n'
+              '\t\treturn personaAssembly(assembly);\n'
+              '\t}\n'
+              '\tasync androidAssemble(context = {}) {')
+        # Selection and preparation do not count as model dispatch. Fixed built-in
+        # transports own starts; opaque adapters explicitly record execution attempts.
+        patch('@deepseek-ai/dsh-llm/lib/index.js',
+              'import { createRequire } from "node:module";',
+              'import { createRequire } from "node:module";\nimport { usageStream, modelTransport } from "../../../../../assistant.mjs";')
+        patch('@deepseek-ai/dsh-llm/lib/index.js',
+              '\t\tasync *adapterStream(options, prepared) {',
+              '\t\tasync *adapterStream(options, prepared) {\n\t\t\tconst accounting = { ...options, purpose: options.purpose ?? (isAgentLoopRequest(options) ? "conversation" : "other") };')
+        patch('@deepseek-ai/dsh-llm/lib/index.js',
+              '\t\t\t\titerator = dispatch(this.forAdapter(projectedOptions, adapter))[Symbol.asyncIterator]();',
+              '\t\t\t\titerator = usageStream(accounting, () => dispatch(this.forAdapter(projectedOptions, adapter)), void 0, adapter[modelTransport] === true)[Symbol.asyncIterator]();')
+        patch('@deepseek-ai/dsh-llm-deepseek/lib/index.js',
+              'var DeepSeekAdapter = class extends LlmAdapter {',
+              'var DeepSeekAdapter = class extends LlmAdapter {\n\t[modelTransport] = true;')
+        patch('@deepseek-ai/dsh-llm-deepseek/lib/index.js',
+              '//#region lib/types/translate.js',
+              'import { modelTransport, modelFetch, reportProviderUsage } from "../../../../../assistant.mjs";\n//#region lib/types/translate.js')
+        patch('@deepseek-ai/dsh-llm-deepseek/lib/index.js',
+              '\tconst usage = {\n\t\tinputTokens: 0,\n\t\toutputTokens: 0\n\t};',
+              '\tconst usage = {};')
+        patch('@deepseek-ai/dsh-llm-deepseek/lib/index.js',
+              '\t\t\tupdateUsage(usage, object(event.message).usage);',
+              '\t\t\tupdateUsage(usage, object(event.message).usage);\n\t\t\treportProviderUsage({ ...usage });')
+        patch('@deepseek-ai/dsh-llm-deepseek/lib/index.js',
+              '\t\t\tif (event.usage !== void 0) updateUsage(usage, event.usage);',
+              '\t\t\tif (event.usage !== void 0) {\n\t\t\t\tupdateUsage(usage, event.usage);\n\t\t\t\treportProviderUsage({ ...usage });\n\t\t\t}')
+        patch('@deepseek-ai/dsh-llm-deepseek/lib/index.js',
+              '\t\t\tusage.totalTokens = usage.inputTokens + usage.outputTokens + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0);',
+              '\t\t\t// Keep unreported totals unknown; earlier snapshots are already durable.')
+        patch('@deepseek-ai/dsh-llm-deepseek/lib/index.js',
+              'const response = await fetch(`${messagesApiRoot(connection.baseURL)}/messages`, {',
+              'const response = await modelFetch(`${messagesApiRoot(connection.baseURL)}/messages`, {')
+        patch('@deepseek-ai/dsh-llm-deepseek/lib/index.js',
+              '\t\t\tyield {\n\t\t\t\ttype: "usage",\n\t\t\t\tusage\n\t\t\t};',
+              '\t\t\tif (usage.inputTokens !== void 0 && usage.outputTokens !== void 0) yield {\n\t\t\t\ttype: "usage",\n\t\t\t\tusage: { ...usage }\n\t\t\t};')
+        patch('@deepseek-ai/dsh-llm-pi-ai/lib/index.js',
+              '//#region lib/types/stream.js',
+              'import { modelTransport, piOptions, providerUsage } from "../../../../../assistant.mjs";\n//#region lib/types/stream.js')
+        patch('@deepseek-ai/dsh-llm-pi-ai/lib/index.js',
+              'var PiAiAdapter = class extends LlmAdapter {',
+              'var PiAiAdapter = class extends LlmAdapter {\n\t[modelTransport] = true;')
+        patch('@deepseek-ai/dsh-llm-pi-ai/lib/index.js',
+              '\t\t\t\t\t...profileOptions(profile, reasoning, apiKey),',
+              '\t\t\t\t\t...profileOptions(profile, reasoning, apiKey),\n\t\t\t\t\t...piOptions(model),')
+        patch('@deepseek-ai/dsh-llm-pi-ai/lib/index.js',
+              "/**\n* Map pi-ai usage (reasoning folded into output by pi-ai).\n* @param usage - cumulative usage from the terminal pi-ai event.\n* @returns harness counts with pi-ai's exact total; cache fields appear only\n*   when non-zero (pi-ai reports zeros, not absence).\n*/\nfunction mapUsage(usage) {\n\treturn {\n\t\tinputTokens: usage.input,\n\t\toutputTokens: usage.output,\n\t\ttotalTokens: usage.totalTokens,\n\t\t...usage.cacheRead > 0 ? { cacheReadTokens: usage.cacheRead } : {},\n\t\t...usage.cacheWrite > 0 ? { cacheWriteTokens: usage.cacheWrite } : {}\n\t};\n}\n",
+              '// Usage provenance comes from protocol callbacks before pi-ai synthesizes zeros.\n')
+        patch('@deepseek-ai/dsh-llm-pi-ai/lib/index.js',
+              '\t\t\tyield {\n\t\t\t\ttype: "usage",\n\t\t\t\tusage: mapUsage(event.message.usage)\n\t\t\t};',
+              '\t\t\tif (providerUsage() !== void 0) yield {\n\t\t\t\ttype: "usage",\n\t\t\t\tusage: providerUsage()\n\t\t\t};')
+        patch('@deepseek-ai/dsh-llm-pi-ai/lib/index.js',
+              '\t\t\tyield {\n\t\t\t\ttype: "usage",\n\t\t\t\tusage: mapUsage(event.error.usage)\n\t\t\t};',
+              '\t\t\tif (providerUsage() !== void 0) yield {\n\t\t\t\ttype: "usage",\n\t\t\t\tusage: providerUsage()\n\t\t\t};')
+        for filename in ("start.mjs", "plugins.mjs", "assistant.mjs", "compat.mjs", "guard.mjs", "policy.mjs", "files.mjs", "host.mjs", "recover.mjs", "android.patch.yml"):
             shutil.copy2(SOURCE / filename, bundle / filename)
         ndk = Path(os.environ.get("ANDROID_NDK_HOME", "/home/skynit/Android/Sdk/ndk/28.2.13676358"))
         compiler = ndk / "toolchains/llvm/prebuilt/linux-x86_64/bin" / (
@@ -292,6 +378,8 @@ def build(abi):
             "dsh": "0.2.1-rc.2", "node": packages["nodejs-lts"]["version"],
             "tools": {name: packages[name]["version"] for name in ("bash", "ripgrep")},
             "nodePty": json.loads((SOURCE / "node_modules/node-pty/package.json").read_text())["version"],
+            "pnpm": json.loads((SOURCE / "node_modules/pnpm/package.json").read_text())["version"],
+            "npm": json.loads((SOURCE / "node_modules/npm/package.json").read_text())["version"],
             "npmLockSha256": digest(SOURCE / "package-lock.json"),
             "termuxLockSha256": digest(SOURCE / "termux.lock.json"),
             "patches": patches, "elf16k": elf, "excludedNative": excluded_native, "files": files,
