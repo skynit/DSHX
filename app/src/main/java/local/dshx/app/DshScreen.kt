@@ -7,10 +7,14 @@ import android.view.ViewTreeObserver
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.input.TextFieldState
 import androidx.compose.foundation.text.input.TextFieldLineLimits
 import androidx.compose.foundation.text.input.rememberTextFieldState
@@ -22,9 +26,19 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.error
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -36,9 +50,8 @@ import com.composables.icons.lucide.House
 import com.composables.icons.lucide.Lucide
 import com.composables.icons.lucide.MessageSquare
 import com.composables.icons.lucide.Settings2
+import com.composables.icons.lucide.ChevronRight
 import top.yukonga.miuix.kmp.basic.*
-import top.yukonga.miuix.kmp.extra.SuperArrow
-import top.yukonga.miuix.kmp.extra.SuperRadioButton
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.theme.darkColorScheme
 import top.yukonga.miuix.kmp.theme.lightColorScheme
@@ -56,7 +69,10 @@ private fun AppTheme(theme: String, content: @Composable () -> Unit) {
     val text = if (dark) Color(0xFFECEFEB) else Color(0xFF202220)
     val muted = if (dark) Color(0xFFA6ACA5) else Color(0xFF6D726D)
     val border = if (dark) Color(0xFF363B36) else Color(0xFFE4E5E2)
-    val primary = if (dark) Color(0xFF78A7EF) else Color(0xFF3F7EDB)
+    val primary = if (dark) Color(0xFF78A7EF) else Color(0xFF2F6CC4)
+    val input = if (dark) Color(0xFF252925) else Color.White
+    val selected = if (dark) Color(0xFF2A2E2A) else Color(0xFFF0F1EF)
+    val danger = if (dark) Color(0xFFE3848A) else Color(0xFFB33D48)
     val colors = if (dark) darkColorScheme() else lightColorScheme()
     val view = LocalView.current
     @Suppress("DEPRECATION")
@@ -74,6 +90,8 @@ private fun AppTheme(theme: String, content: @Composable () -> Unit) {
             onSurfaceSecondary = text, onSurfaceVariantSummary = muted,
             onSurfaceVariantActions = muted, surfaceContainer = surface,
             onSurfaceContainer = text, onSurfaceContainerVariant = muted,
+            surfaceContainerHigh = input, secondary = selected, onSecondary = text,
+            error = danger, onError = text,
             outline = border, dividerLine = border,
             secondaryVariant = border, onSecondaryVariant = text,
             disabledPrimaryButton = border, disabledOnPrimaryButton = muted,
@@ -117,9 +135,22 @@ fun DshScreen(
         Scaffold(
             contentWindowInsets = WindowInsets(0, 0, 0, 0),
             bottomBar = {
-                if (!(tab in 1..2 && !logs && keyboardOpen)) NavigationBar(defaultWindowInsetsPadding = false) {
-                    listOf(Triple("工作台", Lucide.House, 0), Triple("聊天", Lucide.MessageSquare, 1), Triple("设置", Lucide.Settings2, 2)).forEach { (label, icon, index) ->
-                        NavigationBarItem(selected = tab == index && !logs, onClick = { tab = index; logs = false }, icon = icon, label = label)
+                if (!(tab in 1..2 && !logs && keyboardOpen)) Column(Modifier.background(MiuixTheme.colorScheme.surfaceVariant)) {
+                    Divider()
+                    Row(Modifier.fillMaxWidth().selectableGroup().padding(horizontal = 12.dp, vertical = 4.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        listOf(Triple("工作台", Lucide.House, 0), Triple("聊天", Lucide.MessageSquare, 1), Triple("设置", Lucide.Settings2, 2)).forEach { (label, icon, index) ->
+                            val selected = tab == index && !logs
+                            Row(Modifier.weight(1f).heightIn(min = 48.dp).clip(RoundedCornerShape(8.dp))
+                                .background(if (selected) MiuixTheme.colorScheme.secondary else Color.Transparent)
+                                .selectable(selected, role = Role.Tab, onClick = { tab = index; logs = false })
+                                .padding(horizontal = 8.dp, vertical = 8.dp),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally), verticalAlignment = Alignment.CenterVertically) {
+                                val color = if (selected) MiuixTheme.colorScheme.onSurface else MiuixTheme.colorScheme.onSurfaceVariantSummary
+                                if (LocalDensity.current.fontScale < 1.5f) Icon(icon, contentDescription = null, modifier = Modifier.size(18.dp), tint = color)
+                                Text(label, fontSize = 13.sp, color = color, fontWeight = if (selected) FontWeight.Medium else FontWeight.Normal)
+                            }
+                        }
                     }
                 }
             },
@@ -127,14 +158,17 @@ fun DshScreen(
             if (tab == 1 && !logs && running && webReady && pageError == null) {
                 chat(Modifier.padding(padding).fillMaxSize())
             } else {
-                Column(
-                    Modifier.padding(padding).fillMaxSize().verticalScroll(scroll).padding(horizontal = 24.dp, vertical = 24.dp),
-                    verticalArrangement = Arrangement.spacedBy(20.dp),
-                ) {
+                BoxWithConstraints(Modifier.padding(padding).fillMaxSize().verticalScroll(scroll)) {
+                  val gutter = if (maxWidth >= 600.dp) 32.dp else 16.dp
+                  Column(
+                    Modifier.align(Alignment.TopCenter).widthIn(max = 680.dp).fillMaxWidth().padding(horizontal = gutter, vertical = 16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                  ) {
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
                         Column(verticalArrangement = Arrangement.spacedBy(4.dp), modifier = Modifier.weight(1f)) {
-                            Text(if (logs) "运行诊断" else listOf("DSHX", "聊天", "设置")[tab], fontSize = 28.sp, fontWeight = FontWeight.SemiBold)
-                            Note(if (logs) "最近 120 行 · 已隐藏常见凭据" else listOf("你的 dsh，在 Android 上", "连接本机 dsh 工作区", "按你的习惯使用")[tab])
+                            Text(if (logs) "运行诊断" else listOf("DSHX", "聊天", "设置")[tab], fontSize = 22.sp, fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.semantics { heading() })
+                            if (logs) Note("最近 120 行 · 已脱敏")
                         }
                         if (tab == 0 && !logs) Text("开发版", fontSize = 12.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
                             modifier = Modifier.border(1.dp, MiuixTheme.colorScheme.outline, RoundedCornerShape(6.dp)).padding(8.dp, 5.dp))
@@ -142,11 +176,11 @@ fun DshScreen(
                     when {
                         logs -> {
                             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                                TextButton("返回", onClick = { logs = false }, minHeight = 48.dp)
-                                TextButton("刷新日志", onClick = { logText = diagnostics() }, minHeight = 48.dp)
+                                Action("返回", onClick = { logs = false })
+                                Action("刷新日志", onClick = { logText = diagnostics() })
                             }
                             Panel {
-                                SelectionContainer { Text(logText.ifBlank { "还没有运行日志。启动 dsh 后，诊断信息会显示在这里。" }, fontFamily = FontFamily.Monospace, fontSize = 12.sp, lineHeight = 20.sp) }
+                                SelectionContainer { Text(logText.ifBlank { "暂无日志" }, fontFamily = FontFamily.Monospace, fontSize = 12.sp, lineHeight = 18.sp) }
                             }
                         }
                         tab == 0 -> {
@@ -156,27 +190,22 @@ fun DshScreen(
                                     Text(state.phase, fontSize = 14.sp, fontWeight = FontWeight.Medium,
                                         color = if (running) LocalStatusColor.current else MiuixTheme.colorScheme.onSurfaceVariantSummary)
                                 }
-                                Spacer(Modifier.height(14.dp))
-                                Text(if (running) "工作区已就绪" else if (state.busy) state.phase else "从一次对话开始", fontSize = 23.sp, fontWeight = FontWeight.Medium)
+                                Spacer(Modifier.height(12.dp))
+                                Text(if (running) "工作区已就绪" else if (state.busy) "正在准备工作区" else "本机工作区", fontSize = 20.sp, fontWeight = FontWeight.Medium)
                                 Spacer(Modifier.height(8.dp))
                                 Note(state.message)
-                                Spacer(Modifier.height(22.dp))
-                                Button(onClick = { if (running) tab = 1 else onStart() }, enabled = !state.busy,
-                                    modifier = Modifier.fillMaxWidth(), minHeight = 52.dp, cornerRadius = 12.dp,
-                                    colors = ButtonDefaults.buttonColorsPrimary()) {
-                                    Text(if (running) "进入聊天" else if (state.busy) "请稍候…" else "启动 dsh", fontSize = 16.sp, fontWeight = FontWeight.Medium)
-                                }
-                                if (active) {
-                                    Spacer(Modifier.height(8.dp))
-                                    TextButton(if (running) "停止服务" else "取消启动", onClick = onStop,
-                                        enabled = state.phase != "正在停止", modifier = Modifier.fillMaxWidth(), minHeight = 48.dp)
+                                Spacer(Modifier.height(16.dp))
+                                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Action(if (running) "进入聊天" else if (state.busy) "请稍候…" else "启动 dsh",
+                                        onClick = { if (running) tab = 1 else onStart() }, enabled = !state.busy, primary = true)
+                                    if (active) Action(if (running) "停止服务" else "取消启动", onClick = onStop, enabled = state.phase != "正在停止")
                                 }
                             }
                             Section("开始使用")
                             Panel(padding = 0) {
-                                SuperArrow(title = "模型与会话", summary = if (running) "在原版 dsh 页面配置模型、继续对话" else "启动后，在聊天页配置模型并创建会话", onClick = { tab = 1 })
+                                LinkRow("模型与会话", if (running) "配置模型、继续对话" else "启动后可用", onClick = { tab = 1 })
                                 Divider()
-                                SuperArrow(title = "运行诊断", summary = "启动遇到问题时，查看本机日志", onClick = ::openLogs)
+                                LinkRow("运行诊断", "查看本机日志", onClick = ::openLogs)
                             }
                             Section("这台设备")
                             Panel {
@@ -186,43 +215,50 @@ fun DshScreen(
                                 Divider()
                                 Info("运行环境", "${bundle.abi} · ${bundle.unpackedSize / 1024 / 1024} MB")
                             }
-                            Note("会话与模型配置保存在应用内。模型请求会发往你配置的服务商。默认完全权限，可使用本应用能够访问的文件与前台命令；不提供额外的 Android 系统权限。")
+                            Note("数据保存在本机，模型请求发送至你配置的服务商。")
                         }
                         tab == 1 -> Panel {
-                            Text(if (!running) "先启动你的工作区" else if (!webReady) "需要更新网页组件" else "聊天页面暂时不可用", fontSize = 22.sp, fontWeight = FontWeight.Medium)
+                            Text(if (!running) "先启动工作区" else if (!webReady) "需要更新网页组件" else "聊天暂时不可用", fontSize = 18.sp, fontWeight = FontWeight.Medium)
                             Spacer(Modifier.height(12.dp))
-                            Note(if (!running) "返回工作台启动 dsh。就绪后，你可以在这里使用原版聊天、模型配置和会话记录。" else if (!webReady) "当前版本 ${webVersion ?: "未知"}。请在系统中更新 Android System WebView 至 126 或更新版本。" else pageError.orEmpty())
+                            Note(if (!running) "在工作台启动 dsh 后，即可聊天和配置模型。" else if (!webReady) "请将 Android System WebView 更新至 126 或更新版本。" else pageError.orEmpty())
                             Spacer(Modifier.height(20.dp))
-                            if (running && webReady) TextButton("重新加载", onClick = onReload, minHeight = 48.dp)
-                            TextButton("返回工作台", onClick = { tab = 0 }, minHeight = 48.dp)
+                            if (running && webReady) Action("重新加载", onClick = onReload)
+                            Action("返回工作台", onClick = { tab = 0 })
                         }
                         else -> {
                             savedPages.SaveableStateProvider("assistant") { AssistantSettings(assistantStore) }
                             Section("工具与权限")
                             Panel {
-                                Text("完全权限 · 默认", fontSize = 16.sp, fontWeight = FontWeight.Medium)
+                                Text("完全权限", fontSize = 14.sp, fontWeight = FontWeight.Medium)
                                 Spacer(Modifier.height(8.dp))
-                                Note("助手可读写本应用能够访问的文件并执行已适配的前台命令。当前不提供会话沙箱管理，也不增加手机 root 或其他系统权限。")
+                                Note("可读写应用可访问的文件、执行已适配命令；不增加系统权限。")
                             }
-                            Section("管理界面外观")
-                            Panel(padding = 0) {
-                                listOf("system" to "跟随系统", "light" to "浅色", "dark" to "深色").forEachIndexed { index, (value, label) ->
-                                    if (index > 0) Divider()
-                                    SuperRadioButton(title = label, selected = theme == value, onClick = { onTheme(value) })
+                            Section("外观")
+                            Panel(padding = 4) {
+                                Row(Modifier.fillMaxWidth().selectableGroup(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    listOf("system" to "跟随系统", "light" to "浅色", "dark" to "深色").forEach { (value, label) ->
+                                        Box(Modifier.weight(1f).heightIn(min = 48.dp).clip(RoundedCornerShape(8.dp))
+                                            .background(if (theme == value) MiuixTheme.colorScheme.secondary else Color.Transparent)
+                                            .border(1.dp, if (theme == value) MiuixTheme.colorScheme.outline else Color.Transparent, RoundedCornerShape(8.dp))
+                                            .selectable(theme == value, role = Role.RadioButton, onClick = { onTheme(value) }).padding(8.dp),
+                                            contentAlignment = Alignment.Center) {
+                                            Text(label, fontSize = 13.sp, fontWeight = if (theme == value) FontWeight.SemiBold else FontWeight.Normal)
+                                        }
+                                    }
                                 }
                             }
-                            Section("关于运行环境")
+                            Section("运行环境")
                             Panel {
                                 Info("dsh", bundle.dsh); Divider()
                                 Info("Node.js", bundle.node); Divider()
                                 Info("架构", bundle.abi); Divider()
                                 Info("界面组件", "Miuix 0.8.8")
                             }
-                            Panel(padding = 0) { SuperArrow(title = "运行诊断", summary = "查看已脱敏日志", onClick = ::openLogs) }
-                            Note("DSHX 是 dsh 的 Android 移植。应用负责运行环境、启动与停止；聊天、模型和会话沿用原版 dsh，聊天页外观可在 dsh 内设置。工具与手机操作能力仍在移植中。")
+                            Panel(padding = 0) { LinkRow("运行诊断", "已脱敏", onClick = ::openLogs) }
                         }
                     }
                     Spacer(Modifier.height(4.dp))
+                  }
                 }
             }
         }
@@ -277,62 +313,109 @@ private fun AssistantSettings(store: AssistantStore) {
     }
     LaunchedEffect(store) { readSettings() }
 
-    Section("助手人设")
     Panel {
-        Note("默认显示 DS 的标准人设；修改后保存即可生效，清空字段或恢复默认可继续沿用 DS。人设不改变工具权限。")
-        Spacer(Modifier.height(14.dp))
-        AssistantField("名字", name, 80, loading || saving, 1)
-        if (name.text.isBlank()) Note("DS 未设置固定名字。")
-        AssistantField("身份", identity, 2000, loading || saving, 4)
-        AssistantField("自定义提示词", prompt, 16000, loading || saving, 8)
-        Note("长度按 UTF-16 单位计算：常见汉字计 1，部分表情计 2；保存时去掉首尾空白。")
+        Text("助手人设", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.semantics { heading() })
+        Spacer(Modifier.height(4.dp))
+        Note("默认沿用 DS，修改后下次对话生效。")
+        Spacer(Modifier.height(16.dp))
+        AssistantField("名字", name, 80, loading || saving, 1, "DS 默认，无固定名字")
+        AssistantField("身份", identity, 2000, loading || saving, 3)
+        AssistantField("自定义提示词", prompt, 16000, loading || saving, 5)
         Spacer(Modifier.height(12.dp))
-        Button(onClick = { save(AssistantStore.Settings(name.text.toString(), identity.text.toString(), prompt.text.toString()), false) },
-            enabled = !loading && !saving, modifier = Modifier.fillMaxWidth(), minHeight = 48.dp,
-            colors = ButtonDefaults.buttonColorsPrimary()) {
-            Text(if (loading) "正在读取…" else if (saving) "正在保存…" else "保存人设")
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Action(if (loading) "读取中…" else if (saving) "保存中…" else "保存人设",
+                onClick = { save(AssistantStore.Settings(name.text.toString(), identity.text.toString(), prompt.text.toString()), false) },
+                enabled = !loading && !saving, primary = true)
+            Action("恢复默认", onClick = { save(AssistantStore.Settings(), true) }, enabled = !loading && !saving,
+                modifier = Modifier.semantics { contentDescription = "恢复上游默认设置" })
         }
-        TextButton("恢复上游默认设置", onClick = { save(AssistantStore.Settings(), true) },
-            enabled = !loading && !saving, modifier = Modifier.fillMaxWidth(), minHeight = 48.dp)
         if (settingsError != null) {
-            Note(settingsError!!)
-            TextButton("重试读取设置", onClick = ::readSettings, enabled = !loading && !saving, minHeight = 48.dp)
+            Spacer(Modifier.height(8.dp))
+            Text(settingsError!!, fontSize = 12.sp, lineHeight = 18.sp, color = MiuixTheme.colorScheme.error)
+            Action("重试读取设置", onClick = ::readSettings, enabled = !loading && !saving)
         }
         val dirty = saved?.let { it.displayed() != AssistantStore.Settings(name.text.toString(), identity.text.toString(), prompt.text.toString()) } ?: initialized
-        if (dirty) Note("有未保存的编辑。") else message?.let { Note(it) }
-        Spacer(Modifier.height(8.dp))
-        Note("保存后，从下一次对话步骤起使用新设置，包括已有会话；正在进行的调用和历史消息不变。自动标题和摘要仍使用专用指令。")
+        if (dirty || message != null) {
+            Spacer(Modifier.height(8.dp))
+            Note(if (dirty) "有未保存的编辑。" else message.orEmpty())
+        }
     }
 }
 
 @Composable
-private fun AssistantField(label: String, state: TextFieldState, limit: Int, disabled: Boolean, lines: Int) {
-    TextField(state = state, label = label, enabled = !disabled, modifier = Modifier.fillMaxWidth(),
-        lineLimits = if (lines == 1) TextFieldLineLimits.SingleLine else TextFieldLineLimits.MultiLine(maxHeightInLines = lines))
+private fun AssistantField(label: String, state: TextFieldState, limit: Int, disabled: Boolean, lines: Int, hint: String = "") {
+    var focused by remember { mutableStateOf(false) }
     val size = state.text.toString().trim().length
-    Note("$label · $size / $limit${if (size > limit) " · 超出长度限制，请缩短后保存" else ""}")
-    Spacer(Modifier.height(12.dp))
+    val invalid = size > limit
+    val colors = MiuixTheme.colorScheme
+    val shape = RoundedCornerShape(8.dp)
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Row(Modifier.fillMaxWidth().heightIn(min = 20.dp), horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically) {
+            Text(label, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+            if (focused || invalid) Text("$size / $limit", fontSize = 12.sp, color = if (invalid) colors.error else colors.onSurfaceVariantSummary)
+        }
+        BasicTextField(state = state, enabled = !disabled,
+            textStyle = TextStyle(fontSize = 15.sp, lineHeight = 21.sp, color = if (disabled) colors.onSurfaceVariantSummary else colors.onSurface),
+            cursorBrush = SolidColor(colors.primary),
+            lineLimits = if (lines == 1) TextFieldLineLimits.SingleLine else TextFieldLineLimits.MultiLine(maxHeightInLines = lines),
+            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).onFocusChanged { focused = it.isFocused }
+                .semantics { contentDescription = label; if (invalid) error("$label 超出长度限制") }
+                .clip(shape).background(if (disabled) colors.secondary else colors.surfaceContainerHigh)
+                .border(if (focused) 2.dp else 1.dp, if (invalid) colors.error else if (focused) colors.primary else colors.outline, shape)
+                .padding(12.dp),
+            decorator = { inner ->
+                Box(contentAlignment = Alignment.CenterStart) {
+                    if (state.text.isEmpty() && hint.isNotEmpty()) Text(hint, fontSize = 14.sp, lineHeight = 21.sp, color = colors.onSurfaceVariantSummary)
+                    inner()
+                }
+            })
+        if (invalid) Text("超出长度限制，请缩短后保存。", fontSize = 12.sp, color = colors.error)
+    }
+    Spacer(Modifier.height(16.dp))
 }
 
 @Composable
-private fun Panel(padding: Int = 20, content: @Composable ColumnScope.() -> Unit) {
-    Card(modifier = Modifier.fillMaxWidth().border(1.dp, MiuixTheme.colorScheme.outline, RoundedCornerShape(18.dp)),
-        cornerRadius = 18.dp, insideMargin = PaddingValues(padding.dp), content = content)
+private fun Panel(padding: Int = 16, content: @Composable ColumnScope.() -> Unit) {
+    Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(MiuixTheme.colorScheme.surfaceVariant)
+        .border(1.dp, MiuixTheme.colorScheme.outline, RoundedCornerShape(10.dp)).padding(padding.dp), content = content)
 }
 
 @Composable
-private fun Note(text: String) = Text(text, fontSize = 14.sp, lineHeight = 22.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+private fun Action(text: String, onClick: () -> Unit, modifier: Modifier = Modifier, enabled: Boolean = true, primary: Boolean = false) {
+    Button(onClick = onClick, modifier = modifier, enabled = enabled, minHeight = 48.dp, cornerRadius = 8.dp,
+        insideMargin = PaddingValues(horizontal = 16.dp, vertical = 10.dp),
+        colors = if (primary) ButtonDefaults.buttonColorsPrimary() else ButtonDefaults.buttonColors()) {
+        Text(text, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+    }
+}
 
 @Composable
-private fun Section(text: String) = Text(text, fontSize = 13.sp, fontWeight = FontWeight.Medium, color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+private fun LinkRow(title: String, summary: String, onClick: () -> Unit) {
+    Row(Modifier.fillMaxWidth().clickable(role = Role.Button, onClick = onClick).heightIn(min = 64.dp).padding(16.dp),
+        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(title, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+            Note(summary)
+        }
+        Icon(Lucide.ChevronRight, contentDescription = null, modifier = Modifier.size(16.dp), tint = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+    }
+}
+
+@Composable
+private fun Note(text: String) = Text(text, fontSize = 12.sp, lineHeight = 18.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+
+@Composable
+private fun Section(text: String) = Text(text, modifier = Modifier.padding(top = 8.dp).semantics { heading() },
+    fontSize = 12.sp, fontWeight = FontWeight.Medium, color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
 
 @Composable
 private fun Divider() = Spacer(Modifier.fillMaxWidth().height(1.dp).background(MiuixTheme.colorScheme.dividerLine))
 
 @Composable
 private fun Info(label: String, value: String) {
-    Row(Modifier.fillMaxWidth().padding(vertical = 12.dp), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-        Text(label, fontSize = 14.sp, modifier = Modifier.weight(1f), color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
-        Text(value, fontSize = 14.sp, modifier = Modifier.weight(1.6f))
+    Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+        Text(label, fontSize = 13.sp, modifier = Modifier.weight(1f), color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+        Text(value, fontSize = 13.sp, modifier = Modifier.weight(1.6f))
     }
 }
