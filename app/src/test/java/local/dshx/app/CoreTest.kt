@@ -582,6 +582,46 @@ class CoreTest {
     }
 
     @Test @Config(sdk = [26])
+    fun assistantDefaultsMatchTheBundledDsStandardPersona() {
+        val context = org.robolectric.RuntimeEnvironment.getApplication()
+        val sources = mutableMapOf<String, String>()
+        val paths = setOf(
+            "lib/node_modules/@deepseek-ai/dsh-system-prompt/lib/index.js",
+            "lib/node_modules/@deepseek-ai/dsh-web-app/cordis.patch.yml",
+            "lib/node_modules/@deepseek-ai/dsh-web-app/presets/standard.patch.yml",
+        )
+        java.util.zip.ZipInputStream(context.assets.open("core.zip")).use { zip ->
+            while (true) {
+                val entry = zip.nextEntry ?: break
+                if (entry.name in paths) sources[entry.name] = zip.readBytes().toString(Charsets.UTF_8)
+            }
+        }
+        assertEquals(paths, sources.keys)
+        val defaults = AssistantStore.defaults
+        assertEquals("", defaults.name)
+        assertTrue(sources.getValue(paths.elementAt(0)).contains("text: \"${defaults.identity}\""))
+        assertTrue(sources.getValue(paths.elementAt(1)).contains("personaPrefix: >-\n      ${defaults.prompt}"))
+        assertTrue(sources.getValue(paths.elementAt(2)).contains("prefix: ${defaults.prompt}"))
+    }
+
+    @Test @Config(sdk = [26])
+    fun assistantDefaultsDisplayWithoutBecomingLiteralOverrides() {
+        val store = AssistantStore(folder.root)
+        val defaults = AssistantStore.defaults
+        assertEquals(defaults, store.readSettings().displayed())
+        assertFalse(File(folder.root, "assistant/settings.json").exists())
+        assertEquals(AssistantStore.Settings(), defaults.custom())
+        val edited = defaults.copy(name = "  小禾  ", prompt = "  回答保留 {{原文}}  ")
+        val saved = store.saveSettings(edited.custom())
+        assertEquals(AssistantStore.Settings("小禾", prompt = "回答保留 {{原文}}"), saved)
+        assertEquals(defaults.copy(name = "小禾", prompt = "回答保留 {{原文}}"), store.readSettings().displayed())
+        assertEquals(AssistantStore.Settings(), store.saveSettings(AssistantStore.Settings().custom()))
+        assertEquals(defaults, AssistantStore(folder.root).readSettings().displayed())
+        assertEquals(AssistantStore.Settings(), store.saveSettings(defaults.custom()))
+        assertEquals("", JSONObject(File(folder.root, "assistant/settings.json").readText()).getString("prompt"))
+    }
+
+    @Test @Config(sdk = [26])
     fun assistantSettingsTrimPersistAndRestoreDefaultsWithoutChangingUsage() {
         val store = AssistantStore(folder.root)
         assertEquals(AssistantStore.Settings(), store.readSettings())

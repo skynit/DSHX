@@ -29,9 +29,28 @@ class AssistantStore(filesDir: File) {
         // Activities may have different store instances while an earlier IO task finishes.
         // The runtime only reads the base; all native writers share this temporary file.
         private val settingsLock = Any()
+
+        // The bundled dsh Web standard persona; the package test checks these
+        // against the shipped sources so an upstream upgrade cannot drift silently.
+        val defaults = Settings(
+            identity = "You are an AI agent powered by DeepSeek Harness.",
+            prompt = "You are a coding agent powered by the {{model}} model.",
+        )
     }
 
     data class Settings(val name: String = "", val identity: String = "", val prompt: String = "") {
+        fun displayed(): Settings = Settings(
+            name.ifBlank { defaults.name }, identity.ifBlank { defaults.identity }, prompt.ifBlank { defaults.prompt },
+        )
+
+        // Default text is a preview of upstream-owned instructions, not a literal
+        // Android override. In particular, {{model}} must still be resolved by dsh.
+        fun custom(): Settings = trimmed().let {
+            Settings(it.name.takeUnless { value -> value == defaults.name }.orEmpty(),
+                it.identity.takeUnless { value -> value == defaults.identity }.orEmpty(),
+                it.prompt.takeUnless { value -> value == defaults.prompt }.orEmpty())
+        }
+
         fun trimmed(): Settings = Settings(name.trim(), identity.trim(), prompt.trim()).also {
             require(it.name.length <= 80) { "名字不能超过 80 个 UTF-16 单位。" }
             require(it.identity.length <= 2000) { "身份不能超过 2000 个 UTF-16 单位。" }

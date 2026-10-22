@@ -243,9 +243,10 @@ private fun AssistantSettings(store: AssistantStore) {
     val scope = rememberCoroutineScope()
 
     fun fill(value: AssistantStore.Settings) {
-        name.setTextAndPlaceCursorAtEnd(value.name)
-        identity.setTextAndPlaceCursorAtEnd(value.identity)
-        prompt.setTextAndPlaceCursorAtEnd(value.prompt)
+        val displayed = value.displayed()
+        name.setTextAndPlaceCursorAtEnd(displayed.name)
+        identity.setTextAndPlaceCursorAtEnd(displayed.identity)
+        prompt.setTextAndPlaceCursorAtEnd(displayed.prompt)
         initialized = true
     }
     fun readSettings() {
@@ -265,7 +266,7 @@ private fun AssistantSettings(store: AssistantStore) {
         message = null
         settingsError = null
         scope.launch {
-            val result = withContext(Dispatchers.IO) { runCatching { store.saveSettings(value) } }
+            val result = withContext(Dispatchers.IO) { runCatching { store.saveSettings(value.custom()) } }
             result.onSuccess {
                 saved = it
                 fill(it)
@@ -278,9 +279,10 @@ private fun AssistantSettings(store: AssistantStore) {
 
     Section("助手人设")
     Panel {
-        Note("人设是助手的名字、身份和回答指令，由你填写并保存在本机，不改变工具权限。每个字段留空时使用上游默认值。")
+        Note("默认显示 DS 的标准人设；修改后保存即可生效，清空字段或恢复默认可继续沿用 DS。人设不改变工具权限。")
         Spacer(Modifier.height(14.dp))
         AssistantField("名字", name, 80, loading || saving, 1)
+        if (name.text.isBlank()) Note("DS 未设置固定名字。")
         AssistantField("身份", identity, 2000, loading || saving, 4)
         AssistantField("自定义提示词", prompt, 16000, loading || saving, 8)
         Note("长度按 UTF-16 单位计算：常见汉字计 1，部分表情计 2；保存时去掉首尾空白。")
@@ -296,7 +298,7 @@ private fun AssistantSettings(store: AssistantStore) {
             Note(settingsError!!)
             TextButton("重试读取设置", onClick = ::readSettings, enabled = !loading && !saving, minHeight = 48.dp)
         }
-        val dirty = saved?.let { it != AssistantStore.Settings(name.text.toString(), identity.text.toString(), prompt.text.toString()) } ?: initialized
+        val dirty = saved?.let { it.displayed() != AssistantStore.Settings(name.text.toString(), identity.text.toString(), prompt.text.toString()) } ?: initialized
         if (dirty) Note("有未保存的编辑。") else message?.let { Note(it) }
         Spacer(Modifier.height(8.dp))
         Note("保存后，从下一次对话步骤起使用新设置，包括已有会话；正在进行的调用和历史消息不变。自动标题和摘要仍使用专用指令。")
