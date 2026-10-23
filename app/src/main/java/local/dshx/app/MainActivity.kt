@@ -19,6 +19,7 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.webkit.JavascriptInterface
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -36,6 +37,13 @@ import java.net.URI
 class MainActivity : ComponentActivity() {
     private var phoneRevision by mutableIntStateOf(0)
     private val engine get() = (application as DshApp).engine
+    private val voice get() = (application as DshApp).voice
+    private var pendingVoice: String? = null
+    private val microphone = registerForActivityResult(ActivityResultContracts.RequestPermission()) { allowed ->
+        val action = pendingVoice; pendingVoice = null
+        if (allowed && action != null) voiceAction(action)
+        else if (!allowed) Toast.makeText(this, "麦克风未授权，仍可使用文字聊天。", Toast.LENGTH_LONG).show()
+    }
     private val assistantStore by lazy { AssistantStore(filesDir) }
     private var browser: WebView? = null
     private var browserInstance: String? = null
@@ -80,6 +88,18 @@ class MainActivity : ComponentActivity() {
         setContent {
             var state by remember { mutableStateOf(engine.state) }
             var theme by remember { mutableStateOf(preferences.getString("theme", "system") ?: "system") }
+            var voiceState by remember { mutableStateOf(voice.state) }
+            DisposableEffect(voice) {
+                val listener: (VoiceControl.State) -> Unit = { next ->
+                    val previous = voiceState.session
+                    voiceState = next
+                    if (previous != next.session && next.session != null && next.status == "正在播报") {
+                        engine.state.url?.let { url -> browser?.loadUrl("$url&dshx-session=${Uri.encode(next.session)}") }
+                    }
+                }
+                voice.observe(listener)
+                onDispose { voice.remove(listener) }
+            }
             DisposableEffect(engine) {
                 val listener: (EngineState) -> Unit = {
                     state = it
@@ -98,10 +118,23 @@ class MainActivity : ComponentActivity() {
                 onReload = { pageError = null; browser?.reload() },
                 assistantStore = assistantStore,
                 phone = engine.phone, phoneRevision = phoneRevision,
+                voice = voice, voiceState = voiceState, onVoice = ::voiceAction,
                 onPhonePermission = ::phonePermission,
                 chat = { modifier -> state.url?.let { instance -> AndroidView(modifier = modifier, factory = { webView(instance) }) } }
             )
         }
+    }
+
+    private fun voiceAction(action: String) {
+        if (action == "stop") { voice.stop(); return }
+        if (action in setOf("download", "download-local", "download-output")) {
+            voice.download(when (action) { "download-local" -> "local"; "download-output" -> "output"; else -> "speech" }); return
+        }
+        if (action == "send") { voice.start(action); return }
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED && action != "send") {
+            pendingVoice = action; microphone.launch(Manifest.permission.RECORD_AUDIO); return
+        }
+        startForegroundService(Intent(this, VoiceService::class.java).setAction(action))
     }
 
     override fun onResume() { super.onResume(); engine.phone.device.attach(this); phoneRevision++ }
@@ -142,6 +175,15 @@ class MainActivity : ComponentActivity() {
                 settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
                 settings.setSupportMultipleWindows(false)
                 CookieManager.getInstance().setAcceptThirdPartyCookies(this, false)
+                addJavascriptInterface(object {
+                    @JavascriptInterface fun selected(session: String) {
+                        runOnUiThread {
+                            if (browser === this@apply && browserInstance == instance && engine.state.url == instance && sameOrigin(instance, url.orEmpty())) {
+                                voice.select(session.ifBlank { null })
+                            }
+                        }
+                    }
+                }, "DshxVoice")
                 webChromeClient = object : WebChromeClient() {
                     override fun onShowFileChooser(view: WebView, callback: ValueCallback<Array<Uri>>, params: FileChooserParams): Boolean {
                         if (filePending || engine.state.url != instance || !sameOrigin(instance, view.url.orEmpty()) ||
@@ -177,6 +219,14 @@ class MainActivity : ComponentActivity() {
                                 style.id = 'dshx-chat-layout';
                                 style.textContent = ${JSONObject.quote(css)};
                                 document.head.append(style);
+                                let selected;
+                                const syncVoice = () => {
+                                    try {
+                                        const session = JSON.parse(localStorage.getItem('dsh.sessions.current') || '{}').sessionId || '';
+                                        if (selected !== session) { selected = session; window.DshxVoice.selected(session); }
+                                    } catch {}
+                                };
+                                syncVoice(); setInterval(syncVoice, 500);
                             })()
                         """.trimIndent(), null)
                     }

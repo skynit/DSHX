@@ -12,6 +12,8 @@ import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Semaphore
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
@@ -20,6 +22,7 @@ class PolicyBridge(
     private val policy: ToolPolicy, val instance: String,
     private val phone: ((String, JSONObject, String, () -> Boolean) -> JSONObject)? = null,
     private val phoneFinished: ((String) -> Unit)? = null,
+    private val model: ((JSONObject, () -> Boolean) -> JSONObject)? = null,
     private val lost: () -> Unit,
 ) : Closeable {
     val token = UUID.randomUUID().toString() + UUID.randomUUID().toString()
@@ -31,6 +34,24 @@ class PolicyBridge(
     @Volatile private var client: Socket? = null
     private data class Call(val id: Long, val session: String, val cancelled: AtomicBoolean = AtomicBoolean())
     @Volatile private var phoneCall: Call? = null
+    @Volatile private var modelCall: Call? = null
+    private val voiceCalls = ConcurrentHashMap<String, CompletableFuture<JSONObject>>()
+
+    /** Called off the main thread; replies share the existing authenticated connection. */
+    fun voice(action: String, data: JSONObject = JSONObject()): JSONObject {
+        val socket = client ?: throw IllegalStateException("语音会话尚未连接，请先启动 dsh。")
+        check(!closed) { "语音会话连接已停止。" }
+        val id = UUID.randomUUID().toString()
+        val result = CompletableFuture<JSONObject>()
+        voiceCalls[id] = result
+        try {
+            check(client === socket && !closed) { "语音会话连接已停止。" }
+            send(socket, JSONObject().put("voice", id).put("action", action).put("data", data))
+            val response = result.get(180, TimeUnit.SECONDS)
+            check(response.optBoolean("ok")) { response.optString("error", "语音会话请求失败。") }
+            return response.getJSONObject("result")
+        } finally { voiceCalls.remove(id) }
+    }
 
     fun start() {
         thread(name = "dsh-policy-listener", isDaemon = true) {
@@ -70,6 +91,12 @@ class PolicyBridge(
             send(socket, JSONObject().put("id", 0).put("ok", true).put("state", snapshot()))
             while (!closed) {
                 val request = JSONObject(line(input) ?: break)
+                if (request.has("voice")) {
+                    require(request.keys().asSequence().all { it in setOf("voice", "ok", "result", "error") })
+                    require(request.get("ok") is Boolean)
+                    voiceCalls[request.getString("voice")]?.complete(request)
+                    continue
+                }
                 val id = request.get("id")
                 require(id is Number && id.toDouble() == id.toLong().toDouble() && id.toLong() in 1..9_007_199_254_740_991L)
                 val response = JSONObject().put("id", id)
@@ -79,10 +106,34 @@ class PolicyBridge(
                         "register" -> setOf("id", "method", "session", "title", "parent")
                         "phone" -> setOf("id", "method", "session", "action", "args")
                         "phone-cancel" -> setOf("id", "method", "session", "call")
+                        "local-model" -> setOf("id", "method", "session", "messages")
+                        "local-cancel" -> setOf("id", "method", "session", "call")
                         else -> setOf("id", "method", "session")
                     }
                     require(request.keys().asSequence().all { it in allowed }) { "查询不接受额外字段" }
                     val session = request.optString("session")
+                    if (method == "local-model") {
+                        policy.mode(instance, session)
+                        val owner = policy.state.sessions.first { it.id == session }
+                        val handler = requireNotNull(model) { "本地模型未配置。" }
+                        val call = Call(id.toLong(), session)
+                        synchronized(this) { require(modelCall == null) { "本地模型正在处理上一轮。" }; modelCall = call }
+                        thread(name = "dsh-local-model", isDaemon = true) {
+                            val result = JSONObject().put("id", id)
+                            try {
+                                val value = handler(request) { !closed && !call.cancelled.get() && policy.state.sessions.any { it === owner } }
+                                check(!closed && !call.cancelled.get() && policy.state.sessions.any { it === owner })
+                                result.put("ok", true).put("result", value)
+                            } catch (error: Throwable) {
+                                android.util.Log.w("DSHXVoice", "Local model failed", error)
+                                result.put("ok", false).put("error", if (error.message == "当前可用内存不足，本地模型暂不加载。请关闭其他占用内存的应用后重试。")
+                                    error.message else "本地模型未就绪、已取消或处理失败，请检查模型文件和设备内存。")
+                            }
+                            finally { synchronized(this) { if (modelCall === call) modelCall = null } }
+                            runCatching { send(socket, result) }
+                        }
+                        continue
+                    }
                     if (method == "phone") {
                         policy.mode(instance, session)
                         val owner = policy.state.sessions.first { it.id == session }
@@ -123,6 +174,9 @@ class PolicyBridge(
                             val call = request.getLong("call")
                             phoneCall?.takeIf { it.id == call && it.session == session }?.cancelled?.set(true)
                         }
+                        "local-cancel" -> {
+                            modelCall?.takeIf { it.id == request.getLong("call") && it.session == session }?.cancelled?.set(true)
+                        }
                         else -> throw IllegalArgumentException("仅支持登记、查询和结束会话")
                     }
                     response.put("ok", true)
@@ -162,7 +216,10 @@ class PolicyBridge(
     }
 
     private fun release() {
+        voiceCalls.values.forEach { it.completeExceptionally(IllegalStateException("语音会话连接已停止。")) }
+        voiceCalls.clear()
         phoneCall?.cancelled?.set(true)
+        modelCall?.cancelled?.set(true)
         runCatching { server.close() }
         sockets.forEach { runCatching { it.close() } }
         policy.disconnect(instance)

@@ -84,6 +84,7 @@ Node 为当前实例维护认证查询连接，宿主登记父子会话；当前
 需要 JDK 17、Android SDK 36、NDK 28.2.13676358、Python 3.11+、Node/npm、curl、dpkg-deb、readelf 与 `/usr/include/node/node_api.h`。可通过 `ANDROID_NDK_HOME` 指定 NDK。
 
 ```bash
+python3 tools/voice.py prepare
 python3 tools/core.py build --abi arm64-v8a
 JAVA_HOME=/usr/lib/jvm/java-17-openjdk ./gradlew :app:assembleDebug
 JAVA_HOME=/usr/lib/jvm/java-17-openjdk ./gradlew :app:testDebugUnitTest \
@@ -225,3 +226,12 @@ V1-A/B 源码与入口已逐项核对，但实际运行证据和 V1-C 配套仍�
 剩余事项包括：插件运行结果收敛、模型提示中的旧插件描述修正、API 26＋WebView 126+ 完整聊天、原生 ARM 16KB、长时后台与锁屏、异常与渲染故障、更多输入法及附件来源，以及正式版本、发行签名、第三方许可证与对应源码配套。已有 ARM 真机、真实服务商和官方 x86 16KB 模拟器证据分别以 DELIVERY 的具体包和边界为准，不将它们笼统列为全部未做或全部通过。
 
 手机人设入口与后台用量账本见上方 V2 记录。手机桥本轮接入范围与限制见 PHONE（本地文档）；小模型分工、按键语音、声音唤醒按后续阶段推进。下一步及退出条件见 本地能力核对记录（仅本地保留）。
+
+
+## 2026-10-23 语音与本地小模型增量
+
+原生端已接入声音唤醒、句末检测、SenseVoice 本地输入、草稿编辑、正式会话语音对话和按需 Qwen3 小模型。系统没有离线中文声音时可主动下载约 58 MiB 的 MeloTTS 中英播报资源；开始对话前先检查播报条件，普通语音输入可独立使用。下载使用固定版本和 SHA-256 校验，用户显式选择官方或镜像来源，录音不因下载来源切换而上传。
+
+构建前执行 `python3 tools/voice.py prepare`；下载环境需要代理时给该命令传 `--proxy`，不修改设备或系统全局代理。脚本准备固定 AAR、唤醒资源和 llama.cpp 源码；ASR、播报与小模型权重由用户在设置下载，不打进 APK。`VoiceControl` 是 Application 持有的流程对象；`VoiceService` 负责麦克风前台通知；`VoiceInput` 管理单一录音和识别；`VoiceOutput` 负责离线合成与播放；`LocalModel` 调用 C++ CPU 推理。完整术语、调用流程、来源、设备结果和限制见 本地语音实施记录（仅本地保留），第三方声明见 `app/src/main/assets/voice/NOTICE.txt`。
+
+本轮只执行受影响原生包与 Node 语音／用量的定向测试，旧轮次数字不移用。未完成 ARM 真机唤醒、耗电、长时锁屏和回声打断验收；实验播报中唤醒默认关闭，不能把接口存在当作声学质量通过。最终状态与产物由 VOICE 记录。

@@ -11,6 +11,7 @@ import android.os.IBinder
 
 class DshApp : Application() {
     val engine by lazy { Engine(this) }
+    val voice by lazy { VoiceControl(this, engine) }
 }
 
 class EngineService : Service() {

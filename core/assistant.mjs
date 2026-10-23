@@ -60,6 +60,10 @@ function append(directory, event, filename = 'usage.jsonl') {
   } finally { closeSync(file); }
 }
 
+export function localUsage(event, directory = process.env.DSHX_ASSISTANT_DIR) {
+  if (directory) append(directory, event, 'local-usage.jsonl');
+}
+
 // Built-in adapters opt in only when their model send path is instrumented.
 export const modelTransport = Symbol('android-model-transport');
 const calls = new AsyncLocalStorage();
@@ -351,6 +355,8 @@ export function piOptions(model) {
 // close. Detached pi-ai producers inherit the same context without sharing it
 // with another call or writing after its terminal record.
 export async function* usageStream(options, stream, directory = process.env.DSHX_ASSISTANT_DIR, transport = false) {
+  // Native inference owns a separate measured local ledger; it is never a remote request attempt.
+  if (options.provider === 'dshx-local') { yield* stream(); return; }
   const state = { options, directory, transport, request: undefined, closed: false };
   let iterator;
   let outcome = 'incomplete';

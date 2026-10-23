@@ -30,3 +30,5 @@
       name: 'file:@CORE@/guard.mjs'
     - id: dshx-android-phone
       name: 'file:@CORE@/phone.mjs'
+    - id: dshx-android-voice
+      name: 'file:@CORE@/voice.mjs'

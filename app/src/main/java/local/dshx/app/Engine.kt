@@ -35,6 +35,8 @@ class Engine(private val context: Context, private val worker: Executor = Execut
     fun observe(listener: (EngineState) -> Unit) { listeners.add(listener); listener(state) }
     fun remove(listener: (EngineState) -> Unit) { listeners.remove(listener) }
     fun diagnostics(): String = synchronized(logs) { logs.joinToString("\n") }
+    fun voice(action: String, data: org.json.JSONObject = org.json.JSONObject()): org.json.JSONObject =
+        (bridge ?: throw IllegalStateException("请先启动 dsh，再使用语音对话。" )).voice(action, data)
 
     @SuppressLint("UsableSpace") // Use already free space; do not evict other apps' caches to install.
     @Synchronized fun start(onFinished: () -> Unit) = launch(onFinished)
@@ -79,7 +81,7 @@ class Engine(private val context: Context, private val worker: Executor = Execut
                 patch.writeText(File(core, "android.patch.yml").readText().replace("@CORE@", core.path))
                 val instance = UUID.randomUUID().toString()
                 tools.begin(instance)
-                val policyBridge = PolicyBridge(tools, instance, phone::execute, phone::finish) {
+                val policyBridge = PolicyBridge(tools, instance, phone::execute, phone::finish, LocalModel(context)::reply) {
                     main.post {
                         if (bridge?.instance == instance && !cancelled.get()) {
                             record("原生工具权限连接中断，已请求停止 dsh；旧会话权限不会恢复。")

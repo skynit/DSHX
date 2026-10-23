@@ -48,6 +48,26 @@ export class PolicyHost {
 
   receive(message) {
     if (this.failure) return;
+    if (typeof message.voice === 'string') {
+      if (!this.connected || !/^[a-zA-Z0-9-]{1,80}$/.test(message.voice) || typeof message.action !== 'string') {
+        throw new Error('原生语音请求无效。');
+      }
+      Promise.resolve().then(() => {
+        if (!this.voice) throw Object.assign(new Error('语音会话尚未就绪。'), { code: 'VOICE_NOT_READY' });
+        return this.voice(message.action, message.data ?? {});
+      }).then(result => this.send({ voice: message.voice, ok: true, result }),
+        error => {
+          // Keep diagnostic frames, never provider error text or request/response bodies.
+          console.warn('Android voice request failed:', error?.name ?? 'Error',
+            typeof error?.code === 'string' && /^[A-Za-z0-9/_-]{1,80}$/.test(error.code) ? error.code : '',
+            typeof error?.stack === 'string' ? error.stack.split('\n').slice(1, 5).join('\n') : '');
+          const detail = error?.code === 'VOICE_NOT_READY' ? '语音会话尚未就绪，请稍后重试。'
+            : error?.code === 'VOICE_MEMORY' ? '当前可用内存不足，本地模型暂不加载。请关闭其他占用内存的应用后重试。'
+            : '语音会话请求失败，请检查模型配置或重新开始。';
+          this.send({ voice: message.voice, ok: false, error: detail });
+        });
+      return;
+    }
     if (!Number.isSafeInteger(message.id) || message.id < 0 || typeof message.ok !== 'boolean') {
       throw new Error('原生查询响应无效。');
     }
@@ -60,7 +80,7 @@ export class PolicyHost {
       clearTimeout(pending.timer);
       pending.cleanup?.();
       this.pending.delete(message.id);
-      pending.reject(new Error(pending.phone ? message.error || '手机操作失败，请重新观察界面。' : '原生会话查询被拒绝，会话可能已结束。'));
+      pending.reject(new Error(pending.phone || pending.local ? message.error || '本机处理失败，请重新开始。' : '原生会话查询被拒绝，会话可能已结束。'));
       return;
     }
     const state = message.state;
@@ -94,13 +114,14 @@ export class PolicyHost {
     const id = ++this.sequence;
     return new Promise((resolve, reject) => {
       const phone = method === 'phone';
-      const timer = setTimeout(() => this.fail(), phone ? (data.action === 'ask' ? 65000 : 25000) : 3000);
+      const local = method === 'local-model';
+      const timer = setTimeout(() => this.fail(), local ? 170000 : phone ? (data.action === 'ask' ? 65000 : 25000) : 3000);
       const abort = () => {
-        reject(new Error('手机操作已取消；已发出的动作结果需重新观察，不能自动重试。' +
+        reject(new Error(local ? '本地模型生成已取消。' : '手机操作已取消；已发出的动作结果需重新观察，不能自动重试。' +
           (data.action === 'export' ? '导出可能已开始，授权目录可能残留不完整文件，请检查。' : '')));
-        this.query('phone-cancel', { session: data.session, call: id }).catch(() => {});
+        this.query(local ? 'local-cancel' : 'phone-cancel', { session: data.session, call: id }).catch(() => {});
       };
-      this.pending.set(id, { resolve, reject, timer, phone, cleanup: () => signal?.removeEventListener('abort', abort) });
+      this.pending.set(id, { resolve, reject, timer, phone, local, cleanup: () => signal?.removeEventListener('abort', abort) });
       this.send({ id, method, ...data });
       signal?.addEventListener('abort', abort, { once: true });
       if (signal?.aborted) abort();

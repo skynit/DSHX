@@ -21,6 +21,9 @@ core/cache/
 app/src/main/assets/core.zip
 app/src/main/assets/core.json
 app/src/main/assets/core-info.json
+app/libs/*.aar
+app/.cxx/
+app/src/main/assets/voice/wake/
 
 # python
 __pycache__/

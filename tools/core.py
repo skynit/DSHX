@@ -354,7 +354,7 @@ def build(abi):
         patch('@deepseek-ai/dsh-llm-pi-ai/lib/index.js',
               '\t\t\tyield {\n\t\t\t\ttype: "usage",\n\t\t\t\tusage: mapUsage(event.error.usage)\n\t\t\t};',
               '\t\t\tif (providerUsage() !== void 0) yield {\n\t\t\t\ttype: "usage",\n\t\t\t\tusage: providerUsage()\n\t\t\t};')
-        for filename in ("start.mjs", "plugins.mjs", "assistant.mjs", "compat.mjs", "guard.mjs", "policy.mjs", "files.mjs", "host.mjs", "phone.mjs", "recover.mjs", "android.patch.yml"):
+        for filename in ("start.mjs", "plugins.mjs", "assistant.mjs", "compat.mjs", "guard.mjs", "policy.mjs", "files.mjs", "host.mjs", "phone.mjs", "voice.mjs", "recover.mjs", "android.patch.yml"):
             shutil.copy2(SOURCE / filename, bundle / filename)
         ndk = Path(os.environ.get("ANDROID_NDK_HOME", "/home/skynit/Android/Sdk/ndk/28.2.13676358"))
         compiler = ndk / "toolchains/llvm/prebuilt/linux-x86_64/bin" / (

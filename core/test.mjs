@@ -2906,3 +2906,200 @@ for (const scenario of ['direct', 'later allow listener', 'removed plugin guard'
     } finally { await ctx.fiber.dispose(); }
   });
 }
+
+test('voice local routing uses the real loop history restores selection and separates accounting', async () => {
+  const { Context } = await load('@deepseek-ai/cordis');
+  const { default: SystemPrompt } = await load('@deepseek-ai/dsh-system-prompt');
+  const { default: Tools } = await load('@deepseek-ai/dsh-tools');
+  const { default: LlmRuntime, LlmAdapter, createUserMessage } = await load('@deepseek-ai/dsh-llm');
+  const { default: Agents, installModelSelection } = await load('@deepseek-ai/dsh-agent');
+  const { default: Sessions } = await load('@deepseek-ai/dsh-session');
+  const { default: Projections } = await load('@deepseek-ai/dsh-session-projection');
+  const { installModelSelectionProjection } = await import(new URL('./types/model-selection-projection.js',
+    pathToFileURL(require.resolve('@deepseek-ai/dsh-api-session-controller'))));
+  const { default: AgentLoop } = await load('@deepseek-ai/dsh-agent-loop');
+  const { voiceSession, localAdapter, localQuestion } = await import(pathToFileURL(join(core, 'voice.mjs')));
+  const { usageStream } = await import(pathToFileURL(join(core, 'assistant.mjs')));
+  const ctx = new Context();
+  const dir = await mkdtemp(join(directory, 'voice-accounting-'));
+  const previous = process.env.DSHX_ASSISTANT_DIR;
+  process.env.DSHX_ASSISTANT_DIR = dir;
+  let voice, disposeSelection;
+  let remote = 0;
+  let local = 0;
+  const events = [];
+  const original = { provider: 'fixture', model: 'remote' };
+  const selection = { current: original };
+  class Remote extends LlmAdapter {
+    async *stream() { remote++; yield { type: 'text-delta', index: 0, text: '远程任务回答' }; yield { type: 'finish', reason: { kind: 'stop' } }; }
+  }
+  try {
+    for (const plugin of [SystemPrompt, Tools, LlmRuntime, Agents, Sessions, Projections]) await ctx.plugin(plugin);
+    installModelSelectionProjection(ctx);
+    await ctx.plugin(AgentLoop, { agents: [] });
+    ctx.llm.registerAdapter(['fixture'], new Remote());
+    ctx.llm.registerAdapter(['dshx-local'], localAdapter(LlmAdapter, { query: async (method, data) => {
+      local++; assert.equal(method, 'local-model');
+      assert.equal(data.session, 'voice-session');
+      assert.equal(data.messages.at(-1).text, '你好');
+      assert.ok(data.messages.every(message => ['user', 'assistant'].includes(message.role)));
+      selection.current = undefined; // Controller consumes a selection after its durable header.
+      return { text: '你好，我是小橙。', inputTokens: 17, outputTokens: 8 };
+    } }));
+    ctx.on('llm/stream', (options, stream) => usageStream(options, stream));
+    const agent = await ctx.agentLoop.create('voice-session', original);
+    disposeSelection = installModelSelection(agent.ctx, selection);
+    ctx.sessionController = {
+      agents: {
+        selectionFor: () => selection,
+        selectForNextRequest(agent, selected) { agent.session.append('model/selection', selected); selection.current = selected; },
+      },
+      create: async () => ({ sessionId: agent.session.id }),
+      commands: {
+        resolveAgent: async () => agent,
+        prompt: async (request, source) => { agent.followup(createUserMessage({ content: request.content, source })); return { accepted: true }; },
+      },
+    };
+    ctx.on('session/event', (_session, event) => events.push(event));
+    voice = voiceSession(ctx);
+    assert.equal(localQuestion('你好'), true);
+    assert.equal(localQuestion('本地回答：今天的天气'), false);
+    assert.equal(localQuestion('搜索文件'), false);
+    assert.equal(localQuestion('什么是光合作用'), true);
+    const result = await voice.call('prompt', { interaction: 'first', text: '你好', local: true });
+    await agent.whenIdle();
+    assert.equal(result.text, '你好，我是小橙。');
+    assert.equal(result.session, agent.session.id);
+    assert.equal(result.local, true);
+    assert.equal(local, 1); assert.equal(remote, 0);
+    assert.equal(selection.current, original, 'restore even after the API consumed our temporary selection');
+    assert.ok(events.some(event => event.type === 'model/selection' && event.data.provider === original.provider),
+      'persist the original route before a local header can become the resumed session default');
+    assert.equal(agent.session.requestHeader().config.provider, 'dshx-local');
+    const replay = new Context();
+    try {
+      await replay.plugin(Projections);
+      installModelSelectionProjection(replay);
+      assert.deepEqual(replay.sessionProjections.stateOf(agent.session, 'modelSelection').pending, original,
+        'a fresh projection rebuilds the original route from committed events without the execution cache');
+      assert.deepEqual(replay.sessionProjections.snapshot(agent.session, ['modelSelection']).values.modelSelection.next, original);
+    } finally { await replay.fiber.dispose(); }
+    assert.ok(events.some(event => event.type === 'user/message' && event.data.source.rpcId));
+    const followup = await voice.call('prompt', { interaction: 'second', session: agent.session.id, text: '搜索文件', local: true });
+    await agent.whenIdle();
+    assert.equal(followup.local, false); assert.equal(remote, 1);
+    assert.equal(agent.session.requestHeader().config.provider, 'fixture');
+    const ledger = (await readFile(join(dir, 'local-usage.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+    assert.deepEqual(ledger.map(row => row.event), ['start', 'finish']);
+    assert.deepEqual(ledger[1].usage, { inputTokens: 17, outputTokens: 8 });
+    assert.equal(ledger[1].outcome, 'success');
+    const cloudLedger = await readFile(join(dir, 'usage.jsonl'), 'utf8');
+    assert.doesNotMatch(cloudLedger, /dshx-local/);
+    assert.doesNotMatch(JSON.stringify(ledger), /你好|搜索文件|小橙/);
+  } finally {
+    voice?.close(); disposeSelection?.(); await ctx.fiber.dispose();
+    if (previous === undefined) delete process.env.DSHX_ASSISTANT_DIR; else process.env.DSHX_ASSISTANT_DIR = previous;
+  }
+});
+
+test('voice cancellation removes only its pending message and cannot cancel another running task', async () => {
+  const { voiceSession } = await import(pathToFileURL(join(core, 'voice.mjs')));
+  const handlers = new Map();
+  const admission = Promise.withResolvers();
+  const admitted = Promise.withResolvers();
+  const pending = [{ id: 'typed', source: { kind: 'user', rpcId: 'typed' } }];
+  let cancellations = 0;
+  const agent = { status: 'idle', inbox: { nextTurn: [], nextStep: [], hasPending: false, remove(id) {
+    this.nextTurn = this.nextTurn.filter(message => message.id !== id);
+  } }, cancel() { cancellations++; } };
+  const voice = voiceSession({
+    on(name, handler) { handlers.set(name, handler); return () => handlers.delete(name); },
+    sessionController: { commands: {
+      resolveAgent: async () => agent,
+      prompt: async (_request, source) => {
+        admitted.resolve(); await admission.promise;
+        agent.inbox.nextTurn.push({ id: 'voice', source });
+      },
+    } },
+  });
+  try {
+    const call = voice.call('prompt', { session: 'session', interaction: 'cancel-own', text: '你好' });
+    call.catch(() => {});
+    await admitted.promise;
+    agent.status = 'running'; agent.inbox.nextTurn = pending.slice();
+    await voice.call('cancel', { interaction: 'old-round' });
+    assert.equal(cancellations, 0);
+    await voice.call('cancel', { interaction: 'cancel-own' });
+    admission.resolve();
+    await assert.rejects(call, /取消/);
+    assert.equal(cancellations, 0, 'the admitted typed task belongs to someone else');
+    assert.deepEqual(agent.inbox.nextTurn.map(message => message.id), ['typed']);
+  } finally { admission.resolve(); voice.close(); }
+});
+
+test('voice temporary model selection respects user switches and rejects unsuccessful turns', async () => {
+  const { voiceSession } = await import(pathToFileURL(join(core, 'voice.mjs')));
+  const handlers = new Map();
+  const selection = { current: { provider: 'original', model: 'one' } };
+  const agent = { status: 'idle', inbox: { nextTurn: [], nextStep: [], hasPending: false }, cancel() {} };
+  const chosen = { provider: 'user-picked', model: 'two' };
+  let failure = { kind: 'error' };
+  const session = { id: 'switch-session' };
+  const voice = voiceSession({
+    on(name, handler) { handlers.set(name, handler); return () => handlers.delete(name); },
+    sessionController: {
+      agents: {
+        selectionFor: () => selection,
+        selectForNextRequest(_agent, selected) {
+          selection.current = selected;
+          handlers.get('session/event')(session, { type: 'model/selection', data: selected });
+        },
+      },
+      commands: {
+        resolveAgent: async () => agent,
+        prompt: async (_request, source) => {
+          handlers.get('agent/inbox/claimed')({ agent, message: { source }, turn: 1 });
+          assert.equal(selection.current.provider, 'dshx-local');
+          selection.current = chosen;
+          handlers.get('session/event')(session, { type: 'model/selection', data: chosen });
+          handlers.get('session/event')(session, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'partial' }] } } });
+          handlers.get('session/event')(session, { type: 'turn/end', data: { turn: 1, reason: failure } });
+        },
+      },
+    },
+  });
+  try {
+    await assert.rejects(voice.call('prompt', { session: session.id, interaction: 'switch', text: '你好', local: true }), /失败/);
+    assert.equal(selection.current, chosen, 'an explicit user change wins over restoring the previous choice');
+    failure = { kind: 'error', error: { message: '当前可用内存不足，本地模型暂不加载。请关闭其他占用内存的应用后重试。' } };
+    await assert.rejects(voice.call('prompt', { session: session.id, interaction: 'memory', text: '你好', local: true }), { code: 'VOICE_MEMORY' });
+  } finally { voice.close(); }
+});
+
+test('voice local adapter bounds Unicode history and records cancellation without prompt content', async () => {
+  const { LlmAdapter } = await load('@deepseek-ai/dsh-llm');
+  const { localAdapter } = await import(pathToFileURL(join(core, 'voice.mjs')));
+  const dir = await mkdtemp(join(directory, 'voice-projection-'));
+  const previous = process.env.DSHX_ASSISTANT_DIR;
+  process.env.DSHX_ASSISTANT_DIR = dir;
+  const abort = new AbortController();
+  const messages = Array.from({ length: 20 }, () => ({ role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '🙂'.repeat(1000) }] }));
+  messages.unshift({ role: 'system', content: [{ type: 'text', text: 'private system' }] });
+  const adapter = localAdapter(LlmAdapter, { query: async (_method, data) => {
+    assert.equal(data.messages.length, 8);
+    assert.ok(data.messages.every(message => [...message.text].length === 600 && message.text === '🙂'.repeat(600)));
+    assert.ok(Buffer.byteLength(JSON.stringify(data)) < 32768, 'the projection must fit the authenticated native line limit');
+    abort.abort(); throw new Error('private generation detail');
+  } });
+  try {
+    await assert.rejects(async () => { for await (const _ of adapter.stream({ sessionId: 'bounded', messages, signal: abort.signal })) {} }, /private generation detail/);
+    const text = await readFile(join(dir, 'local-usage.jsonl'), 'utf8');
+    assert.doesNotMatch(text, /private|🙂/);
+    const rows = text.trim().split('\n').map(JSON.parse);
+    assert.equal(rows.at(-1).outcome, 'cancelled');
+    assert.equal(rows.at(-1).usage, null);
+    await assert.rejects(stat(join(dir, 'usage.jsonl')), { code: 'ENOENT' });
+  } finally {
+    if (previous === undefined) delete process.env.DSHX_ASSISTANT_DIR; else process.env.DSHX_ASSISTANT_DIR = previous;
+  }
+});

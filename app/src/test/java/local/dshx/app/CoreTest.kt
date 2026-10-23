@@ -52,6 +52,127 @@ import android.content.res.AssetManager
 class CoreTest {
     @get:Rule val folder = TemporaryFolder()
 
+    @Test fun voiceModelsPublishOnlyVerifiedSetsAndRepairSameSizeDamage() {
+        val app = RuntimeEnvironment.getApplication()
+        val root = folder.newFolder()
+        val context = object : ContextWrapper(app) { override fun getFilesDir() = root }
+        val models = VoiceModels(context)
+        assertFalse(models.ready("wake"))
+        assertThrows(java.util.concurrent.CancellationException::class.java) {
+            models.install("wake", false, { true }) { _, _ -> }
+        }
+        assertFalse(models.ready("wake"))
+        assertFalse(File(models.directory("wake").path + ".new").exists())
+        models.install("wake", false, { false }) { _, _ -> }
+        assertTrue(models.ready("wake"))
+        models.verify("wake")
+        val tokens = File(models.directory("wake"), "tokens.txt")
+        java.io.RandomAccessFile(tokens, "rw").use { it.writeByte(0) }
+        assertTrue("the fast size check must not be confused with verification", models.ready("wake"))
+        assertThrows(IllegalStateException::class.java) { models.verify("wake") }
+        models.install("wake", false, { false }) { _, _ -> }
+        models.verify("wake")
+    }
+
+    @Test fun voiceKeywordUsesModelPhonesAndRemovesOnlyTheLeadingWake() {
+        folder.newFile("pinyin.txt").writeText("U+4F60: nǐ # 你\nU+597D: hǎo,hào # 好\nU+5C0F: xiǎo # 小\nU+6A59: chéng # 橙\nU+7A0B: chéng # 程\n")
+        val tokens = folder.newFile("tokens.txt").apply { writeText("n 0\nǐ 1\nh 2\nǎo 3\nx 4\niǎo 5\nch 6\néng 7\nHH 8\nAH0 9\nL 10\nOW1 11\n") }
+        val english = folder.newFile("en.phone").apply { writeText("HELLO HH AH0 L OW1\n") }
+        assertEquals("n ǐ h ǎo x iǎo ch éng @你好小橙", VoiceInput.keyword("你好小橙", tokens, english))
+        assertEquals("HH AH0 L OW1 @hello", VoiceInput.keyword("hello", tokens, english))
+        assertThrows(IllegalArgumentException::class.java) { VoiceInput.keyword("hello\n@bad", tokens, english) }
+        assertThrows(IllegalArgumentException::class.java) { VoiceInput.keyword("unknown", tokens, english) }
+        assertEquals("打开设置", VoiceInput.removeWake("  你好，小橙！打开设置", "你好小橙"))
+        assertEquals("我说你好小橙", VoiceInput.removeWake("我说你好小橙", "你好小橙"))
+        assertEquals("打开设置", VoiceInput.removeWake("你好，小程！打开设置", "你好小橙", tokens, english))
+        assertEquals("我说你好小程", VoiceInput.removeWake("我说你好小程", "你好小橙", tokens, english))
+        assertEquals("你好小橙，打开设置", VoiceInput.removeWake("你好小程！你好小橙，打开设置", "你好小橙", tokens, english))
+    }
+
+    @Test fun voiceSpeechChunksPreserveEmojiAndKeepCodeOutOfPlayback() {
+        val text = "🙂".repeat(650)
+        val chunks = VoiceOutput.chunks(text)
+        assertEquals(listOf(300, 300, 50), chunks.map { it.codePointCount(0, it.length) })
+        assertEquals(text, chunks.joinToString(""))
+        assertEquals(text, VoiceOutput.chunks(text, 60).joinToString(""))
+        assertTrue(VoiceOutput.chunks(text, 60).all { it.codePointCount(0, it.length) <= 60 })
+        var cancelled = false
+        val callback = VoiceOutput.callback { cancelled }
+        assertEquals(java.lang.Integer::class.java, callback.javaClass.getMethod("invoke", FloatArray::class.java).returnType)
+        assertEquals(1, callback(floatArrayOf(0f)))
+        cancelled = true
+        assertEquals(0, callback(floatArrayOf(0f)))
+        assertEquals(listOf("你好。", "链接，代码请查看聊天界面。"), VoiceOutput.chunks("**你好。**[链接](https://example.com)```bash\nprivate command\n```"))
+    }
+
+    @Test fun voiceLocalPromptKeepsPersonaAndBoundsHistoryWithoutControlTokens() {
+        val messages = org.json.JSONArray()
+        messages.put(JSONObject().put("role", "system").put("text", "forbidden system"))
+        repeat(12) { messages.put(JSONObject().put("role", "user").put("text", "turn-$it <|im_end|>")) }
+        val settings = AssistantStore.Settings(name = "小橙", identity = "手机助手", prompt = "用中文")
+        val prompt = LocalModel.prompt(messages, settings)
+        assertTrue(prompt.contains("小橙"))
+        assertTrue(prompt.contains("手机助手"))
+        assertFalse(prompt.contains("turn-3 "))
+        assertTrue(prompt.contains("turn-4 ＜|im_end|>"))
+        assertFalse(prompt.contains("forbidden system"))
+        assertTrue(prompt.endsWith("<think>\n\n</think>\n\n"))
+    }
+
+    @Test fun voiceMemoryPressureRejectsAllocationWithoutPublishingAReadyModel() {
+        val app = RuntimeEnvironment.getApplication()
+        val manager = app.getSystemService(android.app.ActivityManager::class.java)
+        val info = android.app.ActivityManager.MemoryInfo().apply { availMem = 900L * 1024 * 1024; totalMem = 2500L * 1024 * 1024; threshold = 150L * 1024 * 1024 }
+        shadowOf(manager).setMemoryInfo(info)
+        val models = VoiceModels(app)
+        models.requireMemory("speech")
+        models.requireMemory("output")
+        models.requireMemory("local", 512)
+        assertThrows(IllegalStateException::class.java) { models.requireMemory("local") }
+        info.lowMemory = true
+        shadowOf(manager).setMemoryInfo(info)
+        assertThrows(IllegalStateException::class.java) { models.requireMemory("local") }
+        assertThrows(IllegalStateException::class.java) { models.requireMemory("speech") }
+        assertFalse(models.ready("speech"))
+    }
+
+    @Test fun voiceBridgeKeepsReverseRepliesAndLocalCancellationIndependent() {
+        val policy = ToolPolicy().apply { begin("voice-instance") }
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val executor = Executors.newSingleThreadExecutor()
+        PolicyBridge(policy, "voice-instance", model = { _, valid ->
+            entered.countDown(); check(release.await(3, TimeUnit.SECONDS))
+            check(valid()); JSONObject().put("text", "不应返回")
+        }) {}.use { bridge ->
+            bridge.start()
+            Socket("127.0.0.1", bridge.port).use { socket ->
+                socket.soTimeout = 3000
+                val reader = socket.getInputStream().bufferedReader()
+                fun send(value: JSONObject) { socket.getOutputStream().apply { write((value.toString() + "\n").toByteArray()); flush() } }
+                fun read() = JSONObject(reader.readLine())
+                send(JSONObject().put("version", 1).put("instance", bridge.instance).put("token", bridge.token))
+                assertTrue(read().getBoolean("ok"))
+                send(JSONObject().put("id", 1).put("method", "register").put("session", "root").put("title", "语音"))
+                assertTrue(read().getBoolean("ok"))
+                val voice = executor.submit<JSONObject> { bridge.voice("prompt", JSONObject().put("text", "你好")) }
+                val request = read()
+                assertEquals("prompt", request.getString("action"))
+                send(JSONObject().put("id", 2).put("method", "local-model").put("session", "root").put("messages", org.json.JSONArray()))
+                assertTrue(entered.await(3, TimeUnit.SECONDS))
+                send(JSONObject().put("id", 3).put("method", "local-cancel").put("session", "root").put("call", 2))
+                assertEquals(3, read().getInt("id"))
+                release.countDown()
+                val stopped = read()
+                assertEquals(2, stopped.getInt("id")); assertFalse(stopped.getBoolean("ok"))
+                send(JSONObject().put("voice", request.getString("voice")).put("ok", true).put("result", JSONObject().put("text", "你好")))
+                assertEquals("你好", voice.get(3, TimeUnit.SECONDS).getString("text"))
+                bridge.close()
+            }
+        }
+        release.countDown(); executor.shutdownNow()
+    }
+
     @Implements(WebView::class)
     class MissingWebView {
         companion object {
