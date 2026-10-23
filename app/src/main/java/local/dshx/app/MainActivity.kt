@@ -137,7 +137,12 @@ class MainActivity : ComponentActivity() {
         startForegroundService(Intent(this, VoiceService::class.java).setAction(action))
     }
 
-    override fun onResume() { super.onResume(); engine.phone.device.attach(this); phoneRevision++ }
+    override fun onResume() {
+        super.onResume()
+        engine.phone.resume()
+        engine.phone.device.attach(this)
+        phoneRevision++
+    }
     override fun onPause() { engine.phone.device.detach(this); super.onPause() }
 
     private fun phonePermission(action: String) {

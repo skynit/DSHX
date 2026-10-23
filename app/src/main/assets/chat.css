@@ -1,5 +1,234 @@
-/* Android layout for the pinned official dsh page. Use its semantic slots
-   instead of generated class names; editor state and actions stay upstream. */
+/* Qoder-style visual layer for the pinned official dsh page. Keep theme,
+   editor state, icons and actions upstream; target tokens and semantic slots. */
+html:root {
+    --dsw-radius-xs: 4px;
+    --dsw-radius-sm: 6px;
+    --dsw-radius-md: 8px;
+    --dsw-radius-lg: 8px;
+    --dsw-radius-xl: 10px;
+    --dsw-radius-panel: 10px;
+    --dsw-corner-shape: round;
+    --ds-transition-duration: 160ms;
+    --ds-transition-duration-fast: 120ms;
+    --ds-transition-duration-slow: 240ms;
+}
+
+body {
+    --dshx-background: #f7f7f5;
+    --dshx-surface: #fcfcfb;
+    --dshx-elevated: #ffffff;
+    --dshx-muted: #f0f1ef;
+    --dshx-border: #e4e5e2;
+    --dshx-border-subtle: #ecedeb;
+    --dshx-text: #202220;
+    --dshx-text-muted: #6d726d;
+    --dshx-primary: #2f6cc4;
+    --dshx-on-primary: #ffffff;
+    --dshx-success: #23845f;
+    --dshx-warning: #946015;
+    --dshx-danger: #b33d48;
+    --dshx-overlay-shadow: 0 8px 24px rgb(0 0 0 / 8%);
+}
+
+body[data-ds-dark-theme] {
+    --dshx-background: #171917;
+    --dshx-surface: #202320;
+    --dshx-elevated: #252925;
+    --dshx-muted: #2a2e2a;
+    --dshx-border: #363b36;
+    --dshx-border-subtle: #2a2f2a;
+    --dshx-text: #ecefeb;
+    --dshx-text-muted: #a6aca5;
+    --dshx-primary: #78a7ef;
+    --dshx-on-primary: #172336;
+    --dshx-success: #63b58b;
+    --dshx-warning: #d1a255;
+    --dshx-danger: #e3848a;
+    --dshx-overlay-shadow: 0 8px 24px rgb(0 0 0 / 20%);
+}
+
+/* Beat both upstream palette selectors, including asynchronously loaded CSS.
+   User font preferences and theme-service inline overrides retain priority. */
+html > body:not([data-ds-dark-theme]),
+html > body[data-ds-dark-theme] {
+    --dsw-alias-bg-base: var(--dshx-surface);
+    --dsw-alias-bg-layer-1: var(--dshx-surface);
+    --dsw-alias-bg-layer-2: var(--dshx-elevated);
+    --dsw-alias-bg-layer-3: var(--dshx-elevated);
+    --dsw-alias-bg-module-platform: var(--dshx-background);
+    --dsw-alias-bg-multi-select: var(--dshx-muted);
+    --dsw-alias-bg-overlay: var(--dshx-muted);
+    --dsw-alias-label-primary: var(--dshx-text);
+    --dsw-alias-label-primary-bluish: var(--dshx-text);
+    --dsw-alias-label-secondary: var(--dshx-text-muted);
+    --dsw-alias-label-tertiary: var(--dshx-text-muted);
+    --dsw-alias-label-caption: var(--dshx-text-muted);
+    --dsw-alias-label-dimmed: var(--dshx-text-muted);
+    --dsw-alias-label-primary-dimmed: var(--dshx-text-muted);
+    --dsw-alias-label-primary-foreground: var(--dshx-on-primary);
+    --dsw-alias-border-l1: var(--dshx-border-subtle);
+    --dsw-alias-border-l2: var(--dshx-border);
+    --dsw-alias-border-l2-darkmode-thin: var(--dshx-border);
+    --dsw-alias-border-l3: var(--dshx-border);
+    --dsw-alias-border-l4: var(--dshx-border);
+    --dsw-alias-brand-primary: var(--dshx-primary);
+    --dsw-alias-brand-text: var(--dshx-text);
+    --dsw-alias-link: var(--dshx-primary);
+    --dsw-alias-state-business-primary: var(--dshx-primary);
+    --dsw-alias-state-business-tertiary: color-mix(in srgb, var(--dshx-primary) 12%, var(--dshx-surface));
+    --dsw-alias-state-success-primary: var(--dshx-success);
+    --dsw-alias-state-success-secondary: var(--dshx-success);
+    --dsw-alias-state-success-tertiary: color-mix(in srgb, var(--dshx-success) 10%, var(--dshx-surface));
+    --dsw-alias-state-warn-label: var(--dshx-warning);
+    --dsw-alias-state-warn-primary: var(--dshx-warning);
+    --dsw-alias-state-warn-tertiary: color-mix(in srgb, var(--dshx-warning) 10%, var(--dshx-surface));
+    --dsw-alias-state-error-primary: var(--dshx-danger);
+    --dsw-alias-state-error-secondary: var(--dshx-danger);
+    --dsw-alias-interactive-bg-hover: var(--dshx-muted);
+    --dsw-alias-interactive-bg-hover-solid: var(--dshx-muted);
+    --dsw-alias-interactive-bg-active: color-mix(in srgb, var(--dshx-text) 10%, var(--dshx-surface));
+    --dsw-alias-interactive-bg-hover-accent: color-mix(in srgb, var(--dshx-primary) 10%, var(--dshx-surface));
+    --dsw-alias-interactive-bg-hover-danger: color-mix(in srgb, var(--dshx-danger) 8%, var(--dshx-surface));
+    --dsw-alias-button-primary-fill: var(--dshx-primary);
+    --dsw-alias-button-primary-hover: color-mix(in srgb, var(--dshx-primary) 90%, var(--dshx-text));
+    --dsw-alias-button-primary-dimmed: var(--dshx-muted);
+    /* The upstream Send button uses white glyphs in both themes. */
+    --dsw-alias-button-info-fill: #2f6cc4;
+    --dsw-alias-button-info-hover: #285ea9;
+    --dsw-alias-button-elevated-fill: var(--dshx-elevated);
+    --dsw-alias-button-floating-fill: var(--dshx-elevated);
+    --dsw-alias-button-floating-hover: var(--dshx-muted);
+    --dsw-alias-button-ghost-active-fill: var(--dshx-muted);
+    --dsw-alias-button-ghost-active-hover: var(--dshx-muted);
+    --dsw-alias-menu-icon: var(--dshx-text-muted);
+    --dsw-alias-settings-card-fill: var(--dshx-surface);
+    --dsw-alias-settings-card-stroke: var(--dshx-border);
+    --dsw-alias-markdown-code-block: var(--dshx-background);
+    --dsw-alias-markdown-code-block-banner: var(--dshx-muted);
+    --dsw-alias-markdown-inline-code: var(--dshx-muted);
+    --dsw-alias-scrollbar-bg-l1: color-mix(in srgb, var(--dshx-text-muted) 28%, transparent);
+    --dsw-alias-scrollbar-bg-l2: color-mix(in srgb, var(--dshx-text-muted) 40%, transparent);
+    --dsw-alias-scrollbar-hover-l1: var(--dshx-text-muted);
+    --dsw-alias-scrollbar-hover-l2: var(--dshx-text-muted);
+    --dsw-specific-input-major: var(--dshx-elevated);
+    --dsw-specific-login-input: var(--dshx-elevated);
+    --dsw-specific-menu: var(--dshx-elevated);
+    --dsw-specific-selector: var(--dshx-muted);
+    --dsw-specific-sidebar-fill: var(--dshx-background);
+    --dsw-specific-sidebar-nav-item-active: var(--dshx-muted);
+    --dsw-specific-sidebar-nav-item-active-accent: var(--dshx-muted);
+    --dsw-specific-sidebar-nav-item-hover: var(--dshx-muted);
+    --dsw-specific-bubble: var(--dshx-muted);
+    font-family: var(--dsw-font-family);
+    letter-spacing: 0;
+}
+
+body :is(button, input, textarea, select, [role="menuitem"], [role="tab"]) {
+    transition: background-color 160ms, border-color 160ms, color 160ms;
+}
+
+body :is(button, input, textarea, select, [role="menuitem"], [role="tab"], [role="switch"], a):focus-visible {
+    outline: 2px solid var(--dshx-primary);
+    outline-offset: 2px;
+}
+
+body :is([role="menu"], [role="listbox"], [role="dialog"]) {
+    border-color: var(--dshx-border);
+    border-radius: var(--dsw-radius-md);
+    box-shadow: var(--dshx-overlay-shadow);
+}
+
+body [data-composer-card] {
+    border: 1px solid var(--dshx-border);
+    border-radius: var(--dsw-radius-panel);
+    box-shadow: none;
+    transition: border-color 160ms;
+}
+
+body [data-composer-card]:focus-within {
+    border-color: var(--dshx-primary);
+}
+
+body [data-composer-input] {
+    font-size: var(--dsh-content-font-size, 14px);
+}
+
+/* The official settings shell reserves a 188px navigation column. Stack
+   that same navigation above its content on phones, retaining DOM order. */
+@media (max-width: 640px) {
+    body [role="dialog"]:has(> nav [data-slot="settings.header"]) {
+        flex-direction: column;
+        width: calc(100vw - 24px);
+        max-width: calc(100vw - 24px);
+        height: calc(100dvh - 24px);
+    }
+
+    body [role="dialog"] > nav:has([data-slot="settings.header"]) {
+        width: 100%;
+        min-height: 0;
+        gap: 8px;
+        padding: 16px 12px 8px;
+        border-bottom: 1px solid var(--dshx-border);
+    }
+
+    body [role="dialog"] > nav:has([data-slot="settings.header"]) > div:has(> button[aria-current]) {
+        flex-direction: row;
+        gap: 4px;
+        overflow-x: auto;
+        padding: 4px;
+    }
+
+    body [role="dialog"] > nav:has([data-slot="settings.header"]) button {
+        flex: none;
+        min-height: 44px;
+        border-radius: var(--dsw-radius-sm);
+    }
+
+    body [role="dialog"] > nav:has([data-slot="settings.header"]) + div {
+        min-height: 0;
+    }
+
+    body [role="dialog"] > nav:has([data-slot="settings.header"]) + div > div:first-child {
+        height: auto;
+        min-height: 60px;
+        padding: 8px 12px;
+        align-items: center;
+    }
+
+    body [role="dialog"] > nav:has([data-slot="settings.header"]) + div > div:first-child > button {
+        flex: 0 0 44px;
+        height: 44px;
+    }
+
+    body [role="dialog"] > nav:has([data-slot="settings.header"]) + div > div:last-child {
+        padding: 0 16px 16px;
+    }
+}
+
+/* Touch controls grow only while there is room for the original toolbar.
+   The short landscape rules below retain the proven keyboard layout. */
+@media (pointer: coarse) and (min-height: 241px) {
+    body [data-composer-card] button {
+        min-height: 44px;
+        min-width: 44px;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    html:root {
+        --ds-transition-duration: 0ms;
+        --ds-transition-duration-fast: 0ms;
+        --ds-transition-duration-slow: 0ms;
+    }
+
+    body *, body *::before, body *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0ms !important;
+        scroll-behavior: auto !important;
+    }
+}
+
 @media (orientation: landscape) and (max-height: 240px) {
     [data-slot="conversation.header"] > header,
     [data-composer-dock] {

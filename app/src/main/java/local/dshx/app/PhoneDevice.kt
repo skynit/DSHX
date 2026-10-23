@@ -67,7 +67,7 @@ internal class PhoneDevice private constructor(private val context: Context) {
 
     fun attach(value: Activity) { activity = WeakReference(value) }
     fun detach(value: Activity) { if (activity.get() === value) activity.clear() }
-    fun allowed(name: String): Boolean = settings.getBoolean(name, false)
+    fun allowed(name: String): Boolean = settings.getBoolean(name, name == "overlay")
     fun setAllowed(name: String, enabled: Boolean) {
         require(name in permissions)
         settings.edit().putBoolean(name, enabled).apply()

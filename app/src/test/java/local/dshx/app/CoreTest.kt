@@ -1052,12 +1052,12 @@ class CoreTest {
         }
     }
 
-    @Test fun phoneControlDefaultsToDisabledAndPersistsItsSwitchIndependentlyOfFull() {
+    @Test fun phoneControlDefaultsToEnabledAndKeepsStopIndependentOfFull() {
         val context = RuntimeEnvironment.getApplication()
         val control = PhoneControl(context)
         val policy = ToolPolicy().apply { begin("instance"); connected("instance") }
         assertEquals(ToolPolicy.FULL, policy.register("instance", "root", "手机会话", null))
-        assertFalse(control.enabled())
+        assertTrue(control.enabled())
         assertFalse(control.status().getBoolean("ready"))
         control.setEnabled(true)
         assertTrue(PhoneControl(context).enabled())
@@ -1078,7 +1078,8 @@ class CoreTest {
         assertTrue(initial.getBoolean("ok"))
         assertEquals(Build.VERSION.SDK_INT == 34, initial.getBoolean("screenshotSupported"))
         assertEquals(Build.VERSION.SDK_INT >= 30, initial.getBoolean("coordinateSupported"))
-        listOf("enabled", "accessibility", "ready", "screenshotReady").forEach { key ->
+        assertTrue(initial.getBoolean("enabled"))
+        listOf("accessibility", "ready", "screenshotReady").forEach { key ->
             assertFalse(key, initial.getBoolean(key))
         }
         shadowOf(context.getSystemService(KeyguardManager::class.java)).apply {
@@ -1143,6 +1144,7 @@ class CoreTest {
             control.execute("home", JSONObject(), "root") { true }
         }.get(3, TimeUnit.SECONDS)
         try {
+            control.setEnabled(false)
             phoneFailure("disabled", execute())
             control.setEnabled(true)
             phoneFailure("accessibility_offline", execute())
@@ -1668,18 +1670,43 @@ class CoreTest {
         phoneFailure("wrong_thread", control.execute("clipboard", JSONObject().put("mode", "write").put("text", ""), "root") { true })
     }
 
-    @Test fun phoneDeviceSensitiveSwitchesAreIndependentAndDefaultClosed() {
+    @Test fun phoneDeviceKeepsSensitiveSwitchesIndependentOfDefaultPhoneAccess() {
         val control = PhoneControl(RuntimeEnvironment.getApplication())
-        PhoneDevice.permissions.forEach { assertFalse(control.allowed(it)) }
+        PhoneDevice.permissions.forEach { assertEquals(it == "overlay", control.allowed(it)) }
         control.setAllowed("clipboard", true)
         assertTrue(control.allowed("clipboard"))
         assertFalse(control.allowed("files"))
-        assertFalse(control.enabled())
+        assertTrue(control.enabled())
         control.setEnabled(true)
         control.setEnabled(false)
         assertTrue(control.allowed("clipboard"))
         control.setAllowed("clipboard", false)
         assertFalse(control.allowed("clipboard"))
+    }
+
+    @Test fun phoneControlResumesLegacySettingsWithoutGrantingSystemPermissions() {
+        val context = RuntimeEnvironment.getApplication()
+        context.getSharedPreferences("phone", android.content.Context.MODE_PRIVATE).edit()
+            .putBoolean("enabled", false).putBoolean("overlay", false).apply()
+        val control = PhoneControl(context)
+        assertFalse(control.enabled())
+        assertFalse(control.allowed("overlay"))
+        control.resume()
+        assertTrue(PhoneControl(context).enabled())
+        assertTrue(control.allowed("overlay"))
+        assertFalse(control.status().getBoolean("accessibility"))
+        assertFalse(control.status().getJSONObject("capabilities").getBoolean("overlayPermission"))
+        assertFalse(control.allowed("files"))
+        assertFalse(control.allowed("location"))
+        var dispatched = 0
+        assertEquals("permission_required", assertThrows(PhoneFailure::class.java) {
+            control.device.execute("overlay", JSONObject().put("text", "提示"), {}, { dispatched++ }, {}, { true })
+        }.code)
+        assertEquals(0, dispatched)
+        control.setEnabled(false)
+        assertFalse(control.enabled())
+        control.resume()
+        assertTrue(control.enabled())
     }
 
     @Test fun phoneDeviceRequiresOwnSwitchAndClipboardFocusWithoutAccessibility() {

@@ -8,6 +8,8 @@ import android.widget.Toast
 import android.view.View
 import android.view.ViewTreeObserver
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -34,13 +36,17 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.error
 import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -54,11 +60,10 @@ import com.composables.icons.lucide.Lucide
 import com.composables.icons.lucide.MessageSquare
 import com.composables.icons.lucide.Settings2
 import com.composables.icons.lucide.ChevronRight
-import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.semantics.LiveRegionMode
-import androidx.compose.ui.semantics.liveRegion
-import androidx.compose.ui.semantics.stateDescription
+import com.composables.icons.lucide.Play
 import com.composables.icons.lucide.Square
+import com.composables.icons.lucide.Save
+import com.composables.icons.lucide.RotateCcw
 import com.composables.icons.lucide.Mic
 import com.composables.icons.lucide.Download
 import top.yukonga.miuix.kmp.basic.*
@@ -153,8 +158,11 @@ fun DshScreen(
                         horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         listOf(Triple("工作台", Lucide.House, 0), Triple("聊天", Lucide.MessageSquare, 1), Triple("设置", Lucide.Settings2, 2)).forEach { (label, icon, index) ->
                             val selected = tab == index && !logs
+                            val background by animateColorAsState(
+                                if (selected) MiuixTheme.colorScheme.secondary else Color.Transparent,
+                                animationSpec = tween(160), label = "navigation selection")
                             Row(Modifier.weight(1f).heightIn(min = 48.dp).clip(RoundedCornerShape(8.dp))
-                                .background(if (selected) MiuixTheme.colorScheme.secondary else Color.Transparent)
+                                .background(background)
                                 .selectable(selected, role = Role.Tab, onClick = { tab = index; logs = false })
                                 .padding(horizontal = 8.dp, vertical = 8.dp),
                                 horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally), verticalAlignment = Alignment.CenterVertically) {
@@ -213,8 +221,10 @@ fun DshScreen(
                                 Spacer(Modifier.height(16.dp))
                                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                     Action(if (running) "进入聊天" else if (state.busy) "请稍候…" else "启动 dsh",
-                                        onClick = { if (running) tab = 1 else onStart() }, enabled = !state.busy, primary = true)
-                                    if (active) Action(if (running) "停止服务" else "取消启动", onClick = onStop, enabled = state.phase != "正在停止")
+                                        onClick = { if (running) tab = 1 else onStart() }, enabled = !state.busy, primary = true,
+                                        icon = if (running) Lucide.MessageSquare else Lucide.Play)
+                                    if (active) Action(if (running) "停止服务" else "取消启动", onClick = onStop,
+                                        enabled = state.phase != "正在停止", icon = Lucide.Square, danger = true)
                                 }
                             }
                             Section("开始使用")
@@ -265,14 +275,6 @@ fun DshScreen(
                                     }
                                 }
                             }
-                            Section("运行环境")
-                            Panel {
-                                Info("dsh", bundle.dsh); Divider()
-                                Info("Node.js", bundle.node); Divider()
-                                Info("架构", bundle.abi); Divider()
-                                Info("界面组件", "Miuix 0.8.8")
-                            }
-                            Panel(padding = 0) { LinkRow("运行诊断", "已脱敏", onClick = ::openLogs) }
                         }
                     }
                     Spacer(Modifier.height(4.dp))
@@ -394,52 +396,24 @@ private fun VoiceSettings(voice: VoiceControl, state: VoiceControl.State, action
 
 @Composable
 private fun PhoneSettings(phone: PhoneControl, revision: Int, permission: (String) -> Unit) {
-    var status by remember(revision) { mutableStateOf(phone.status()) }
+    val status = remember(revision) { phone.status() }
     val context = LocalView.current.context
+    val capabilities = status.getJSONObject("capabilities")
     Section("手机操作")
-    Panel {
-        val enabled = status.optBoolean("enabled")
-        val connected = status.optBoolean("accessibility")
-        Text(if (enabled && connected) "设备与屏幕能力已开启" else if (enabled) "设备能力已开启，屏幕操作待授权" else "手机操作已暂停", fontSize = 14.sp, fontWeight = FontWeight.Medium)
-        Spacer(Modifier.height(8.dp))
-        Note("提供设备信息、应用、屏幕操作、文件、交互和感知共 23 项能力，不含虚拟屏幕。屏幕操作需要无障碍服务；下面的敏感能力可分别开启。读取的内容会提供给你配置的模型服务。")
-        Spacer(Modifier.height(12.dp))
-        Action(if (enabled) "暂停手机操作" else "开启手机操作", onClick = {
-            phone.setEnabled(!enabled)
-            status = phone.status()
-        }, modifier = Modifier.fillMaxWidth())
-        Spacer(Modifier.height(8.dp))
-        Action("打开无障碍设置", onClick = {
-            try { context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
-            catch (_: RuntimeException) { Toast.makeText(context, "无法打开系统设置，请手动进入无障碍设置。", Toast.LENGTH_SHORT).show() }
-        }, modifier = Modifier.fillMaxWidth())
-        Spacer(Modifier.height(8.dp))
-        Action("刷新状态", onClick = { status = phone.status() }, modifier = Modifier.fillMaxWidth())
-        Spacer(Modifier.height(8.dp))
-        Note(if (status.optBoolean("screenshotSupported")) "当前系统支持截图；截图需要支持图片的模型。" else "当前使用控件操作，截图需要 Android 11 或更高版本。")
-        Spacer(Modifier.height(12.dp))
-        val capabilities = status.getJSONObject("capabilities")
-        val labels = linkedMapOf("clipboard" to "剪贴板", "files" to "文件访问", "location" to "位置", "sensors" to "传感器", "torch" to "手电筒", "overlay" to "悬浮提示")
-        for ((name, label) in labels) {
-            val allowed = capabilities.optBoolean(name)
-            Action("${if (allowed) "关闭" else "开启"}$label", onClick = {
-                phone.setAllowed(name, !allowed); status = phone.status()
-            }, modifier = Modifier.fillMaxWidth())
-            Spacer(Modifier.height(6.dp))
+    Panel(padding = 0) {
+        SettingsRow("无障碍设置", if (status.optBoolean("accessibility")) "服务已连接，可读取屏幕并执行点击。" else "尚未授权，屏幕操作需要开启 DSHX 无障碍服务。") {
+            Action("打开设置", onClick = {
+                try { context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                catch (_: RuntimeException) { Toast.makeText(context, "无法打开系统设置，请手动进入无障碍设置。", Toast.LENGTH_SHORT).show() }
+            })
         }
-        Note("剪贴板仅在 DSHX 窗口位于前台时读写。文件仅限应用工作区和下方授权目录；关闭文件访问会撤销目录授权。位置、相机、步数和悬浮提示还需要系统允许。")
-        Spacer(Modifier.height(8.dp))
-        Note("系统权限：位置${if (capabilities.optBoolean("locationPermission")) "已允许" else "未允许"} · 相机${if (capabilities.optBoolean("cameraPermission")) "已允许" else "未允许"} · 步数${if (capabilities.optBoolean("stepsPermission")) "已允许" else "未允许"} · 通知${if (capabilities.optBoolean("notificationsPermission")) "已允许" else "未允许"} · 悬浮提示${if (capabilities.optBoolean("overlayPermission")) "已允许" else "未允许"}")
-        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            for ((name, label) in linkedMapOf("location" to "位置权限", "torch" to "相机权限", "steps" to "步数权限", "notifications" to "通知设置", "overlay" to "悬浮提示权限")) {
-                Action(label, onClick = { permission(name) })
-            }
+        Divider()
+        SettingsRow("悬浮提示", if (capabilities.optBoolean("overlayPermission")) "系统已允许，可在其他应用上方显示操作提示。" else "系统尚未授权，需允许显示在其他应用上层。") {
+            Action("打开设置", onClick = { permission("overlay") })
         }
-        Spacer(Modifier.height(8.dp))
-        Note(if (capabilities.optBoolean("directoryReady")) "手机目录已授权${if (capabilities.optBoolean("directoryWritable")) "，可读取与导出" else "，仅可读取"}。" else "尚未授权手机目录；应用工作区仍可在开启文件访问后读取。")
-        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Action("选择手机文件目录", onClick = { permission("directory") }, enabled = capabilities.optBoolean("files"))
-            Action("撤销目录授权", onClick = { permission("revoke"); status = phone.status() }, enabled = capabilities.optBoolean("directoryReady"))
+        Divider()
+        SettingsRow("通知权限", if (capabilities.optBoolean("notificationsPermission")) "已允许，用于后台语音与运行状态提示。" else "尚未允许，后台语音与运行状态通知可能不可见。") {
+            Action("打开设置", onClick = { permission("notifications") })
         }
     }
 }
@@ -543,9 +517,9 @@ private fun AssistantSettings(store: AssistantStore) {
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Action(if (loading) "读取中…" else if (saving) "保存中…" else "保存人设",
                 onClick = { save(AssistantStore.Settings(name.text.toString(), identity.text.toString(), prompt.text.toString()), false) },
-                enabled = !loading && !saving, primary = true)
+                enabled = !loading && !saving, primary = true, icon = Lucide.Save)
             Action("恢复默认", onClick = { save(AssistantStore.Settings(), true) }, enabled = !loading && !saving,
-                modifier = Modifier.semantics { contentDescription = "恢复上游默认设置" })
+                modifier = Modifier.semantics { contentDescription = "恢复上游默认设置" }, icon = Lucide.RotateCcw)
         }
         if (settingsError != null) {
             Spacer(Modifier.height(8.dp))
@@ -567,6 +541,9 @@ private fun AssistantField(label: String, state: TextFieldState, limit: Int, dis
     val invalid = size > limit
     val colors = MiuixTheme.colorScheme
     val shape = RoundedCornerShape(8.dp)
+    val border by animateColorAsState(
+        if (invalid) colors.error else if (focused) colors.primary else colors.outline,
+        animationSpec = tween(160), label = "field focus")
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         Row(Modifier.fillMaxWidth().heightIn(min = 20.dp), horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically) {
@@ -574,13 +551,13 @@ private fun AssistantField(label: String, state: TextFieldState, limit: Int, dis
             if (focused || invalid) Text("$size / $limit", fontSize = 12.sp, color = if (invalid) colors.error else colors.onSurfaceVariantSummary)
         }
         BasicTextField(state = state, enabled = !disabled,
-            textStyle = TextStyle(fontSize = 15.sp, lineHeight = 21.sp, color = if (disabled) colors.onSurfaceVariantSummary else colors.onSurface),
+            textStyle = TextStyle(fontSize = 14.sp, lineHeight = 21.sp, color = if (disabled) colors.onSurfaceVariantSummary else colors.onSurface),
             cursorBrush = SolidColor(colors.primary),
             lineLimits = if (lines == 1) TextFieldLineLimits.SingleLine else TextFieldLineLimits.MultiLine(maxHeightInLines = lines),
             modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).onFocusChanged { focused = it.isFocused }
                 .semantics { contentDescription = label; if (invalid) error("$label 超出长度限制") }
                 .clip(shape).background(if (disabled) colors.secondary else colors.surfaceContainerHigh)
-                .border(if (focused) 2.dp else 1.dp, if (invalid) colors.error else if (focused) colors.primary else colors.outline, shape)
+                .border(if (focused || invalid) 2.dp else 1.dp, border, shape)
                 .padding(12.dp),
             decorator = { inner ->
                 Box(contentAlignment = Alignment.CenterStart) {
@@ -605,11 +582,14 @@ private fun Action(
     primary: Boolean = false, icon: ImageVector? = null, danger: Boolean = false,
 ) {
     val colors = MiuixTheme.colorScheme
-    Button(onClick = onClick, modifier = modifier,
+    var focused by remember { mutableStateOf(false) }
+    Button(onClick = onClick, modifier = modifier.onFocusChanged { focused = it.isFocused }
+        .border(if (focused) 2.dp else 1.dp,
+            if (focused) colors.primary else if (primary) Color.Transparent else colors.outline, RoundedCornerShape(8.dp)),
         enabled = enabled, minHeight = 48.dp, cornerRadius = 8.dp,
         insideMargin = PaddingValues(horizontal = 16.dp, vertical = 10.dp),
-        colors = if (primary) ButtonDefaults.buttonColorsPrimary() else if (!danger) ButtonDefaults.buttonColors() else ButtonDefaults.buttonColors(
-            color = colors.error.copy(alpha = 0.08f),
+        colors = if (primary) ButtonDefaults.buttonColorsPrimary() else ButtonDefaults.buttonColors(
+            color = if (danger) colors.error.copy(alpha = 0.08f) else colors.surfaceContainerHigh,
             disabledColor = colors.secondary,
             contentColor = if (danger) colors.error else colors.onSurface,
             disabledContentColor = colors.onSurfaceVariantSummary)) {

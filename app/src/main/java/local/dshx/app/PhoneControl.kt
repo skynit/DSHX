@@ -25,9 +25,15 @@ class PhoneControl(context: Context) {
 
     fun finish(session: String) { main.post { window.finish(session) } }
 
-    fun enabled(): Boolean = settings.getBoolean("enabled", false)
+    fun enabled(): Boolean = settings.getBoolean("enabled", true)
 
-    /** 由设置页在主线程调用；关闭同时撤销所有实例的排队请求和观测。 */
+    /** 回到应用时恢复默认允许；小窗中的停止仍会立即取消操作，系统授权另行检查。 */
+    fun resume() {
+        setEnabled(true)
+        setAllowed("overlay", true)
+    }
+
+    /** 在主线程调用；关闭同时撤销所有实例的排队请求和观测。 */
     fun setEnabled(value: Boolean) {
         check(Looper.myLooper() == Looper.getMainLooper()) { "手机开关必须在主线程修改" }
         settings.edit().putBoolean("enabled", value).apply()
