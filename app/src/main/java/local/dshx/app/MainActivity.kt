@@ -45,6 +45,7 @@ class MainActivity : ComponentActivity() {
         else if (!allowed) Toast.makeText(this, "麦克风未授权，仍可使用文字聊天。", Toast.LENGTH_LONG).show()
     }
     private val assistantStore by lazy { AssistantStore(filesDir) }
+    private val memoryStore by lazy { MemoryStore(filesDir) }
     private var browser: WebView? = null
     private var browserInstance: String? = null
     private var pageError by mutableStateOf<String?>(null)
@@ -53,6 +54,64 @@ class MainActivity : ComponentActivity() {
     private var fileInstance: String? = null
     private var fileMultiple = false
     private var filePending = false
+    private var backupPicking by mutableStateOf(false)
+    private val backupPicker = registerForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
+        backupPicking = false
+        if (uri != null) {
+            val resolver = applicationContext.contentResolver
+            engine.backup(
+                open = { resolver.openOutputStream(uri, "wt") ?: error("无法写入所选备份文件") },
+                cleanup = { android.provider.DocumentsContract.deleteDocument(resolver, uri); Unit },
+            )
+        }
+    }
+    private val restorePicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        backupPicking = false
+        if (uri != null) {
+            val resolver = applicationContext.contentResolver
+            engine.restore { resolver.openInputStream(uri) ?: error("无法读取所选备份文件") }
+        }
+    }
+    private var knowledgePicking by mutableStateOf(false)
+    private var knowledgePick: String? = null
+    private val knowledgePicker = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        knowledgePicking = false
+        val pending = knowledgePick?.let(::JSONObject)
+        knowledgePick = null
+        if (pending != null && uris.isNotEmpty()) {
+            val resolver = applicationContext.contentResolver
+            val action = pending.getString("action")
+            if (action == "update" && uris.size != 1) {
+                Toast.makeText(this, "替换正文时只能选择一个文件。", Toast.LENGTH_LONG).show()
+            } else {
+                // 名称查询和读取也在后台；提供方返回的显示名从不作为本机路径使用。
+                val inputs = uris.map { uri -> KnowledgeStore.Input("", { resolver.openInputStream(uri) ?: error("无法读取所选知识文件。") }) }
+                kotlin.concurrent.thread(name = "dsh-knowledge-selection", isDaemon = true) {
+                    val named = inputs.mapIndexed { index, input ->
+                        val title = runCatching {
+                            resolver.query(uris[index], arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                                if (cursor.moveToFirst()) cursor.getString(0) else null
+                            }
+                        }.getOrNull() ?: if (action == "restore") "知识归档.gz" else "资料.txt"
+                        input.copy(title = title)
+                    }
+                    if (!engine.knowledgeFiles(action, pending.getJSONObject("data"), named))
+                        runOnUiThread { Toast.makeText(this, "已有知识文件正在处理，请稍后重试。", Toast.LENGTH_LONG).show() }
+                }
+            }
+        }
+    }
+    private val knowledgeExport = registerForActivityResult(ActivityResultContracts.CreateDocument("application/gzip")) { uri ->
+        knowledgePicking = false
+        val pending = knowledgePick?.let(::JSONObject)
+        knowledgePick = null
+        if (uri != null && pending != null) {
+            val resolver = applicationContext.contentResolver
+            engine.knowledgeFiles("export", pending.getJSONObject("data"),
+                output = { resolver.openOutputStream(uri, "wt") ?: error("无法保存知识归档。") },
+                cleanup = { android.provider.DocumentsContract.deleteDocument(resolver, uri); Unit })
+        }
+    }
     private val phonePermissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { phoneRevision++ }
     private val phoneDirectory = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         val data = result.data
@@ -82,6 +141,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        backupPicking = savedInstanceState?.getBoolean("backupPicking") ?: false
+        knowledgePicking = savedInstanceState?.getBoolean("knowledgePicking") ?: false
+        knowledgePick = savedInstanceState?.getString("knowledgePick")
         val preferences = getSharedPreferences("appearance", MODE_PRIVATE)
         val info = assets.open("core-info.json").bufferedReader().use { JSONObject(it.readText()) }
         val bundle = BundleInfo(info.getString("dsh"), info.getString("node"), info.getString("abi"), info.getLong("unpackedSize"))
@@ -117,12 +179,57 @@ class MainActivity : ComponentActivity() {
                 diagnostics = engine::diagnostics, pageError = pageError,
                 onReload = { pageError = null; browser?.reload() },
                 assistantStore = assistantStore,
+                memoryStore = memoryStore, onMemory = engine::memory,
+                knowledgeStore = engine.knowledgeStore, onKnowledge = engine::knowledge,
+                knowledgePicking = knowledgePicking, onKnowledgeFile = ::knowledgeFile,
+                backupPicking = backupPicking, onBackup = ::backupAction,
                 phone = engine.phone, phoneRevision = phoneRevision,
                 voice = voice, voiceState = voiceState, onVoice = ::voiceAction,
                 onPhonePermission = ::phonePermission,
                 chat = { modifier -> state.url?.let { instance -> AndroidView(modifier = modifier, factory = { webView(instance) }) } }
             )
         }
+    }
+
+    private fun knowledgeFile(action: String, data: JSONObject) {
+        if (knowledgePicking || engine.state.knowledgeFiles.busy) return
+        if (engine.state.url == null) {
+            Toast.makeText(this, "请先启动 dsh，再管理知识文件。", Toast.LENGTH_LONG).show()
+            return
+        }
+        knowledgePick = JSONObject().put("action", action).put("data", data).toString()
+        knowledgePicking = true
+        try {
+            if (action == "export") knowledgeExport.launch("DSHX-knowledge-${System.currentTimeMillis()}.json.gz")
+            else knowledgePicker.launch(if (action == "restore") arrayOf("application/gzip", "application/x-gzip", "application/octet-stream")
+                else arrayOf("text/plain", "text/markdown", "text/x-markdown", "application/octet-stream"))
+        } catch (_: RuntimeException) {
+            knowledgePicking = false
+            knowledgePick = null
+            Toast.makeText(this, "无法打开系统文件选择器，请重试。", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun backupAction(restore: Boolean) {
+        if (backupPicking || engine.active || engine.state.busy) return
+        backupPicking = true
+        try {
+            if (restore) restorePicker.launch(arrayOf("application/zip", "application/x-zip-compressed", "application/octet-stream"))
+            else {
+                val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.ROOT).format(java.util.Date())
+                backupPicker.launch("DSHX-sessions-$stamp.zip")
+            }
+        } catch (_: RuntimeException) {
+            backupPicking = false
+            Toast.makeText(this, "无法打开系统文件选择器，请重试。", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBoolean("backupPicking", backupPicking)
+        outState.putBoolean("knowledgePicking", knowledgePicking)
+        outState.putString("knowledgePick", knowledgePick)
+        super.onSaveInstanceState(outState)
     }
 
     private fun voiceAction(action: String) {

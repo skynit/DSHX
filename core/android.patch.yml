@@ -4,6 +4,12 @@
   disabled: true
 - id: product-analytics
   disabled: true
+- id: session-persistence-jsonl
+  config:
+    root: !!js dshHomePath('storages', 'sessions')
+- id: attachment-local
+  config:
+    dshHome: !!js dshHomePath('storages')
 - id: fs-sandbox
   disabled: true
 - id: sandbox-policy
@@ -32,3 +38,7 @@
       name: 'file:@CORE@/phone.mjs'
     - id: dshx-android-voice
       name: 'file:@CORE@/voice.mjs'
+    - id: dshx-android-memory
+      name: 'file:@CORE@/memory.mjs'
+    - id: dshx-android-knowledge
+      name: 'file:@CORE@/knowledge.mjs'

@@ -126,6 +126,14 @@ def build(abi):
             file.write_text(old.replace(before, after))
             patches.append({"path": path, "before": initial, "after": digest(file)})
 
+        # Keep the single-document format and its strict validation; only route
+        # our owned domains into their own directories beside their files.
+        patch("@deepseek-ai/dsh-storage-json/lib/index.js",
+              '\tconst path = join(root, `${descriptor.name}.json`);',
+              '\tconst nested = ["memory", "knowledge"].includes(descriptor.name);\n'
+              '\tconst path = nested ? join(root, descriptor.name, "state.json") : join(root, `${descriptor.name}.json`);\n'
+              '\tif (nested) await mkdir(dirname(path), { recursive: true, mode: 448 });')
+
         patch("@deepseek-ai/dsh-sdk-app/cordis.patch.yml",
               '      disabled: !!js "!(process.env.DSH_PRIMARY_RUNTIME ?? process.env.DSH_BUNDLED_PRIMARY_RUNTIME) && !process.env.DSH_BUNDLED_OFFICE_CLI"',
               "      disabled: true")
@@ -354,7 +362,7 @@ def build(abi):
         patch('@deepseek-ai/dsh-llm-pi-ai/lib/index.js',
               '\t\t\tyield {\n\t\t\t\ttype: "usage",\n\t\t\t\tusage: mapUsage(event.error.usage)\n\t\t\t};',
               '\t\t\tif (providerUsage() !== void 0) yield {\n\t\t\t\ttype: "usage",\n\t\t\t\tusage: providerUsage()\n\t\t\t};')
-        for filename in ("start.mjs", "plugins.mjs", "assistant.mjs", "compat.mjs", "guard.mjs", "policy.mjs", "files.mjs", "host.mjs", "phone.mjs", "voice.mjs", "recover.mjs", "android.patch.yml"):
+        for filename in ("start.mjs", "plugins.mjs", "assistant.mjs", "compat.mjs", "guard.mjs", "policy.mjs", "files.mjs", "host.mjs", "phone.mjs", "voice.mjs", "memory.mjs", "memory-store.mjs", "memory-extract.mjs", "read-budget.mjs", "knowledge.mjs", "knowledge-store.mjs", "knowledge-search.mjs", "knowledge-model.mjs", "local-route.mjs", "local-routes.json", "recover.mjs", "android.patch.yml"):
             shutil.copy2(SOURCE / filename, bundle / filename)
         ndk = Path(os.environ.get("ANDROID_NDK_HOME", "/home/skynit/Android/Sdk/ndk/28.2.13676358"))
         compiler = ndk / "toolchains/llvm/prebuilt/linux-x86_64/bin" / (

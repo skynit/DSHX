@@ -3,16 +3,77 @@ import { localUsage } from './assistant.mjs';
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
+import { localRouter } from './local-route.mjs';
 
 export const name = 'dshx-android-voice';
 export const inject = ['sessionController', 'agents', 'llm'];
 const route = { provider: 'dshx-local', model: 'qwen3-0.6b' };
 
-// This is deliberately conservative: local text generation cannot execute tools or obtain live facts.
-export function localQuestion(text) {
-  if ([...text].length > 160 || /打开|关闭|点击|搜索|查询|今天|现在|天气|新闻|文件|屏幕|应用|定位|下载|安装|代码|执行|提醒|记住|上次|刚才/.test(text)) return false;
-  return /^本地回答[：:，,\s]/.test(text) || /^(你好|您好|嗨|早上好|晚上好|谢谢|再见|你是谁|你叫什么|介绍一下自己)[。！!？?\s]*$/.test(text)
-    || [...text].length <= 80 && /^(什么是|解释一下|简单解释)/.test(text);
+function localTask(text) {
+  // Capability exclusions are independent of similarity: an explicit prefix
+  // does not give the local text generator live facts or tool access.
+  if ([...text].length > 160 || /打开|关闭|点击|搜索|查询|今天|现在|天气|新闻|文件|屏幕|应用|定位|下载|安装|代码|执行|提醒|记住|上次|\b(open|close|click|search|weather|news|file|install|execute|remember)\b/i.test(text)) return null;
+  return localRouter.match(text.replace(/^本地回答[：:，,\s]+/, '')).route;
+}
+
+export function localQuestion(text) { return localTask(text) !== null; }
+
+function needsHistory(text) {
+  return localTask(text) === 'followup' || /这个|那个|它|上文|上面|前面|上一条|上一轮|继续|刚才|第[一二三四五六七八九十\d]+点|\b(it|that|previous|above)\b/i.test(text);
+}
+
+function isMemory(message) {
+  return message.role === 'user' && message.source?.kind === 'plugin:dshx-memory';
+}
+
+// dsh owns the durable history. This is a detached, task-sized view, never a
+// second conversation store. Keep complete turns rather than cutting text.
+export function localInput(messages, needsHistory = false) {
+  const turns = [];
+  const memory = [];
+  let summary;
+  let instructions = [];
+  for (const message of messages) {
+    const text = message.content.filter(part => part.type === 'text').map(part => part.text).join('\n');
+    const kind = message.source?.kind;
+    if (message.role === 'user' && kind === 'compact-checkpoint') {
+      summary = { role: 'context', kind: 'summary', text };
+    } else if (message.role === 'user' && kind === 'agent-instructions') {
+      if (message.source.baseline) instructions = [];
+      instructions.push({ role: 'context', kind: 'instructions', text });
+    } else if (isMemory(message)) {
+      if (message.content.some(part => part.type !== 'text')) return null;
+      // Updates and invalidation notices must follow older recalls in order.
+      memory.push({ role: 'context', kind: 'memory', text });
+    } else if (message.role === 'user' && (!kind || kind === 'user')) {
+      turns.push([{ role: 'user', text, rich: message.content.some(part => part.type !== 'text') }]);
+    } else if (message.role === 'assistant' && (!kind || kind === 'model') && text && turns.length) {
+      turns.at(-1).push({ role: 'assistant', text, rich: message.content.some(part => part.type === 'tool-call') });
+    } else if (message.role === 'assistant' && message.content.some(part => part.type === 'tool-call') && turns.length) {
+      // A tool-dependent turn cannot become a complete text answer by dropping its calls/results.
+      turns.at(-1)[0].rich = true;
+    }
+  }
+  if (!turns.length || turns.at(-1).length !== 1 || !turns.at(-1)[0].text || turns.at(-1)[0].rich) return null;
+  const context = [...summary ? [summary] : [], ...instructions, ...memory].filter(message => message.text);
+  if (context.length > 8) return null;
+  let remaining = 1800 - context.reduce((sum, message) => sum + [...message.text].length, 0);
+  const selected = [];
+  let count = 0;
+  for (let index = turns.length - 1; index >= 0; index--) {
+    const turn = turns[index];
+    const size = turn.reduce((sum, message) => sum + [...message.text].length, 0);
+    const required = index === turns.length - 1 || needsHistory && index === turns.length - 2;
+    const incomplete = index < turns.length - 1 && !turn.some(message => message.role === 'assistant');
+    if (incomplete || turn.some(message => message.rich) || count + turn.length > 8 || size > remaining) {
+      if (required) return null;
+      break;
+    }
+    selected.unshift(...turn.map(({ role, text }) => ({ role, text })));
+    remaining -= size; count += turn.length;
+  }
+  if (needsHistory && (turns.length < 2 || !turns.at(-2).some(message => message.role === 'assistant'))) return null;
+  return [...context, ...selected];
 }
 
 export function localAdapter(Base, host = policyHost) {
@@ -30,10 +91,18 @@ export function localAdapter(Base, host = policyHost) {
       let usage;
       localUsage({ event: 'start', id, sessionId: options.sessionId ?? null, ...route, at: started });
       try {
-        const messages = options.messages.filter(message => ['user', 'assistant'].includes(message.role))
-          .filter(message => !message.source || message.source.kind === 'user')
-          .map(message => ({ role: message.role, text: [...message.content.filter(part => part.type === 'text').map(part => part.text).join('\n')].slice(0, 600).join('') }))
-          .filter(message => message.text).slice(-8);
+        const latest = options.messages.findLast(message => message.role === 'user' && (!message.source?.kind || message.source.kind === 'user'));
+        const task = latest?.content.filter(part => part.type === 'text').map(part => part.text).join('\n') ?? '';
+        const messages = localInput(options.messages, needsHistory(task));
+        if (!messages) {
+          const memory = options.messages.some(isMemory);
+          yield { type: 'finish', reason: { kind: 'error', failure: {
+            code: memory ? 'LOCAL_MEMORY_CONTEXT' : 'LOCAL_CONTEXT',
+            message: memory ? '当前任务所需的记忆背景与上下文无法完整交给本地模型，不会自动转用云端模型。'
+              : '当前任务所需的上下文无法完整交给本地模型。',
+          } } };
+          return;
+        }
         const result = await host.query('local-model', { session: options.sessionId, messages }, options.signal);
         options.signal?.throwIfAborted();
         if (typeof result.text !== 'string' || !result.text.trim() ||
@@ -84,6 +153,13 @@ export function voiceSession(ctx) {
       if (run.cancelled) { agent.cancel({ kind: 'user' }, { keepInbox: true }); return; }
       // Claim happens before prompt assembly; user/message is persisted only after model preparation.
       if (run.local) {
+        const task = localTask(run.input);
+        const history = agent.session?.deriveMessages?.() ?? [];
+        // Keep memory-bearing requests local so the adapter can report an
+        // incomplete input instead of silently routing it to the original model.
+        run.local = task !== null && (history.some(isMemory) || localInput([...history, message], needsHistory(run.input)) !== null);
+      }
+      if (run.local) {
         run.selection = ctx.sessionController.agents.selectionFor(agent);
         run.previous = run.selection.current;
         // Keep the original route pending in durable history. A local request header
@@ -126,6 +202,7 @@ export function voiceSession(ctx) {
     if (run.entered && entry.type === 'turn/end' && entry.data.turn === run.turn) {
       run.finished = true; restore(run);
       if (entry.data.reason?.kind !== 'completed') {
+        if (run.contextFailure) return run.reject(Object.assign(new Error(run.contextFailure.message), { code: run.contextFailure.code }));
         const memory = entry.data.reason?.error?.message === '当前可用内存不足，本地模型暂不加载。请关闭其他占用内存的应用后重试。';
         return run.reject(Object.assign(new Error('本轮已停止或失败，不再自动播报。'), memory ? { code: 'VOICE_MEMORY' } : {}));
       }
@@ -133,6 +210,31 @@ export function voiceSession(ctx) {
       const local = typeof session.requestHeader === 'function' ? session.requestHeader()?.config.provider === route.provider : run.local;
       run.resolve({ session: session.id, text: [...run.text].slice(0, 4000).join(''), local });
     }
+  });
+  // Scoped instructions can enter after inbox claim. Recheck at the adapter
+  // boundary, and retry that same logged user message once on its original model.
+  const retry = ctx.on('agent/request-error', ({ agent, provider, failure, signal }, next) => {
+    const run = active;
+    if (failure.code === 'LOCAL_MEMORY_CONTEXT' && provider === route.provider && run?.agent === agent) {
+      run.contextFailure = failure;
+      return next();
+    }
+    if (failure.code !== 'LOCAL_CONTEXT' || provider !== route.provider || signal.aborted || !run?.local ||
+        run.cancelled || run.changed || run.agent !== agent || !run.previous || run.previous.provider === route.provider) return next();
+    run.local = false;
+    restore(run);
+    run.recording = true;
+    try { ctx.sessionController.agents.selectForNextRequest(agent, run.previous); }
+    finally { run.recording = false; }
+    // Model selection is snapshotted at prompt assembly. A same-step retry
+    // needs a request override outside that snapshot, scoped to this run only.
+    run.retry = agent.ctx.on('agent/request', async (_payload, next) => {
+      const config = await next();
+      if (run.cancelled || run.changed || active !== run) return config;
+      const { reasoningEffort: _effort, ...rest } = config;
+      return { ...rest, ...run.previous };
+    }, { prepend: true });
+    return { kind: 'retry' };
   });
   return {
     async call(action, data) {
@@ -144,7 +246,7 @@ export function voiceSession(ctx) {
       let resolve, reject;
       const reply = new Promise((yes, no) => { resolve = yes; reject = no; });
       reply.catch(() => {});
-      const run = { request: randomUUID(), interaction: data.interaction, session: data.session, resolve, reject, local: data.local === true && localQuestion(data.text.trim()), entered: false, cancelled: false, text: '' };
+      const run = { request: randomUUID(), interaction: data.interaction, session: data.session, resolve, reject, input: data.text.trim(), local: data.local === true && localQuestion(data.text.trim()), entered: false, cancelled: false, text: '' };
       active = run;
       const timer = setTimeout(() => cancel(run.interaction), 170000);
       try {
@@ -160,11 +262,11 @@ export function voiceSession(ctx) {
         if (run.cancelled) { removePending(run); throw new Error('语音对话已取消。'); }
         return await reply;
       } finally {
-        clearTimeout(timer); restore(run);
+        clearTimeout(timer); run.retry?.(); restore(run);
         if (active === run) active = undefined;
       }
     },
-    close() { cancel(); event(); claimed(); },
+    close() { cancel(); retry(); event(); claimed(); },
   };
 }
 

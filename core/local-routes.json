@@ -1,0 +1,36 @@
+{
+  "routes": [
+    { "name": "greeting", "examples": ["你好", "您好", "你好呀", "嗨", "早上好", "晚上好", "谢谢", "再见", "Hello", "Hi", "Thank you", "Good morning"] },
+    { "name": "identity", "examples": ["你是谁", "你叫什么", "你的名字是什么", "介绍一下自己", "你是什么助手", "Who are you", "What is your name"] },
+    { "name": "explanation", "examples": ["什么是光合作用", "什么是彩虹", "什么是蒸发", "解释一下重力", "解释一下惯性", "简单解释为什么天空是蓝色的", "简单解释月食", "What is gravity", "Explain photosynthesis"] },
+    { "name": "followup", "examples": ["把你的第二点展开说说", "再解释一下第二点", "给上面的解释举个例子", "把上一条回答说得简单一点", "请继续解释刚才的概念", "Explain your second point", "Give an example of your last answer"] }
+  ],
+  "calibration": [
+    { "text": "你好啊", "route": "greeting" },
+    { "text": "您好！", "route": "greeting" },
+    { "text": "晚上好呀", "route": "greeting" },
+    { "text": "Thanks", "route": "greeting" },
+    { "text": "请问你叫什么名字", "route": "identity" },
+    { "text": "你的名字叫什么", "route": "identity" },
+    { "text": "能介绍一下你自己吗", "route": "identity" },
+    { "text": "什么是水循环", "route": "explanation" },
+    { "text": "解释一下浮力", "route": "explanation" },
+    { "text": "简单解释日食", "route": "explanation" },
+    { "text": "请把你的第二点展开说说", "route": "followup" },
+    { "text": "再给上一条解释举个例子", "route": "followup" },
+    { "text": "把你上面的回答说得简单一点", "route": "followup" },
+    { "text": "你好，帮我规划一个完整的系统", "route": null },
+    { "text": "帮我设计一个分布式数据库", "route": null },
+    { "text": "给我写一份周末旅行计划", "route": null },
+    { "text": "证明这个数学定理", "route": null },
+    { "text": "分析下面的长篇报告", "route": null },
+    { "text": "解释一下相对论并推导完整公式", "route": null },
+    { "text": "解释一下如何设计一套数据库系统", "route": null },
+    { "text": "打开手机上的应用", "route": null },
+    { "text": "搜索文件并修改代码", "route": null },
+    { "text": "今天的天气是什么", "route": null },
+    { "text": "你还记得上周我的名字吗", "route": null },
+    { "text": "第二个应用的名字是什么，打开它", "route": null },
+    { "text": "随机内容 xyz987", "route": null }
+  ]
+}

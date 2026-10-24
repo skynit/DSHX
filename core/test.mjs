@@ -2907,6 +2907,70 @@ for (const scenario of ['direct', 'later allow listener', 'removed plugin guard'
   });
 }
 
+test('voice local routing calibrates examples and leaves unknown requests unmatched', async () => {
+  const { localQuestion } = await import(pathToFileURL(join(core, 'voice.mjs')));
+  const { createRouter } = await import(pathToFileURL(join(core, 'local-route.mjs')));
+  const router = createRouter({
+    routes: [{ name: 'greeting', examples: ['你好', '您好', '晚上好'] }],
+    calibration: [{ text: '你好呀', route: 'greeting' }, { text: '你好，帮我设计一整套系统', route: null }],
+  });
+  assert.equal(router.match('你好').route, 'greeting');
+  assert.equal(router.match('你好，帮我设计一整套系统').route, null);
+  assert.equal(router.match('量子力学证明题').route, null);
+  assert.ok(router.match('你好').threshold > 0, 'thresholds come from labelled calibration examples');
+  assert.throws(() => createRouter({ routes: [{ name: 'empty', examples: ['你好'] }], calibration: [] }), /校准/);
+  const tied = createRouter({
+    routes: [{ name: 'one', examples: ['你好'] }, { name: 'two', examples: ['你好'] }],
+    calibration: [{ text: '你好呀', route: 'one' }, { text: '你好啊', route: 'two' }, { text: '未知', route: null }],
+  });
+  assert.equal(tied.match('你好').route, null, 'nearly tied categories must remain unmatched');
+  const unsupported = createRouter({ routes: [{ name: 'one', examples: ['你好'] }],
+    calibration: [{ text: '未知', route: 'one' }, { text: '再见', route: null }] });
+  assert.equal(unsupported.match('你好').route, null, 'disable a route with no positive calibration support');
+  for (const text of ['你好', '您好！', '你叫什么', '什么是光合作用', '本地回答：把你的第二点展开说说']) {
+    assert.equal(localQuestion(text), true, text);
+  }
+  for (const text of ['今天的天气', '本地回答：今天的天气', '打开微信', 'Open WeChat', '帮我设计一个分布式数据库',
+    '你好，帮我规划一个完整的系统', '本地回答：删除目录', '随机内容 xyz987', '什么是光合作用，并搜索最新论文']) {
+    assert.equal(localQuestion(text), false, text);
+  }
+});
+
+test('voice local input keeps model replies checkpoints and instructions without rewriting the session', async () => {
+  const { localInput } = await import(pathToFileURL(join(core, 'voice.mjs')));
+  const { createUserMessage, createAssistantMessage } = await load('@deepseek-ai/dsh-llm');
+  const user = text => createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } });
+  const reply = createAssistantMessage({ content: [{ type: 'text', text: '第二点是节省流量。' },
+    { type: 'reasoning', text: 'private reasoning' }], source: { provider: 'fixture', model: 'remote' } });
+  const summary = { ...user('校验词 KEEP_1023，任务是解释本地模型。'), source: { kind: 'compact-checkpoint' } };
+  const instructions = { ...user('回答简洁，使用中文。'), source: { kind: 'agent-instructions', baseline: true } };
+  const messages = [summary, instructions, user('解释一下本地模型'), reply, user('把你的第二点展开说说')];
+  const before = JSON.stringify(messages);
+  const input = localInput(messages, true);
+  assert.ok(input.some(message => message.role === 'assistant' && message.text === '第二点是节省流量。'));
+  assert.ok(input.some(message => message.role === 'context' && message.kind === 'summary' && message.text.includes('KEEP_1023')));
+  assert.ok(input.some(message => message.role === 'context' && message.kind === 'instructions'));
+  assert.equal(input.at(-1).text, '把你的第二点展开说说');
+  assert.doesNotMatch(JSON.stringify(input), /private reasoning/);
+  assert.equal(JSON.stringify(messages), before);
+  assert.equal(localInput([user('把你的第二点展开说说')], true), null, 'a dependent task needs the previous complete turn');
+  assert.deepEqual(localInput([user('没有回答的问题'), user('你好')]), [{ role: 'user', text: '你好' }]);
+  assert.equal(localInput([user('问题'), { ...reply, content: [{ type: 'text', text: '🙂'.repeat(1800) }] },
+    user('把你的第二点展开说说')], true), null, 'do not cut away the referenced answer');
+  assert.equal(localInput([user('x'.repeat(1801))]), null, 'the current task cannot be silently truncated');
+  assert.equal(localInput([{ role: 'user', source: { kind: 'runtime-context' }, content: [{ type: 'text', text: 'hidden' }] }]), null);
+  assert.equal(localInput([user('问题'), reply]), null, 'the final conversational message must be a user task');
+  const toolReply = { ...reply, content: [...reply.content, { type: 'tool-call', id: 'call', name: 'search', arguments: {} }] };
+  assert.equal(localInput([user('问题'), toolReply, user('把你的第二点展开说说')], true), null,
+    'a tool-dependent answer is not a complete text-only turn');
+  assert.equal(localInput([user('图片'), { ...user('你好'), content: [{ type: 'text', text: '你好' }, { type: 'image' }] }]), null);
+  const latest = { ...instructions, content: [{ type: 'text', text: '新的基准要求' }] };
+  const increment = { ...instructions, source: { kind: 'agent-instructions', baseline: false },
+    content: [{ type: 'text', text: '补充要求' }] };
+  assert.deepEqual(localInput([instructions, latest, increment, user('你好')]).filter(m => m.role === 'context').map(m => m.text),
+    ['新的基准要求', '补充要求']);
+});
+
 test('voice local routing uses the real loop history restores selection and separates accounting', async () => {
   const { Context } = await load('@deepseek-ai/cordis');
   const { default: SystemPrompt } = await load('@deepseek-ai/dsh-system-prompt');
@@ -2927,11 +2991,17 @@ test('voice local routing uses the real loop history restores selection and sepa
   let voice, disposeSelection;
   let remote = 0;
   let local = 0;
+  let remoteText = '远程任务回答';
+  let remoteInput;
   const events = [];
   const original = { provider: 'fixture', model: 'remote' };
   const selection = { current: original };
   class Remote extends LlmAdapter {
-    async *stream() { remote++; yield { type: 'text-delta', index: 0, text: '远程任务回答' }; yield { type: 'finish', reason: { kind: 'stop' } }; }
+    async *stream(options) {
+      remote++; remoteInput = options.messages;
+      yield { type: 'text-delta', index: 0, text: remoteText };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    }
   }
   try {
     for (const plugin of [SystemPrompt, Tools, LlmRuntime, Agents, Sessions, Projections]) await ctx.plugin(plugin);
@@ -2941,8 +3011,9 @@ test('voice local routing uses the real loop history restores selection and sepa
     ctx.llm.registerAdapter(['dshx-local'], localAdapter(LlmAdapter, { query: async (method, data) => {
       local++; assert.equal(method, 'local-model');
       assert.equal(data.session, 'voice-session');
-      assert.equal(data.messages.at(-1).text, '你好');
+      assert.equal(data.messages.at(-1).text, local === 1 ? '你好' : '本地回答：把你的第二点展开说说');
       assert.ok(data.messages.every(message => ['user', 'assistant'].includes(message.role)));
+      if (local === 2) assert.ok(data.messages.some(message => message.role === 'assistant' && message.text === '你好，我是小橙。'));
       selection.current = undefined; // Controller consumes a selection after its durable header.
       return { text: '你好，我是小橙。', inputTokens: 17, outputTokens: 8 };
     } }));
@@ -2966,12 +3037,17 @@ test('voice local routing uses the real loop history restores selection and sepa
     assert.equal(localQuestion('本地回答：今天的天气'), false);
     assert.equal(localQuestion('搜索文件'), false);
     assert.equal(localQuestion('什么是光合作用'), true);
+    const missing = await voice.call('prompt', { interaction: 'missing-history', session: agent.session.id,
+      text: '把你的第二点展开说说', local: true });
+    await agent.whenIdle();
+    assert.equal(missing.local, false);
+    assert.equal(local, 0); assert.equal(remote, 1);
     const result = await voice.call('prompt', { interaction: 'first', text: '你好', local: true });
     await agent.whenIdle();
     assert.equal(result.text, '你好，我是小橙。');
     assert.equal(result.session, agent.session.id);
     assert.equal(result.local, true);
-    assert.equal(local, 1); assert.equal(remote, 0);
+    assert.equal(local, 1); assert.equal(remote, 1);
     assert.equal(selection.current, original, 'restore even after the API consumed our temporary selection');
     assert.ok(events.some(event => event.type === 'model/selection' && event.data.provider === original.provider),
       'persist the original route before a local header can become the resumed session default');
@@ -2985,17 +3061,54 @@ test('voice local routing uses the real loop history restores selection and sepa
       assert.deepEqual(replay.sessionProjections.snapshot(agent.session, ['modelSelection']).values.modelSelection.next, original);
     } finally { await replay.fiber.dispose(); }
     assert.ok(events.some(event => event.type === 'user/message' && event.data.source.rpcId));
+    await voice.call('prompt', { interaction: 'followup', session: agent.session.id, text: '本地回答：把你的第二点展开说说', local: true });
+    await agent.whenIdle();
+    assert.equal(local, 2);
+    remoteText = '完整回答'.repeat(500);
     const followup = await voice.call('prompt', { interaction: 'second', session: agent.session.id, text: '搜索文件', local: true });
     await agent.whenIdle();
-    assert.equal(followup.local, false); assert.equal(remote, 1);
+    assert.equal(followup.local, false); assert.equal(remote, 2);
     assert.equal(agent.session.requestHeader().config.provider, 'fixture');
     const ledger = (await readFile(join(dir, 'local-usage.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
-    assert.deepEqual(ledger.map(row => row.event), ['start', 'finish']);
+    assert.deepEqual(ledger.map(row => row.event), ['start', 'finish', 'start', 'finish']);
     assert.deepEqual(ledger[1].usage, { inputTokens: 17, outputTokens: 8 });
     assert.equal(ledger[1].outcome, 'success');
     const cloudLedger = await readFile(join(dir, 'usage.jsonl'), 'utf8');
     assert.doesNotMatch(cloudLedger, /dshx-local/);
     assert.doesNotMatch(JSON.stringify(ledger), /你好|搜索文件|小橙/);
+    const tooLong = await voice.call('prompt', { interaction: 'long-history', session: agent.session.id,
+      text: '把你的第二点展开说说', local: true });
+    await agent.whenIdle();
+    assert.equal(tooLong.local, false);
+    assert.equal(local, 2); assert.equal(remote, 3, 'do not truncate the required previous answer');
+    let inject = true;
+    const stopInject = ctx.on('agent/request', ({ agent }, next) => {
+      if (inject) {
+        inject = false;
+        agent.session.append('user/message', createUserMessage({ content: [{ type: 'text', text: '长指令'.repeat(700) }],
+          source: { kind: 'agent-instructions', baseline: true } }), { surfaceOp: 'append' });
+      }
+      return next();
+    });
+    const start = events.length;
+    remoteText = '原模型承接同一轮输入。';
+    try {
+      const overflow = await voice.call('prompt', { interaction: 'late-context', session: agent.session.id, text: '你好', local: true });
+      await agent.whenIdle();
+      assert.equal(overflow.local, false);
+      assert.equal(overflow.text, remoteText);
+      assert.equal(local, 2, 'reject oversized final context before invoking native inference');
+      assert.equal(remote, 4, 'retry exactly once on the original model');
+      assert.equal(selection.current, original);
+      assert.ok(remoteInput.some(message => message.source?.kind === 'agent-instructions' &&
+        message.content.some(part => part.type === 'text' && part.text === '长指令'.repeat(700))),
+      'the original model receives the complete instruction that could not fit locally');
+      assert.equal(events.slice(start).filter(e => e.type === 'user/message' && e.data.source?.kind === 'user').length, 1,
+        'a fallback must not enqueue or persist the same user message twice');
+      const attempts = (await readFile(join(dir, 'local-usage.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+      assert.equal(attempts.at(-1).outcome, 'failed');
+      assert.equal(attempts.at(-1).usage, null);
+    } finally { stopInject(); }
   } finally {
     voice?.close(); disposeSelection?.(); await ctx.fiber.dispose();
     if (previous === undefined) delete process.env.DSHX_ASSISTANT_DIR; else process.env.DSHX_ASSISTANT_DIR = previous;
@@ -3044,6 +3157,7 @@ test('voice temporary model selection respects user switches and rejects unsucce
   const agent = { status: 'idle', inbox: { nextTurn: [], nextStep: [], hasPending: false }, cancel() {} };
   const chosen = { provider: 'user-picked', model: 'two' };
   let failure = { kind: 'error' };
+  let cancel = false;
   const session = { id: 'switch-session' };
   const voice = voiceSession({
     on(name, handler) { handlers.set(name, handler); return () => handlers.delete(name); },
@@ -3057,11 +3171,21 @@ test('voice temporary model selection respects user switches and rejects unsucce
       },
       commands: {
         resolveAgent: async () => agent,
-        prompt: async (_request, source) => {
-          handlers.get('agent/inbox/claimed')({ agent, message: { source }, turn: 1 });
+        prompt: async (request, source) => {
+          handlers.get('agent/inbox/claimed')({ agent, message: { role: 'user', content: request.content, source }, turn: 1 });
           assert.equal(selection.current.provider, 'dshx-local');
+          const fallback = signal => handlers.get('agent/request-error')({ agent, provider: 'dshx-local',
+            failure: { code: 'LOCAL_CONTEXT' }, signal }, () => 'unhandled');
+          if (cancel) {
+            await voice.call('cancel', { interaction: 'cancel-context' });
+            assert.equal(fallback(new AbortController().signal), 'unhandled', 'cancelled turns cannot retry');
+            return;
+          }
+          const aborted = new AbortController(); aborted.abort();
+          assert.equal(fallback(aborted.signal), 'unhandled', 'aborted requests cannot retry');
           selection.current = chosen;
           handlers.get('session/event')(session, { type: 'model/selection', data: chosen });
+          assert.equal(fallback(new AbortController().signal), 'unhandled', 'a user model switch prevents fallback');
           handlers.get('session/event')(session, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'partial' }] } } });
           handlers.get('session/event')(session, { type: 'turn/end', data: { turn: 1, reason: failure } });
         },
@@ -3073,6 +3197,9 @@ test('voice temporary model selection respects user switches and rejects unsucce
     assert.equal(selection.current, chosen, 'an explicit user change wins over restoring the previous choice');
     failure = { kind: 'error', error: { message: '当前可用内存不足，本地模型暂不加载。请关闭其他占用内存的应用后重试。' } };
     await assert.rejects(voice.call('prompt', { session: session.id, interaction: 'memory', text: '你好', local: true }), { code: 'VOICE_MEMORY' });
+    cancel = true;
+    await assert.rejects(voice.call('prompt', { session: session.id, interaction: 'cancel-context', text: '你好', local: true }), /取消/);
+    assert.equal(selection.current, chosen);
   } finally { voice.close(); }
 });
 
@@ -3083,11 +3210,17 @@ test('voice local adapter bounds Unicode history and records cancellation withou
   const previous = process.env.DSHX_ASSISTANT_DIR;
   process.env.DSHX_ASSISTANT_DIR = dir;
   const abort = new AbortController();
-  const messages = Array.from({ length: 20 }, () => ({ role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '🙂'.repeat(1000) }] }));
+  const messages = Array.from({ length: 10 }, (_, index) => [
+    { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: `问题${index}` }] },
+    { role: 'assistant', source: { kind: 'model' }, content: [{ type: 'text', text: '🙂'.repeat(600) }] },
+  ]).flat();
+  messages.push({ role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '你好' }] });
   messages.unshift({ role: 'system', content: [{ type: 'text', text: 'private system' }] });
   const adapter = localAdapter(LlmAdapter, { query: async (_method, data) => {
-    assert.equal(data.messages.length, 8);
-    assert.ok(data.messages.every(message => [...message.text].length === 600 && message.text === '🙂'.repeat(600)));
+    assert.equal(data.messages.length, 5);
+    assert.deepEqual(data.messages.map(message => message.role), ['user', 'assistant', 'user', 'assistant', 'user']);
+    assert.ok(data.messages.filter(message => message.role === 'assistant').every(message => message.text === '🙂'.repeat(600)));
+    assert.ok(data.messages.reduce((sum, message) => sum + [...message.text].length, 0) <= 1800);
     assert.ok(Buffer.byteLength(JSON.stringify(data)) < 32768, 'the projection must fit the authenticated native line limit');
     abort.abort(); throw new Error('private generation detail');
   } });
@@ -3102,4 +3235,2573 @@ test('voice local adapter bounds Unicode history and records cancellation withou
   } finally {
     if (previous === undefined) delete process.env.DSHX_ASSISTANT_DIR; else process.env.DSHX_ASSISTANT_DIR = previous;
   }
+});
+
+// Local memory tests use real DSH JSON storage in one private directory per fixture.
+async function localMemoryFixture(t, { open = true } = {}) {
+  const { Context } = await load('@deepseek-ai/cordis');
+  const storage = await import(pathToFileURL(join(core, 'memory-store.mjs')));
+  const memory = await import(pathToFileURL(join(core, 'memory.mjs')));
+  const ctx = new Context();
+  const dir = await mkdtemp(join(directory, 'local-memory-'));
+  const f = { ctx, dir, ...storage, ...memory, store: undefined, memory: undefined, extracts: 0, installs: 0 };
+  t.after(async () => {
+    try { if (f.memory) await f.memory.close(); else await f.store?.close(); }
+    finally { await ctx.fiber.dispose(); }
+  });
+  await ctx.plugin((await load('@deepseek-ai/dsh-storage')).default);
+  await ctx.plugin(await load('@deepseek-ai/dsh-storage-json'), { root: dir });
+  await ctx.plugin(await load('@deepseek-ai/dsh-storage-domain'), { backend: 'json' });
+  await ctx.plugin((await load('@deepseek-ai/dsh-session')).default);
+  await ctx.plugin((await load('@deepseek-ai/dsh-system-prompt')).default);
+  await ctx.plugin((await load('@deepseek-ai/dsh-session-projection')).default);
+  await ctx.plugin((await load('@deepseek-ai/dsh-fs')).default);
+  await ctx.plugin((await load('@deepseek-ai/dsh-working-directory')).default, { defaultDirectory: workspace });
+  ctx.llm = { listProviders: () => [{ id: 'fixture', name: 'fixture' }] };
+  ctx.pluginManager = {
+    async installBundle() { f.installs++; throw new Error('local memory must never install a package'); },
+  };
+  f.start = async (options = {}) => {
+    f.memory = memory.memorySession(ctx, { store: f.store, extract: async () => { f.extracts++; return []; }, ...options });
+    await f.memory.ready;
+    return f.memory;
+  };
+  f.data = (key, extra = {}) => ({ type: 'fact', scope: { kind: 'user' }, key, summary: key, content: key, ...extra });
+  f.settings = async (enabled, autoSave = false) => f.memory.call('settings', { enabled, autoSave, revision: f.store.read().revision });
+  f.session = (id, provider = 'fixture') => ({ session: ctx.sessions.create(id, { meta: { cwd: workspace } }), options: { provider, model: 'test' } });
+  f.before = async (agent, text = '咖啡') => {
+    const { createUserMessage } = await load('@deepseek-ai/dsh-llm');
+    const message = createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text }] });
+    const decision = { kind: 'enter', messages: [message] };
+    const result = await f.memory.before({ agent, messages: agent.session.deriveMessages(), signal: new AbortController().signal }, async () => decision);
+    return { result, decision, message };
+  };
+  f.commit = (agent, result) => {
+    for (const message of result.messages) agent.session.append('user/message', message, { surfaceOp: 'append' });
+  };
+  if (open) f.store = await storage.openMemory(ctx);
+  return f;
+}
+
+test('Android memory local storage layout uses the actual profile paths for sessions attachments and both domains', async () => {
+  const { Context } = await load('@deepseek-ai/cordis');
+  const { entryListSchema, applyEntryPatches } = await load('@deepseek-ai/cordis-plugin-include');
+  const { interpolate } = await load('@deepseek-ai/cordis-plugin-loader');
+  const { dshHomePath } = await load('@deepseek-ai/dsh-home-paths');
+  const yaml = require('js-yaml');
+  const home = await mkdtemp(join(directory, 'storage-layout-'));
+  const previous = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  const ctx = new Context();
+  let memory, knowledge;
+  try {
+    const base = yaml.load(await readFile(require.resolve('@deepseek-ai/dsh-base/cordis.patch.yml'), 'utf8'), { schema: entryListSchema });
+    const patches = yaml.load(await readFile(new URL('./android.patch.yml', import.meta.url), 'utf8'), { schema: entryListSchema });
+    const ids = ['session-persistence-jsonl', 'attachment-local', 'storage-json'];
+    const rows = applyEntryPatches(base.flatMap(row => row.insert ?? []), patches.filter(row => ids.includes(row.id)), assert.fail);
+    const config = id => interpolate({ dshHomePath }, rows.find(row => row.id === id).config ?? {});
+    await ctx.plugin((await load('@deepseek-ai/dsh-storage')).default);
+    await ctx.plugin(await load('@deepseek-ai/dsh-storage-json'), config('storage-json'));
+    await ctx.plugin(await load('@deepseek-ai/dsh-storage-domain'), { backend: 'json' });
+    await ctx.plugin((await load('@deepseek-ai/dsh-session')).default);
+    await ctx.plugin(await load('@deepseek-ai/dsh-session-persistence-jsonl'), config('session-persistence-jsonl'));
+    await ctx.plugin((await load('@deepseek-ai/dsh-attachment-local')).default, config('attachment-local'));
+    const log = ctx.sessionPersistence.locate({ id: 'layout-session' }).path;
+    assert.ok(log.startsWith(join(home, 'storages', 'sessions') + '/'), log);
+    const attachment = await ctx.attachments.saveFile({ data: Buffer.from('附件保持可读'), name: '资料.txt' });
+    const file = ctx.attachments.fileHostPath(attachment);
+    assert.ok(file.startsWith(join(home, 'storages', 'attachments', 'v1') + '/'), file);
+    assert.equal(await readFile(file, 'utf8'), '附件保持可读');
+    memory = await (await import(pathToFileURL(join(core, 'memory-store.mjs')))).openMemory(ctx);
+    await memory.save({ type: 'fact', scope: { kind: 'user' }, key: 'language', summary: '中文', content: '使用中文' });
+    knowledge = await (await import(pathToFileURL(join(core, 'knowledge-store.mjs')))).openKnowledge(ctx);
+    await knowledge.domain.global.set(knowledge.read());
+    assert.equal(knowledge.root, join(home, 'storages', 'knowledge'));
+    for (const name of ['memory', 'knowledge']) {
+      assert.equal(JSON.parse(await readFile(join(home, 'storages', name, 'state.json'), 'utf8')).unit.name, name);
+      await assert.rejects(stat(join(home, 'storages', name + '.json')), { code: 'ENOENT' });
+    }
+  } finally {
+    await knowledge?.close(); await memory?.close(); await ctx.fiber.dispose();
+    if (previous === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = previous;
+  }
+});
+
+test('Android memory local JSON commits concurrent changes with revisions and survives reopen', async t => {
+  const f = await localMemoryFixture(t);
+  assert.deepEqual(f.store.read(), f.initialMemory());
+  const results = await Promise.allSettled([
+    f.store.save(f.data('first', { revision: 0 })),
+    f.store.save(f.data('stale', { revision: 0 })),
+  ]);
+  assert.deepEqual(results.map(row => row.status), ['fulfilled', 'rejected']);
+  assert.equal(results[1].reason.code, 'MEMORY_CONFLICT');
+  await Promise.all(Array.from({ length: 5 }, (_, index) => f.store.save(f.data(`queued-${index}`))));
+  const snapshot = f.store.read();
+  assert.equal(snapshot.revision, 6);
+  assert.deepEqual(snapshot.entries.map(row => row.key).sort(), ['first', ...Array.from({ length: 5 }, (_, i) => `queued-${i}`)].sort());
+  snapshot.entries[0].content = 'borrowed mutation';
+  assert.equal(f.store.read().entries[0].content, 'first');
+  const saved = f.store.read();
+  const disk = JSON.parse(await readFile(join(f.dir, 'memory', 'state.json'), 'utf8'));
+  assert.deepEqual(disk.unit, { name: 'memory', version: 1 });
+  assert.deepEqual(disk.global, saved);
+  await f.store.close();
+  await assert.rejects(f.store.save(f.data('closed')), { code: 'MEMORY_STOPPED' });
+  f.store = await f.openMemory(f.ctx);
+  assert.deepEqual(f.store.read(), saved);
+  await f.store.save(f.data(' ＦＩＲＳＴ ', { summary: '更正后的事实', content: '新内容', revision: saved.revision }));
+  const updated = f.store.read();
+  assert.equal(updated.entries.length, saved.entries.length);
+  assert.equal(updated.entries.find(row => row.key === 'first').id, saved.entries[0].id);
+  assert.equal(updated.entries.find(row => row.key === 'first').locked, true);
+});
+
+test('Android memory local rejects malformed and unsupported JSON without replacing the file', async t => {
+  for (const corrupt of ['{broken', JSON.stringify({ unit: { name: 'memory', version: 1 }, global: { version: 99 }, tables: {} })]) {
+    const f = await localMemoryFixture(t, { open: false });
+    const path = join(f.dir, 'memory', 'state.json');
+    await mkdir(join(f.dir, 'memory'), { recursive: true });
+    await writeFile(path, corrupt);
+    await assert.rejects(f.openMemory(f.ctx));
+    assert.equal(await readFile(path, 'utf8'), corrupt);
+    await f.start();
+    const status = await f.memory.call('status');
+    assert.equal(status.ready, false);
+    assert.equal(status.settings, null);
+    await assert.rejects(f.memory.call('save', f.data('must-not-replace', { revision: 0 })), { code: 'MEMORY_READ' });
+    assert.equal(await readFile(path, 'utf8'), corrupt);
+  }
+});
+
+test('Android memory local failed durable publication leaves the last snapshot and queue usable', async () => {
+  const { MemoryStore, initialMemory } = await import(pathToFileURL(join(core, 'memory-store.mjs')));
+  let current = initialMemory(), fail = true, writes = 0;
+  const store = new MemoryStore({ global: {
+    get: () => current,
+    async set(next) { writes++; if (fail) throw new Error('private disk detail'); current = structuredClone(next); },
+  }, async close() {} });
+  try {
+    await assert.rejects(store.change(next => { next.settings.enabled = true; }), { code: 'MEMORY_WRITE' });
+    assert.deepEqual(store.read(), initialMemory());
+    assert.equal(current.revision, 0);
+    await assert.rejects(store.change(next => { next.settings.enabled = 'invalid'; }), { code: 'MEMORY_READ' });
+    assert.equal(writes, 1, 'invalid snapshots must not reach the backend');
+    fail = false;
+    await store.change(next => { next.settings.enabled = true; }, 0);
+    assert.equal(store.read().revision, 1);
+    assert.equal(store.read().settings.enabled, true);
+  } finally { await store.close(); }
+});
+
+test('Android memory local Chinese search isolates workspace state expiry and unrelated text', async t => {
+  const f = await localMemoryFixture(t);
+  const rows = [
+    f.data('drink', { summary: '用户偏好无糖咖啡', content: '饮品选择无糖咖啡', type: 'preference' }),
+    f.data('workspace-a', { summary: '甲项目提供咖啡', scope: { kind: 'workspace', workspace } }),
+    f.data('workspace-b', { summary: '乙项目提供咖啡', scope: { kind: 'workspace', workspace: join(workspace, 'other') } }),
+    f.data('pending', { summary: '未确认咖啡偏好' }),
+    f.data('expired', { summary: '过期咖啡偏好', expiresAt: Date.now() - 1 }),
+    f.data('unrelated', { summary: '乘坐地铁通勤', content: '每天步行到地铁站' }),
+    f.data('english', { summary: 'Use Go for backend', content: 'Go is preferred' }),
+  ];
+  for (const data of rows) await f.store.save(data);
+  await f.store.change(next => { next.entries.find(row => row.key === 'pending').state = 'pending'; });
+  const snapshot = f.store.read();
+  assert.deepEqual(f.searchMemory(snapshot, '咖啡', workspace).map(row => row.key).sort(), ['drink', 'workspace-a']);
+  assert.deepEqual(f.searchMemory(snapshot, '咖啡', join(workspace, 'other')).map(row => row.key).sort(), ['drink', 'workspace-b']);
+  assert.deepEqual(f.searchMemory(snapshot, '火星探测器', workspace), []);
+  assert.deepEqual(f.searchMemory(snapshot, 'goal', workspace), [], 'English tokens must not match Go as a prefix');
+  assert.deepEqual(f.searchMemory(snapshot, 'ＧＯ', workspace).map(row => row.key), ['english']);
+  assert.equal(f.searchMemory(snapshot, '咖啡', workspace, 1).length, 1);
+  assert.deepEqual(f.searchMemory(snapshot, '火星探测器', workspace, 10, true).map(row => row.key), ['drink']);
+  await f.start(); await f.settings(true);
+  for (const key of ['workspace-b', 'pending', 'expired']) {
+    assert.throws(() => f.memory.read(snapshot.entries.find(row => row.key === key).id, workspace), { code: 'MEMORY_MISSING' });
+  }
+  const visible = f.memory.read(snapshot.entries.find(row => row.key === 'drink').id, workspace);
+  visible.content = 'borrowed mutation';
+  assert.notEqual(f.memory.read(visible.id, workspace).content, visible.content);
+});
+
+test('Android memory local defaults make no model or installation calls and disabled settings retain management', async t => {
+  const f = await localMemoryFixture(t);
+  f.ctx.llm = { listProviders: () => [{ id: 'fixture', name: 'fixture' }],
+    async resolveModel() { assert.fail('default memory cannot resolve a model'); }, stream() { assert.fail('default memory cannot send model requests'); } };
+  await f.start();
+  let status = await f.memory.call('status');
+  assert.deepEqual(status.settings, { enabled: false, autoSave: false });
+  assert.equal(status.ready, true); assert.equal(status.active, false);
+  assert.equal(status.revision, 0);
+  assert.equal(status.autoReady, false);
+  await assert.rejects(stat(join(f.dir, 'memory', 'state.json')), { code: 'ENOENT' });
+  assert.equal(f.extracts, 0); assert.equal(f.installs, 0);
+  assert.throws(() => f.memory.search('咖啡', workspace), { code: 'MEMORY_NOT_READY' });
+  const saved = await f.memory.call('save', f.data('drink', { summary: '喜欢咖啡', revision: status.revision }));
+  const listed = await f.memory.call('list');
+  const id = listed.entries[0].id;
+  assert.equal(saved.active, false); assert.equal(listed.entries[0].locked, true);
+  assert.equal((await f.memory.call('read', { id })).entry.summary, '喜欢咖啡');
+  await assert.rejects(f.memory.call('save', f.data('stale', { revision: status.revision })), { code: 'MEMORY_CONFLICT' });
+  await assert.rejects(f.memory.call('settings', { enabled: true, autoSave: false }), { code: 'MEMORY_INPUT' });
+  await f.settings(true);
+  assert.equal(f.memory.search('咖啡', workspace)[0].id, id);
+  assert.equal(f.memory.read(id, workspace).id, id);
+  assert.throws(() => f.memory.search('', workspace), { code: 'MEMORY_INPUT' });
+  const changed = await f.memory.call('save', f.data('drink', { id, content: '新正文', revision: f.store.read().revision }));
+  assert.equal(changed.active, true);
+  await f.settings(false);
+  assert.throws(() => f.memory.read(id, workspace), { code: 'MEMORY_NOT_READY' });
+  assert.equal((await f.memory.call('read', { id })).entry.content, '新正文');
+  await f.memory.call('remove', { id, revision: f.store.read().revision });
+  assert.equal((await f.memory.call('list')).entries.length, 0);
+  assert.equal(f.store.read().blocked[0].key, 'drink');
+  await f.memory.call('save', f.data('again', { revision: f.store.read().revision }));
+  await f.memory.call('clear', { revision: f.store.read().revision });
+  assert.deepEqual((await f.memory.call('list')).entries, []);
+  assert.equal(f.extracts, 0); assert.equal(f.installs, 0);
+});
+
+test('Android memory local honors aborted management without changing the saved snapshot', async t => {
+  const f = await localMemoryFixture(t);
+  await f.start();
+  const aborted = new AbortController(); aborted.abort();
+  const snapshot = f.store.read();
+  await assert.rejects(f.memory.call('save', f.data('aborted', { revision: snapshot.revision }), aborted.signal), { name: 'AbortError' });
+  assert.deepEqual(f.store.read(), snapshot);
+  const decision = { kind: 'stop' };
+  assert.equal(await f.memory.before({ signal: new AbortController().signal }, async () => decision), decision);
+});
+
+test('Android memory local injection keeps source metadata whole summaries and local or cloud budgets', async t => {
+  const f = await localMemoryFixture(t);
+  await f.start(); await f.settings(true);
+  for (let i = 0; i < 8; i++) await f.store.save(f.data(`coffee-${i}`, { summary: `咖啡偏好${i}🙂🙂🙂🙂🙂` }));
+  const long = '咖啡' + '长'.repeat(158);
+  await f.store.save(f.data('long', { summary: long }));
+  for (const [provider, budget] of [['fixture', 256], ['dshx-local', 256]]) {
+    const agent = f.session(`budget-${provider}`, provider);
+    agent.session.append('request/header', { header: { config: { provider: 'previous-cloud', model: 'old-route' } }, reason: 'initial' });
+    const { result, decision, message } = await f.before(agent);
+    assert.equal(result.messages.length, 2);
+    const injected = result.messages[0];
+    assert.equal(result.messages[1], message);
+    assert.equal(decision.messages.length, 1, 'the borrowed decision stays unchanged');
+    assert.equal(injected.role, 'user');
+    assert.equal(injected.source.kind, 'plugin:dshx-memory');
+    assert.equal(injected.source.form, 'recall');
+    assert.ok(injected.source.entries.length > 0 && injected.source.entries.length <= 6);
+    assert.equal(injected.source.revision, f.store.read().revision);
+    assert.ok(Object.isFrozen(injected));
+    const text = injected.content[0].text;
+    assert.ok(Buffer.byteLength(text) + 64 <= budget);
+    for (const source of injected.source.entries) {
+      const row = f.store.read().entries.find(row => row.id === source.id);
+      assert.equal(source.updatedAt, row.updatedAt);
+      assert.equal(source.revision, f.store.read().revision);
+      assert.deepEqual(source.scope, row.scope);
+      assert.ok(text.includes(row.summary), 'each selected summary must stay complete');
+    }
+    if (provider === 'dshx-local') assert.equal(text.includes(long), false, 'omit an oversized summary as a whole');
+    const unaccepted = await f.before(agent);
+    assert.equal(unaccepted.result.messages.length, 2, 'unaccepted recalls must not suppress the next admission');
+    f.commit(agent, result);
+    const accepted = new Set(injected.source.entries.map(row => row.id));
+    let exhausted = false;
+    for (let i = 0; i < 9; i++) {
+      const duplicate = await f.before(agent);
+      if (duplicate.result === duplicate.decision) { exhausted = true; break; }
+      for (const entry of duplicate.result.messages[0].source.entries) {
+        assert.equal(accepted.has(entry.id), false, 'an accepted version must not be injected twice');
+        accepted.add(entry.id);
+      }
+      f.commit(agent, duplicate.result);
+    }
+    assert.equal(exhausted, true);
+  }
+  assert.equal(f.extracts, 0);
+});
+
+test('Android memory local injection restores logged recall identity and sends update deletion expiry and clear notices', async t => {
+  const f = await localMemoryFixture(t);
+  await f.start(); await f.settings(true);
+  await f.store.save(f.data('drink', { summary: '喜欢咖啡' }));
+  const agent = f.session('invalidation');
+  const first = await f.before(agent);
+  f.commit(agent, first.result);
+  const original = first.result.messages[0];
+  await f.memory.close();
+  f.store = await f.openMemory(f.ctx);
+  await f.start();
+  const resumed = await f.before(agent);
+  assert.equal(resumed.result, resumed.decision, 'logged recalls must not be injected again after reopening');
+  const row = f.store.read().entries[0];
+  await f.store.save(f.data('drink', { id: row.id, summary: '喜欢无糖咖啡', revision: f.store.read().revision }));
+  const update = await f.before(agent);
+  assert.equal(update.result.messages[0].source.reset, true);
+  assert.match(update.result.messages[0].content[0].text, /背景已失效/);
+  assert.match(update.result.messages[0].content[0].text, /喜欢无糖咖啡/);
+  assert.equal(original.content[0].text.includes('喜欢无糖咖啡'), false);
+  f.commit(agent, update.result);
+  await f.memory.call('remove', { id: row.id, revision: f.store.read().revision });
+  const removed = await f.before(agent);
+  assert.equal(removed.result.messages[0].source.kind, 'plugin:dshx-memory');
+  assert.deepEqual(removed.result.messages[0].source.entries, []);
+  assert.equal(removed.result.messages[0].source.reset, true);
+  assert.match(removed.result.messages[0].content[0].text, /背景已失效/);
+  f.commit(agent, removed.result);
+  assert.equal((await f.before(agent)).result.messages.length, 1);
+  await f.store.save(f.data('expires', { summary: '咖啡即将过期' }));
+  const expiring = await f.before(agent); f.commit(agent, expiring.result);
+  await f.store.change(next => { next.entries[0].expiresAt = Date.now() - 1; });
+  const expired = await f.before(agent);
+  assert.equal(expired.result.messages[0].source.reset, true);
+  assert.match(expired.result.messages[0].content[0].text, /背景已失效/);
+  f.commit(agent, expired.result);
+  await f.store.save(f.data('clear', { summary: '咖啡清空测试' }));
+  const clearing = await f.before(agent); f.commit(agent, clearing.result);
+  await f.memory.call('clear', { revision: f.store.read().revision });
+  const cleared = await f.before(agent);
+  assert.equal(cleared.result.messages[0].source.reset, true);
+  assert.match(cleared.result.messages[0].content[0].text, /背景已失效/);
+});
+
+test('Android memory local model preserves recall notices and rejects incomplete input before native inference', async () => {
+  const { localInput, localAdapter } = await import(pathToFileURL(join(core, 'voice.mjs')));
+  const { createUserMessage, LlmAdapter } = await load('@deepseek-ai/dsh-llm');
+  const make = (text, source) => createUserMessage({ content: [{ type: 'text', text }], source });
+  const task = make('你好', { kind: 'user' });
+  const recall = make('偏好简短中文', { kind: 'plugin:dshx-memory', form: 'recall', entries: [] });
+  const notice = make('旧偏好已删除，停止使用。', { kind: 'plugin:dshx-memory', form: 'recall', entries: [], notice: true });
+  const messages = [recall, task, notice], before = JSON.stringify(messages);
+  assert.deepEqual(localInput(messages), [
+    { role: 'context', kind: 'memory', text: '偏好简短中文' },
+    { role: 'context', kind: 'memory', text: '旧偏好已删除，停止使用。' },
+    { role: 'user', text: '你好' },
+  ]);
+  assert.equal(JSON.stringify(messages), before);
+  assert.deepEqual(localInput([make('unrelated', { kind: 'plugin:other' }), task]), [{ role: 'user', text: '你好' }]);
+  let nativeCalls = 0;
+  const adapter = localAdapter(LlmAdapter, { async query(_method, data) {
+    nativeCalls++; assert.deepEqual(data.messages, localInput(messages));
+    return { text: '你好', inputTokens: 20, outputTokens: 2 };
+  } });
+  assert.equal((await Array.fromAsync(adapter.stream({ messages }))).at(-1).reason.kind, 'stop');
+  for (const input of [
+    [make('🙂'.repeat(1799), recall.source), task],
+    [...Array.from({ length: 9 }, () => recall), task],
+    [{ ...recall, content: [...recall.content, { type: 'image' }] }, task],
+  ]) {
+    assert.equal(localInput(input), null);
+    const events = await Array.fromAsync(adapter.stream({ messages: input }));
+    assert.equal(events.at(-1).reason.failure.code, 'LOCAL_MEMORY_CONTEXT');
+    assert.match(events.at(-1).reason.failure.message, /无法完整.*不会自动转用云端/);
+  }
+  assert.equal(localInput([make('🙂'.repeat(1798), recall.source), task])[0].text, '🙂'.repeat(1798));
+  assert.equal(nativeCalls, 1);
+});
+
+test('Android memory local real agent loop never retries oversized recall or notice on a cloud model', async () => {
+  const { Context } = await load('@deepseek-ai/cordis');
+  const { default: SystemPrompt } = await load('@deepseek-ai/dsh-system-prompt');
+  const { default: Tools } = await load('@deepseek-ai/dsh-tools');
+  const { default: LlmRuntime, LlmAdapter, createUserMessage } = await load('@deepseek-ai/dsh-llm');
+  const { default: Agents, installModelSelection } = await load('@deepseek-ai/dsh-agent');
+  const { default: Sessions } = await load('@deepseek-ai/dsh-session');
+  const { default: Projections } = await load('@deepseek-ai/dsh-session-projection');
+  const { default: AgentLoop } = await load('@deepseek-ai/dsh-agent-loop');
+  const { installModelSelectionProjection } = await import(new URL('./types/model-selection-projection.js', pathToFileURL(require.resolve('@deepseek-ai/dsh-api-session-controller'))));
+  const { voiceSession, localAdapter } = await import(pathToFileURL(join(core, 'voice.mjs')));
+  for (const mode of ['early-recall', 'late-recall', 'notice']) {
+    const ctx = new Context();
+    const original = { provider: 'fixture', model: 'remote' }, selection = { current: original };
+    let remote = 0, local = 0, voice, disposeSelection;
+    try {
+      for (const plugin of [SystemPrompt, Tools, LlmRuntime, Agents, Sessions, Projections]) await ctx.plugin(plugin);
+      installModelSelectionProjection(ctx);
+      await ctx.plugin(AgentLoop, { agents: [] });
+      class Remote extends LlmAdapter { async *stream() { remote++; yield { type: 'finish', reason: { kind: 'stop' } }; } }
+      ctx.llm.registerAdapter(['fixture'], new Remote());
+      ctx.llm.registerAdapter(['dshx-local'], localAdapter(LlmAdapter, { async query() { local++; assert.fail('overflow must not invoke native inference'); } }));
+      const agent = await ctx.agentLoop.create(`memory-${mode}`, original);
+      disposeSelection = installModelSelection(agent.ctx, selection);
+      ctx.sessionController = { agents: {
+        selectionFor: () => selection,
+        selectForNextRequest(agent, selected) { agent.session.append('model/selection', selected); selection.current = selected; },
+      }, commands: {
+        resolveAgent: async () => agent,
+        prompt: async (request, source) => { agent.followup(createUserMessage({ content: request.content, source })); return { accepted: true }; },
+      } };
+      const inject = () => agent.session.append('user/message', createUserMessage({ content: [{ type: 'text', text: 'x'.repeat(1800) }],
+        source: { kind: 'plugin:dshx-memory', form: 'recall', entries: [], ...(mode === 'notice' ? { notice: true } : {}) } }), { surfaceOp: 'append' });
+      if (mode !== 'late-recall') inject();
+      else {
+        let injected = false;
+        ctx.on('agent/request', (_payload, next) => { if (!injected) { injected = true; inject(); } return next(); });
+      }
+      voice = voiceSession(ctx);
+      await assert.rejects(voice.call('prompt', { session: agent.session.id, interaction: mode, text: '你好', local: true }), { code: 'LOCAL_MEMORY_CONTEXT' });
+      await agent.whenIdle();
+      assert.equal(remote, 0); assert.equal(local, 0);
+      assert.equal(selection.current, original);
+    } finally { voice?.close(); disposeSelection?.(); await ctx.fiber.dispose(); }
+  }
+});
+
+test('Android memory local authenticated host validates actions and sanitizes management errors', async t => {
+  const f = await localMemoryFixture(t); await f.start();
+  const host = new PolicyHost(), frames = [];
+  host.socket = { write: value => frames.push(JSON.parse(value)), destroy() {} };
+  t.after(() => host.close());
+  const request = { memory: 'memory-request', action: 'status' };
+  const frame = async () => { for (let i = 0; i < 100 && !frames.length; i++) await delay(2); assert.ok(frames.length, 'missing host response'); return frames.shift(); };
+  assert.throws(() => host.receive(request), /原生记忆请求无效/);
+  host.connected = true;
+  host.receive(request);
+  assert.equal((await frame()).error, f.memoryError({ code: 'MEMORY_NOT_READY' }));
+  host.memory = f.memory.call;
+  host.receive(request);
+  assert.deepEqual((await frame()).result.settings, { enabled: false, autoSave: false });
+  for (const action of ['status', 'settings', 'list', 'read', 'save', 'remove', 'clear', 'retry', 'organize']) {
+    host.memory = async (actual, data) => { assert.equal(actual, action); assert.deepEqual(data, { check: true }); return { action }; };
+    host.receive({ ...request, action, data: { check: true } });
+    assert.equal((await frame()).result.action, action);
+  }
+  for (const invalid of [{ ...request, action: 'install' }, { ...request, action: 'anything' }, { ...request, other: true }, { ...request, memory: '../bad' }]) {
+    assert.throws(() => host.receive(invalid), /原生记忆请求无效/);
+  }
+  host.memory = async () => { throw new Error('private-test-key raw provider details'); };
+  host.receive(request);
+  const failure = await frame();
+  assert.equal(failure.ok, false);
+  assert.doesNotMatch(JSON.stringify(failure), /private-test-key|provider details/);
+});
+
+test('Android memory local real Cordis profile starts local storage without an external memory plugin', { timeout: 35000 }, async () => {
+  const dir = await mkdtemp(join(directory, 'local-memory-profile-'));
+  const yaml = require('js-yaml');
+  const { entryListSchema } = await load('@deepseek-ai/cordis-plugin-include');
+  const patches = yaml.load(await readFile(new URL('./android.patch.yml', import.meta.url), 'utf8'), { schema: entryListSchema });
+  assert.doesNotMatch(JSON.stringify(patches), /openviking/iu, 'the Android profile must remove the old integration entirely');
+  const local = patches.flatMap(row => row.insert ?? []).filter(row => row.id === 'dshx-android-memory');
+  assert.equal(local.length, 1);
+  assert.equal(local[0].name, 'file:@CORE@/memory.mjs');
+  const run = async () => {
+    const assert = (await import('node:assert/strict')).default;
+    const { createRequire } = await import('node:module');
+    const { pathToFileURL } = await import('node:url');
+    const { join } = await import('node:path');
+    const { mkdirSync, writeFileSync } = await import('node:fs');
+    const core = process.env.DSHX_CORE, dir = process.env.DSHX_MEMORY_TEST_DIR;
+    const require = createRequire(join(core, 'lib/node_modules/package.json'));
+    const load = name => import(pathToFileURL(require.resolve(name)));
+    const { packageManager } = await import(pathToFileURL(join(core, 'plugins.mjs')));
+    const { runProfile } = await load('@deepseek-ai/dsh/profile-boot');
+    const { loadProfileDirectory } = await load('@deepseek-ai/dsh-app-boot');
+    const { createLaunchEnvironmentSnapshot } = await load('@deepseek-ai/dsh-launch-environment');
+    const profile = join(dir, 'profile'); mkdirSync(profile);
+    const names = [
+      ['timer', '@deepseek-ai/cordis-plugin-timer'], ['hmr', '@deepseek-ai/dsh-hmr', { root: [] }],
+      ['plugin-manager', '@deepseek-ai/dsh-plugin-manager'], ['storage', '@deepseek-ai/dsh-storage'],
+      ['storage-json', '@deepseek-ai/dsh-storage-json', { root: join(dir, 'storages') }],
+      ['storage-domain', '@deepseek-ai/dsh-storage-domain', { backend: 'json' }],
+      ['system-prompt', '@deepseek-ai/dsh-system-prompt'], ['tools', '@deepseek-ai/dsh-tools'],
+      ['llm', '@deepseek-ai/dsh-llm'], ['agents', '@deepseek-ai/dsh-agent'], ['sessions', '@deepseek-ai/dsh-session'],
+      ['session-projection', '@deepseek-ai/dsh-session-projection'], ['fs', '@deepseek-ai/dsh-fs'],
+      ['working-directory', '@deepseek-ai/dsh-working-directory', { defaultDirectory: dir }],
+      ['session-persistence', '@deepseek-ai/dsh-session-persistence-jsonl', { root: join(dir, 'sessions'), compression: 'none' }],
+    ];
+    const entries = names.map(([id, name, config]) => ({ id, name: pathToFileURL(require.resolve(name)).href, ...(config ? { config } : {}) }));
+    entries.push({ id: 'memory', name: pathToFileURL(join(core, 'memory.mjs')).href });
+    writeFileSync(join(profile, 'package.json'), '{"private":true,"dsh":{"profile":{"bundles":[]}}}');
+    writeFileSync(join(profile, 'cordis.patch.yml'), JSON.stringify([{ insert: entries }]));
+    const anchor = require.resolve('@deepseek-ai/dsh/package.json'), invocation = packageManager(core);
+    const app = await runProfile({ environment: createLaunchEnvironmentSnapshot([]), profile: 'memory-local-test',
+      patchFiles: [], args: [],
+      resolvedProfile: { profile: loadProfileDirectory('dsh', profile, anchor), installAnchor: anchor },
+      packageManager: { ...invocation, env: { ...invocation.env, npm_config_offline: 'true' } },
+    });
+    try {
+      const { policyHost } = await import(pathToFileURL(join(core, 'host.mjs')));
+      assert.equal(typeof policyHost.memory, 'function');
+      const status = await policyHost.memory('status');
+      assert.equal(status.ready, true, JSON.stringify(status));
+      assert.deepEqual(status.settings, { enabled: false, autoSave: false });
+      assert.equal(status.active, false);
+      assert.ok(app.ctx.tools.get('memory_search')); assert.ok(app.ctx.tools.get('memory_read'));
+      console.log('Local memory profile passed');
+    } finally { await app.shutdown.shutdown(0); }
+  };
+  const child = spawn(process.execPath, ['--expose-internals', '--preserve-symlinks', '--preserve-symlinks-main', '--import', join(core, 'compat.mjs'), '--input-type=module', '-e', '(' + run.toString() + ')().catch(error => { console.error(error); process.exitCode = 1; })'], {
+    env: { ...process.env, DSHX_MEMORY_TEST_DIR: dir, DSH_HOME: join(dir, 'home') }, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  child.stdout.on('data', chunk => { output += chunk; }); child.stderr.on('data', chunk => { output += chunk; });
+  const timeout = setTimeout(() => child.kill('SIGKILL'), 25000);
+  try {
+    const code = await new Promise((resolve, reject) => { child.once('error', reject); child.once('close', resolve); });
+    assert.equal(code, 0, output); assert.match(output, /Local memory profile passed/);
+  } finally { clearTimeout(timeout); if (child.exitCode === null) child.kill('SIGKILL'); }
+});
+
+async function localMemoryWait(check, label) {
+  for (let i = 0; i < 1000; i++) { if (check()) return; await delay(2); }
+  assert.fail(label);
+}
+
+for (const action of ['remove', 'remove-renamed-source', 'clear', 'settings', 'llm/adapters-updated']) {
+  test(`Android memory local P2 ${action} prevents a delayed extraction from restoring obsolete memory`, { timeout: 10000 }, async t => {
+    const f = await localMemoryFixture(t);
+    const { createUserMessage } = await load('@deepseek-ai/dsh-llm');
+    const sessionId = `race-${action.replaceAll('/', '-')}`;
+    await f.store.save(f.data('coffee', { summary: '原咖啡偏好', scope: { kind: 'workspace', workspace } }));
+    await f.store.change(next => {
+      next.entries[0].source = action === 'remove-renamed-source'
+        ? { kind: 'auto', session: sessionId, events: [0] } : { kind: 'auto', session: 'old-session', events: [99] };
+      next.entries[0].locked = false;
+    });
+    const old = f.store.read().entries[0];
+    const handlers = new Map(), events = [];
+    const flush = Promise.withResolvers(), release = Promise.withResolvers(), returned = Promise.withResolvers();
+    let flushes = 0, extraction;
+    const session = { id: sessionId, seq: 0, header: { cwd: workspace },
+      snapshotEvents: () => events, requestHeader: () => ({ config: { provider: 'fixture', model: 'source-model' } }) };
+    const ctx = {
+      on(name, handler) {
+        if (!handlers.has(name)) handlers.set(name, new Set());
+        handlers.get(name).add(handler);
+        return () => handlers.get(name).delete(handler);
+      },
+      llm: { listProviders: () => [{ id: 'fixture', name: 'fixture' }] },
+      workingDirectory: { get: () => workspace },
+      pluginManager: f.ctx.pluginManager,
+      sessions: { async flush(current) { assert.equal(current, session); flushes++; return flush.promise; } },
+      sessionPersistence: { async open(id, mode, { signal } = {}) {
+        assert.equal(id, session.id); assert.equal(mode, 'read'); signal?.throwIfAborted();
+        return { async read(from = 0, count = events.length - from) { return { events: events.slice(from, from + count) }; }, async close() {} };
+      } },
+    };
+    const emit = (name, ...args) => { for (const handler of handlers.get(name) ?? []) handler(...args); };
+    f.memory = f.memorySession(ctx, { store: f.store, extract: async (_ctx, options) => {
+      assert.equal(_ctx, ctx); extraction = options;
+      try { return await release.promise; } finally { returned.resolve(); }
+    } });
+    try {
+      await f.memory.ready;
+      await f.memory.call('settings', { enabled: true, autoSave: true, revision: f.store.read().revision });
+      const user = createUserMessage({ content: [{ type: 'text', text: '更正：新的咖啡偏好' }], source: { kind: 'user' } });
+      const decision = { kind: 'enter', messages: [user] };
+      await f.memory.before({ agent: { session }, messages: [], signal: new AbortController().signal }, async () => decision);
+      const cursor = f.store.read().cursors[session.id];
+      assert.equal(cursor.start, 0); assert.equal(cursor.next, 0);
+      events.push({ seq: 0, type: 'user/message', data: user });
+      const end = { seq: 1, type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } };
+      events.push(end); session.seq = events.length;
+      emit('session/event', session, end);
+      await localMemoryWait(() => flushes === 1, 'turn/end did not request a durable checkpoint');
+      assert.equal(f.store.read().jobs.length, 0);
+      assert.equal(extraction, undefined, 'extraction must wait for flush acknowledgement');
+      flush.resolve(true);
+      await localMemoryWait(() => extraction !== undefined, 'registered task never reached the injected extractor');
+      assert.equal(extraction.session, session.id);
+      assert.equal(extraction.provider, 'fixture'); assert.equal(extraction.model, 'source-model');
+      assert.deepEqual(extraction.events.map(row => row.seq), [0, 1]);
+      assert.equal(f.store.read().jobs[0].attempts, 1);
+      const epoch = f.store.read().epoch;
+      if (action.startsWith('remove')) await f.memory.call('remove', { id: old.id, revision: f.store.read().revision });
+      else if (action === 'clear') await f.memory.call('clear', { revision: f.store.read().revision });
+      else if (action === 'settings') await f.memory.call('settings', { enabled: false, autoSave: false, revision: f.store.read().revision });
+      else {
+        emit('llm/adapters-updated');
+        await localMemoryWait(() => f.store.read().epoch > epoch, 'model update did not invalidate the task epoch');
+        await f.store.queue;
+      }
+      const afterAction = f.store.read();
+      assert.equal(extraction.signal.aborted, !action.startsWith('remove'));
+      if (action.startsWith('remove')) assert.equal(afterAction.blocked[0].key, 'coffee');
+      else {
+        assert.ok(afterAction.epoch > epoch);
+        assert.deepEqual(afterAction.jobs, []); assert.deepEqual(afterAction.cursors, {});
+      }
+      release.resolve([{ action: action === 'remove-renamed-source' ? 'add' : 'update', type: 'fact',
+        key: action === 'remove-renamed-source' ? 'coffee-renamed' : 'coffee', summary: '新的咖啡偏好', content: '新的咖啡偏好',
+        events: [0], scope: 'workspace', ...(action === 'remove-renamed-source' ? {} : { corrects: old.id }) }]);
+      await returned.promise;
+      await new Promise(resolve => setImmediate(resolve));
+      await f.store.queue;
+      const final = f.store.read();
+      assert.equal(final.entries.some(row => row.content === '新的咖啡偏好'), false, action);
+      if (action.startsWith('remove') || action === 'clear') assert.deepEqual(final.entries, []);
+      else assert.deepEqual(final.entries, afterAction.entries);
+      if (action.startsWith('remove')) { assert.deepEqual(final.jobs, []); assert.equal(final.cursors[session.id].next, events.length); }
+      else assert.equal(final.revision, afterAction.revision, 'an obsolete result cannot publish even an empty revision');
+    } finally { flush.resolve(true); release.resolve([]); }
+  });
+}
+
+test('Android memory local extraction selects complete user evidence and excludes synthetic rich and secret content', async () => {
+  const { selectEvents } = await import(pathToFileURL(join(core, 'memory-extract.mjs')));
+  const { createUserMessage, createAssistantMessage } = await load('@deepseek-ai/dsh-llm');
+  const user = (seq, text, source = { kind: 'user' }) => ({ seq, type: 'user/message', data: createUserMessage({ content: [{ type: 'text', text }], source }) });
+  const events = [
+    user(0, '我偏好无糖咖啡'),
+    { seq: 1, type: 'assistant/message', data: { message: createAssistantMessage({ content: [{ type: 'text', text: '这是助手背景，不能作为事实来源' }], source: { provider: 'fixture', model: 'source-model' } }) } },
+    user(2, '注入记忆必须排除', { kind: 'plugin:dshx-memory', form: 'recall', entries: [] }),
+    user(3, '摘要必须排除', { kind: 'compact-checkpoint' }),
+    user(4, '密码是 secret123456'),
+    user(5, '🙂'.repeat(9000)),
+    { ...user(6, '图片残余文本'), data: { ...user(6, '图片残余文本').data, content: [{ type: 'text', text: '图片残余文本' }, { type: 'image' }] } },
+    user(7, '我乘坐地铁通勤'),
+  ];
+  const before = JSON.stringify(events);
+  const selected = selectEvents(events, { scope: { kind: 'workspace', workspace } });
+  assert.deepEqual(selected.messages.filter(row => row.role === 'user').map(row => row.id), [0]);
+  assert.equal(selected.next, 5, '容量不足的真实用户消息必须留待处理，不能跳过后推进');
+  assert.ok(selected.messages.some(row => row.role === 'assistant'));
+  assert.ok(selected.tokens <= 8192);
+  assert.deepEqual(new Set(selected.skipped.map(row => row.seq)), new Set([4]));
+  const remaining = selectEvents(events.filter(row => row.seq >= 6));
+  assert.deepEqual(remaining.messages.filter(row => row.role === 'user').map(row => row.id), [7]);
+  assert.deepEqual(remaining.skipped, [{ seq: 6, reason: 'non-text' }]);
+  assert.doesNotMatch(selected.input, /注入记忆|摘要必须|secret123456|图片残余/);
+  assert.equal(JSON.stringify(events), before);
+  assert.equal(selected.messages.find(row => row.id === 0).text, '我偏好无糖咖啡');
+});
+
+test('Android memory local extraction validates whole batches and rejects invented sources scope and facts', async () => {
+  const { selectEvents, validateCandidates } = await import(pathToFileURL(join(core, 'memory-extract.mjs')));
+  const { createUserMessage } = await load('@deepseek-ai/dsh-llm');
+  const event = (seq, text) => ({ seq, type: 'user/message', data: createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } }) });
+  const selection = selectEvents([event(10, '我偏好无糖咖啡'), event(12, '请记住：我乘坐地铁通勤')]);
+  const candidate = { action: 'add', type: 'preference', key: 'coffee', summary: '无糖咖啡', content: '我偏好无糖咖啡', events: [10] };
+  const valid = validateCandidates([candidate], selection)[0];
+  assert.equal(valid.scope, 'user'); assert.deepEqual(valid.events, [10]);
+  const explicit = validateCandidates([{ ...candidate, key: 'commute', summary: '地铁通勤', content: '我乘坐地铁通勤', events: [12] }], selection)[0];
+  assert.equal(explicit.explicit, true); assert.equal(explicit.state, 'pending');
+  for (const invalid of [
+    { ...candidate, events: [999] }, { ...candidate, content: '用户住在月球' },
+    { ...candidate, scope: 'workspace' }, { ...candidate, workspace: '/another-project' },
+    { ...candidate, explicit: true }, { ...candidate, action: 'update', corrects: 'unknown' },
+    { ...candidate, summary: '长'.repeat(161) },
+  ]) assert.throws(() => validateCandidates([candidate, invalid], selection), error => ['MEMORY_SOURCE', 'MEMORY_EXTRACT'].includes(error.code));
+  assert.throws(() => validateCandidates(Array(11).fill(candidate), selection), { code: 'MEMORY_EXTRACT' });
+  assert.throws(() => validateCandidates([candidate, candidate], selection), { code: 'MEMORY_EXTRACT' });
+});
+
+test('Android memory local extraction uses the source route without tools and rejects truncated malformed or tool output', async () => {
+  const { extract } = await import(pathToFileURL(join(core, 'memory-extract.mjs')));
+  const { createUserMessage } = await load('@deepseek-ai/dsh-llm');
+  const events = [
+    { seq: 0, type: 'request/header', data: { header: { config: { provider: 'fixture', model: 'source-model' } } } },
+    { seq: 1, type: 'user/message', data: createUserMessage({ content: [{ type: 'text', text: '我偏好无糖咖啡' }], source: { kind: 'user' } }) },
+  ];
+  const candidate = { action: 'add', type: 'preference', key: 'coffee', summary: '无糖咖啡', content: '我偏好无糖咖啡', events: [1] };
+  const cases = [
+    { label: 'valid', text: JSON.stringify([candidate]), finish: 'stop' },
+    { label: 'truncated', text: JSON.stringify([candidate]), finish: 'max-tokens' },
+    { label: 'malformed', text: '[{broken', finish: 'stop' },
+    { label: 'missing finish', text: JSON.stringify([candidate]) },
+    { label: 'invented source', text: JSON.stringify([{ ...candidate, events: [999] }]), finish: 'stop' },
+    { label: 'tool output', tool: true, finish: 'stop' },
+  ];
+  for (const scenario of cases) {
+    let calls = 0;
+    const ctx = { llm: { async prepareCall(config, signal, refine) {
+      calls++; assert.equal(config.provider, 'fixture'); assert.equal(config.model, 'source-model');
+      const controls = refine(config, { provider: 'fixture', id: 'source-model', context: { contextWindow: 16384 }, defaultMaxTokens: 2048 });
+      return { config: controls, async *stream(options) {
+        assert.equal(options.sessionId, 'extraction-session'); assert.equal(options.purpose, 'memory-extraction');
+        assert.deepEqual(options.tools, []); assert.equal(options.messages[0].source.kind, 'plugin:dshx-memory');
+        assert.equal(options.provider, 'fixture'); assert.equal(options.model, 'source-model');
+        assert.ok(options.maxTokens <= 2048); assert.equal(options.signal.aborted, false);
+        if (scenario.tool) yield { type: 'tool-call-delta', index: 0, id: 'forbidden', name: 'write', argumentsDelta: '{}' };
+        else yield { type: 'text-delta', index: 0, text: scenario.text };
+        if (scenario.finish) yield { type: 'finish', reason: { kind: scenario.finish } };
+      } };
+    } } };
+    const request = { session: 'extraction-session', events, provider: 'fixture', model: 'source-model' };
+    if (scenario.label === 'valid') assert.equal((await extract(ctx, request))[0].content, candidate.content);
+    else await assert.rejects(extract(ctx, request), error => ['MEMORY_EXTRACT', 'MEMORY_SOURCE'].includes(error.code), scenario.label);
+    assert.equal(calls, 1);
+    await assert.rejects(extract(ctx, { ...request, provider: 'other-cloud' }), { code: 'MEMORY_MODEL' });
+    assert.equal(calls, 1, 'a mismatched route cannot resolve or contact another model');
+  }
+  const aborted = new AbortController(); aborted.abort();
+  await assert.rejects(extract({ llm: { prepareCall() { assert.fail('aborted extraction reached a model'); } } }, {
+    session: 'extraction-session', events, provider: 'fixture', model: 'source-model', signal: aborted.signal,
+  }), { code: 'MEMORY_EXTRACT' });
+});
+
+test('Android memory local concurrent settings keep the newest generation barrier until its own save succeeds', async t => {
+  const f = await localMemoryFixture(t); await f.start(); await f.settings(true);
+  const change = f.store.change.bind(f.store), gates = [Promise.withResolvers(), Promise.withResolvers()];
+  let calls = 0;
+  f.store.change = (...args) => { const gate = gates[calls++]; return gate.promise.then(() => change(...args)); };
+  const revision = f.store.read().revision;
+  const first = f.memory.call('settings', { enabled: true, autoSave: false, revision });
+  const second = f.memory.call('settings', { enabled: false, autoSave: false, revision });
+  second.catch(() => {});
+  try {
+    await localMemoryWait(() => calls === 2, 'concurrent settings did not raise both barriers');
+    assert.equal(f.memory.active(), false);
+    gates[0].resolve(); await first;
+    assert.equal(f.store.read().settings.enabled, true);
+    assert.equal(f.memory.active(), false, 'the older successful write cannot lift the newer pending barrier');
+    assert.throws(() => f.memory.search('咖啡', workspace), { code: 'MEMORY_NOT_READY' });
+    gates[1].resolve();
+    await assert.rejects(second, { code: 'MEMORY_CONFLICT' });
+    assert.equal(f.memory.active(), false, 'failed newest settings stay paused instead of reviving old intent');
+    assert.match((await f.memory.call('status')).message, /暂停/);
+    f.store.change = change;
+    await f.settings(true);
+    assert.equal(f.memory.active(), true);
+  } finally { for (const gate of gates) gate.resolve(); f.store.change = change; await Promise.allSettled([first, second]); }
+});
+
+test('Android memory local topic edits reject collisions and preserve deletion sources after editing or confirmation', async t => {
+  const f = await localMemoryFixture(t);
+  await f.store.save(f.data('coffee', { summary: '咖啡偏好' }));
+  await f.store.save(f.data('commute', { summary: '地铁通勤' }));
+  const snapshot = f.store.read(), first = snapshot.entries.find(row => row.key === 'coffee');
+  const disk = await readFile(join(f.dir, 'memory', 'state.json'), 'utf8');
+  await assert.rejects(f.store.save(f.data('commute', { id: first.id, summary: '覆盖另一个主题', revision: snapshot.revision })), { code: 'MEMORY_CONFLICT' });
+  assert.deepEqual(f.store.read(), snapshot);
+  assert.equal(await readFile(join(f.dir, 'memory', 'state.json'), 'utf8'), disk);
+  const invalid = structuredClone(snapshot);
+  invalid.entries[1].key = first.key;
+  assert.throws(() => f.checkMemory(invalid), { code: 'MEMORY_READ' });
+  const ref = { session: 'original-source', events: [1, 2] };
+  for (const mode of ['manual-id', 'manual-upsert', 'auto-upsert']) {
+    const key = `sources-${mode}`;
+    await f.store.save(f.data(key));
+    await f.store.change(next => {
+      next.entries.find(row => row.key === key).source = mode === 'auto-upsert'
+        ? { kind: 'auto', session: 'primary-source', events: [3], refs: [ref] }
+        : { kind: 'manual', refs: [ref] };
+    });
+    const before = f.store.read().entries.find(row => row.key === key);
+    await f.store.save(f.data(key, { ...(mode === 'manual-id' ? { id: before.id } : {}), content: '用户修改后的正文' }));
+    const saved = f.store.read().entries.find(row => row.key === key);
+    assert.deepEqual(saved.source.refs, [ref], `${mode} keeps merged history`);
+    if (mode === 'auto-upsert') assert.equal(saved.source.confirmed, true);
+    await f.store.remove({ id: saved.id });
+    assert.ok(f.store.read().blocked.at(-1).sources.some(row => row.session === ref.session));
+  }
+  await f.store.save(f.data('confirm-sources'));
+  await f.store.change(next => {
+    const active = next.entries.find(row => row.key === 'confirm-sources');
+    active.source = { kind: 'auto', session: 'active-source', events: [7], refs: [ref] };
+    next.entries.push({ ...active, id: 'pending-source', state: 'pending', locked: false,
+      source: { kind: 'auto', session: 'candidate-source', events: [8] }, content: '候选正文' });
+  });
+  await f.store.save(f.data('confirm-sources', { id: 'pending-source', content: '用户确认后的正文' }));
+  assert.equal(f.store.read().entries.filter(row => row.key === 'confirm-sources').length, 1);
+  await f.store.remove({ id: 'pending-source' });
+  assert.deepEqual(f.store.read().blocked.at(-1).sources.map(row => row.session).sort(),
+    ['active-source', 'candidate-source', 'original-source']);
+});
+
+test('Android memory local effective working directory controls injection and resets automatic collection after a change', async t => {
+  const f = await localMemoryFixture(t); await f.start(); await f.settings(true, true);
+  const other = join(workspace, 'new-workspace');
+  await f.store.save(f.data('original', { summary: '咖啡原工作区', scope: { kind: 'workspace', workspace } }));
+  await f.store.save(f.data('current', { summary: '咖啡当前工作区', scope: { kind: 'workspace', workspace: other } }));
+  const agent = f.session('working-directory');
+  const first = await f.before(agent); f.commit(agent, first.result);
+  assert.equal(first.result.messages[0].source.entries[0].id, f.store.read().entries.find(row => row.key === 'original').id);
+  const event = agent.session.append('working-directory/change', { cwd: other });
+  await f.store.queue;
+  const cursor = f.store.read().cursors[agent.session.id];
+  assert.equal(cursor.workspace, other);
+  assert.equal(cursor.start, event.seq + 1); assert.equal(cursor.next, event.seq + 1);
+  assert.equal(agent.session.header.cwd, workspace, 'the immutable original header must remain different');
+  assert.equal(f.ctx.workingDirectory.get(agent.session), other);
+  const current = await f.before(agent);
+  const recall = current.result.messages[0];
+  assert.equal(recall.source.reset, true);
+  assert.ok(recall.source.entries.every(row => row.scope.workspace === other));
+  assert.match(recall.content[0].text, /咖啡当前工作区/);
+  assert.doesNotMatch(recall.content[0].text, /咖啡原工作区/);
+});
+
+test('Android memory local recovery creates per-turn jobs from completed source routes without sending a model request', async t => {
+  const f = await localMemoryFixture(t);
+  const { createUserMessage } = await load('@deepseek-ai/dsh-llm');
+  const user = text => createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } });
+  const id = 'recover-root';
+  const events = [
+    { seq: 0, type: 'request/header', data: { header: { config: { provider: 'route-a', model: 'a' } } } },
+    { seq: 1, type: 'user/message', data: user('咖啡偏好') },
+    { seq: 2, type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },
+    { seq: 3, type: 'request/header', data: { header: { config: { provider: 'route-b', model: 'b' } } } },
+    { seq: 4, type: 'user/message', data: user('地铁通勤') },
+    { seq: 5, type: 'turn/end', data: { turn: 2, reason: { kind: 'completed' } } },
+    { seq: 6, type: 'request/header', data: { header: { config: { provider: 'incomplete-cloud', model: 'never-use' } } } },
+    { seq: 7, type: 'user/message', data: user('尚未完成的轮次') },
+  ];
+  await f.store.change(next => {
+    next.settings = { enabled: true, autoSave: true }; next.epoch = 3;
+    next.cursors[id] = { epoch: 3, start: 0, next: 0, workspace };
+  });
+  let modelCalls = 0;
+  let providers = [{ id: 'route-a', name: 'route-a' }];
+  const ctx = {
+    on() { return () => {}; }, workingDirectory: { get: session => session.header.cwd },
+    llm: { listProviders: () => providers },
+    sessions: { flush() { assert.fail('recovery reads existing checkpoints instead of flushing a detached session'); } },
+    sessionPersistence: { async open(actual, mode) {
+      assert.equal(actual, id); assert.equal(mode, 'read');
+      return { async read(from = 0, count = events.length - from) { return { events: events.slice(from, from + count) }; }, async close() {} };
+    } },
+  };
+  f.memory = f.memorySession(ctx, { store: f.store, extract: async () => { modelCalls++; return []; } });
+  await f.memory.ready;
+  const jobs = f.store.read().jobs;
+  assert.deepEqual(jobs.map(row => [row.from, row.to, row.route.provider, row.route.model]), [[0, 3, 'route-a', 'a'], [3, 6, 'route-b', 'b']]);
+  assert.ok(jobs.every(row => row.attempts === 0 && row.state === 'waiting'));
+  assert.equal(f.store.read().cursors[id].next, 0, 'registering a job is not successful extraction');
+  assert.equal(modelCalls, 0);
+  const available = await f.memory.call('status');
+  assert.equal(available.autoReady, true);
+  assert.deepEqual(available.jobs.map(row => row.modelReady), [true, false], 'availability follows each job source provider id');
+  const waiting = f.store.read();
+  await assert.rejects(f.memory.call('retry', { id: jobs[1].id }), { code: 'MEMORY_MODEL' });
+  assert.deepEqual(f.store.read(), waiting, 'missing source provider must not consume a retry or revision');
+  providers = [];
+  const unavailable = await f.memory.call('status');
+  assert.equal(unavailable.autoReady, false);
+  assert.ok(unavailable.jobs.every(row => row.modelReady === false));
+  await assert.rejects(f.memory.call('retry', { id: jobs[0].id }), { code: 'MEMORY_MODEL' });
+  const task = user('继续整理');
+  const session = { id, seq: events.length, header: { cwd: workspace }, snapshotEvents: () => events,
+    requestHeader: () => ({ config: { provider: 'route-a', model: 'a' } }) };
+  await f.memory.before({ agent: { session }, messages: [], signal: new AbortController().signal }, async () => ({ kind: 'enter', messages: [task] }));
+  await new Promise(resolve => setImmediate(resolve));
+  await f.store.queue;
+  assert.deepEqual(f.store.read().jobs, waiting.jobs, 'automatic draining pauses unavailable source jobs without consuming attempts');
+  assert.equal(modelCalls, 0);
+});
+
+test('Android memory local host cancels one pending management request and preserves the other reply', async () => {
+  const host = new PolicyHost(), frames = [], releases = new Map(), signals = new Map();
+  host.socket = { write: value => frames.push(JSON.parse(value)), destroy() {} };
+  host.connected = true;
+  host.memory = async (_action, data, signal) => {
+    const release = Promise.withResolvers(); releases.set(data.id, release); signals.set(data.id, signal);
+    return release.promise;
+  };
+  try {
+    host.receive({ memory: 'first', action: 'save', data: { id: 'first' } });
+    host.receive({ memory: 'second', action: 'save', data: { id: 'second' } });
+    await localMemoryWait(() => releases.size === 2, 'management requests did not start');
+    assert.throws(() => host.receive({ memory: 'first', action: 'status' }), /重复/);
+    assert.throws(() => host.receive({ memory: 'cancel-invalid', action: 'cancel', data: { id: '../bad' } }), /取消请求无效/);
+    host.receive({ memory: 'cancel-first', action: 'cancel', data: { id: 'first' } });
+    assert.equal(signals.get('first').aborted, true); assert.equal(signals.get('second').aborted, false);
+    releases.get('first').resolve({ late: true }); releases.get('second').resolve({ saved: true });
+    await localMemoryWait(() => frames.length === 1 && host.memoryCalls.size === 0, 'uncancelled reply or request cleanup missing');
+    assert.deepEqual(frames, [{ memory: 'second', ok: true, result: { saved: true } }]);
+  } finally { for (const release of releases.values()) release.resolve({}); host.close(); }
+});
+
+// 知识库测试只追加在本文件末尾；运行时使用摘要核对后的独立运行包。
+async function localKnowledgeModules() {
+  return {
+    ...await import(pathToFileURL(join(core, 'knowledge-store.mjs'))),
+    ...await import(pathToFileURL(join(core, 'knowledge-search.mjs'))),
+  };
+}
+
+function localKnowledgeCheckChunks(text, chunks, sourceId, version) {
+  const chars = [...text];
+  assert.ok(chunks.length > 0, '非空资料必须产生分块');
+  const covered = new Set();
+  chunks.forEach((chunk, index) => {
+    assert.equal(chunk.sourceId, sourceId);
+    assert.equal(chunk.sourceVersion, version);
+    assert.equal(chunk.text, chars.slice(chunk.startOffset, chunk.endOffset).join(''), '分块偏移必须按完整 Unicode 字符定位真实正文');
+    assert.ok([...chunk.text].length <= 800, '分块不能突破约定的 800 码点上限');
+    assert.ok(chunk.startLine >= 1 && chunk.endLine >= chunk.startLine);
+    assert.ok(!chunk.text.includes('\ufffd'), '不得破坏中文或 emoji');
+    if (index) assert.equal(chunk.previous, chunks[index - 1].id);
+    if (index + 1 < chunks.length) assert.equal(chunk.next, chunks[index + 1].id);
+    for (let offset = chunk.startOffset; offset < chunk.endOffset; offset++) covered.add(offset);
+  });
+  for (let index = 0; index < chars.length; index++) {
+    if (chars[index].trim()) assert.ok(covered.has(index), `原文第 ${index} 个非空字符未进入任何分块`);
+  }
+}
+
+test('Android knowledge local chunks preserve Chinese emoji offsets and adjacent references', async () => {
+  const { chunkText } = await localKnowledgeModules();
+  const text = '# 恢复说明\n\n' + '中文🙂恢复步骤🚀必须保留数据库。'.repeat(110);
+  const chunks = chunkText(text, { sourceId: 'unicode-source', version: 3, format: 'md' });
+  localKnowledgeCheckChunks(text, chunks, 'unicode-source', 3);
+  assert.ok(chunks.length >= 3);
+});
+
+test('Android knowledge local chunks retain Markdown tables fenced code and long lines without omissions', async () => {
+  const { chunkText } = await localKnowledgeModules();
+  const text = '# 部署\n\n## 数据库\n\n| 文件 | 保留 |\n| --- | --- |\n' + '| 数据🙂 | 必须 |\n'.repeat(90) +
+    '\n```sh\n' + 'printf 数据恢复🙂\n'.repeat(90) + '```\n\n' + '连续长行🚀'.repeat(300);
+  const chunks = chunkText(text, { sourceId: 'markdown-source', version: 1, format: 'md' });
+  localKnowledgeCheckChunks(text, chunks, 'markdown-source', 1);
+  assert.ok(chunks.some(chunk => chunk.heading.includes('数据库')));
+});
+
+test('Android knowledge local chunks use repeatable IDs and distinguish source versions', async () => {
+  const { chunkText } = await localKnowledgeModules();
+  const text = '保持资料稳定。'.repeat(250);
+  const options = { sourceId: 'stable-source', version: 1, format: 'txt' };
+  const before = chunkText(text, options);
+  assert.deepEqual(chunkText(text, options), before);
+  const after = chunkText(text, { ...options, version: 2 });
+  assert.ok(after.every(chunk => chunk.sourceVersion === 2));
+  assert.equal(new Set(before.map(chunk => chunk.id)).size, before.length);
+});
+
+function localKnowledgeRows(texts) {
+  return texts.map((text, index) => ({ id: `chunk-${index}`, sourceId: `source-${index}`, sourceVersion: 1,
+    kind: 'document', title: `资料 ${index}`, heading: [], text, startOffset: 0, endOffset: [...text].length, startLine: 1, endLine: 1 }));
+}
+
+test('Android knowledge local keyword search finds Chinese phrases and rejects unrelated queries', async () => {
+  const { keywordSearch } = await localKnowledgeModules();
+  const rows = localKnowledgeRows(['恢复数据库时必须保留数据目录和备份文件。', '每天骑车通勤。', '升级失败先停止服务，再恢复数据库。']);
+  const found = keywordSearch(rows, '恢复数据库', { limit: 10 });
+  assert.deepEqual(new Set(found.map(item => item.row.sourceId)), new Set(['source-0', 'source-2']));
+  assert.deepEqual(keywordSearch(rows, '火星探测器', { limit: 10 }), []);
+});
+
+test('Android knowledge local keyword search preserves exact error codes model names and version tokens', async () => {
+  const { keywordSearch } = await localKnowledgeModules();
+  const rows = localKnowledgeRows(['Intel BE213 遇到 E_CONN_RESET，版本 v0.2.1-rc.2。', 'Intel BE200 网络正常。', '使用 Go 编写后端。']);
+  for (const query of ['BE213', 'E_CONN_RESET', 'v0.2.1-rc.2']) {
+    assert.equal(keywordSearch(rows, query, { limit: 10 })[0].row.sourceId, 'source-0');
+  }
+  assert.equal(keywordSearch(rows, 'ＧＯ', { limit: 10 })[0].row.sourceId, 'source-2');
+  assert.deepEqual(keywordSearch(rows, 'goal', { limit: 10 }), []);
+});
+
+test('Android knowledge local keyword search respects limits without mutating source rows', async () => {
+  const { keywordSearch } = await localKnowledgeModules();
+  const rows = localKnowledgeRows(Array.from({ length: 30 }, (_, i) => `数据库恢复资料 ${i}`));
+  const before = structuredClone(rows);
+  assert.equal(keywordSearch(rows, '数据库恢复', { limit: 4 }).length, 4);
+  assert.deepEqual(rows, before);
+});
+
+async function localKnowledgeFixture(t, options = {}) {
+  const f = await localMemoryFixture(t, { open: false });
+  Object.assign(f, await localKnowledgeModules());
+  f.root = join(f.dir, 'knowledge');
+  f.instance = 'knowledge-test-instance';
+  f.workspaces = [workspace, join(workspace, 'other')];
+  f.operation = (data = {}) => ({ operationId: globalThis.crypto.randomUUID(), createdAt: Date.now(), ...data });
+  f.manage = (action, data = {}, extra = {}) => f.store.manage(action, data, { instance: f.instance, workspaces: f.workspaces, ...extra });
+  f.start = async (sessionOptions = {}) => {
+    const { knowledgeSession } = await import(pathToFileURL(join(core, 'knowledge.mjs')));
+    f.knowledge = knowledgeSession(f.ctx, { store: f.store, capacity: 100000, memory: { view: () => ({ enabled: false, revision: 0, entries: [] }) }, ...sessionOptions });
+    await f.knowledge.ready;
+    return f.knowledge;
+  };
+  f.agent = async (cwd = workspace) => {
+    const { createUserMessage } = await load('@deepseek-ai/dsh-llm');
+    const session = f.ctx.sessions.create(globalThis.crypto.randomUUID(), { meta: { cwd } });
+    const agent = { id: globalThis.crypto.randomUUID(), session };
+    f.agents.push(agent);
+    session.append('user/message', createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: '查阅本机知识资料' }] }), { surfaceOp: 'append' });
+    return agent;
+  };
+  f.agents = [];
+  f.ctx.agents = { list: () => f.agents };
+  f.execute = (agent, name, data = {}, signal = new AbortController().signal) => f.knowledge.execute(name, data, { agent, signal });
+  t.after(async () => { await f.knowledge?.close(); });
+  f.store = await f.openKnowledge(f.ctx, { root: f.root, ...options });
+  await f.store.ready;
+  f.collection = async (title = '测试集合', extra = {}) => {
+    const result = await f.manage('collection', f.operation({ type: 'create', title, scope: { kind: 'user' }, ...extra }));
+    await f.store.idle();
+    return result.collection ?? f.store.read().collections.find(row => row.title === title);
+  };
+  f.import = async (text = '数据库恢复必须保留数据目录。', extra = {}) => {
+    const collectionId = extra.collectionId ?? (await f.collection()).id;
+    const result = await f.manage('import', f.operation({ text, title: '恢复手册', format: 'txt', ...extra, collectionId }));
+    await f.store.idle();
+    const status = result.job ? await f.manage('status', { operationId: result.operation.operationId }) : result;
+    if (status.job) assert.equal(status.job.state, 'succeeded', JSON.stringify(status.job));
+    const source = f.store.read().sources.find(row => row.id === (status.source?.id ?? result.source?.id));
+    assert.ok(source, '导入成功必须有正式来源记录');
+    return source;
+  };
+  f.enable = () => f.manage('settings', f.operation({ expectedRevision: f.store.read().settingsRevision, settings: { enabled: true } }));
+  return f;
+}
+
+test('Android knowledge local imports BOM UTF8 preserves original bytes and normalizes reference text', async t => {
+  const f = await localKnowledgeFixture(t);
+  const original = '\ufeff# 恢复🙂\r\n\r\n保留数据库🚀\r\n下一行';
+  const source = await f.import(original, { format: 'md' });
+  assert.equal(source.bytes, Buffer.byteLength(original));
+  assert.equal(source.hash, createHash('sha256').update(original).digest('hex'));
+  assert.equal(await f.store.sourceText(source), '# 恢复🙂\n\n保留数据库🚀\n下一行');
+  assert.equal((await f.store.sourceOriginal(source)).toString('utf8'), original);
+  localKnowledgeCheckChunks(await f.store.sourceText(source), await f.store.sourceChunks(source), source.id, source.version);
+});
+
+test('Android knowledge local rejects empty unsupported and oversized input without publishing sources', async t => {
+  const f = await localKnowledgeFixture(t);
+  const collection = await f.collection();
+  for (const payload of [{ text: '' }, { text: ' \n\t' }, { text: '正文', format: 'pdf' }, { text: '中'.repeat(700000) }]) {
+    await assert.rejects(f.manage('import', f.operation({ title: '无效资料', format: 'txt', collectionId: collection.id, ...payload })),
+      error => ['KNOWLEDGE_INPUT', 'KNOWLEDGE_LIMIT'].includes(error.code));
+    await f.store.idle();
+    assert.equal(f.store.read().sources.filter(row => row.state !== 'deleted').length, 0);
+  }
+});
+
+test('Android knowledge local concurrent duplicate imports publish exactly one source', async t => {
+  const f = await localKnowledgeFixture(t);
+  const collection = await f.collection();
+  const data = { text: '相同资料🙂保留数据目录', title: '并发资料', format: 'txt', collectionId: collection.id };
+  await Promise.all(Array.from({ length: 6 }, () => f.manage('import', f.operation(data))));
+  await f.store.idle();
+  const sources = f.store.read().sources.filter(row => row.state !== 'deleted');
+  assert.equal(sources.length, 1);
+  assert.equal(await f.store.sourceText(sources[0]), data.text);
+});
+
+test('Android knowledge local repeated operation returns one durable effect and rejects changed parameters', async t => {
+  const f = await localKnowledgeFixture(t);
+  const collection = await f.collection();
+  const data = f.operation({ text: '操作重试不重复发布', title: '重试资料', format: 'txt', collectionId: collection.id });
+  const [first, second] = await Promise.all([f.manage('import', data), f.manage('import', data)]);
+  await f.store.idle();
+  assert.equal(first.job?.id ?? first.source?.id, second.job?.id ?? second.source?.id);
+  assert.equal(f.store.read().sources.filter(row => row.state !== 'deleted').length, 1);
+  await assert.rejects(f.manage('import', { ...data, text: '同编号不同资料' }), { code: 'KNOWLEDGE_CONFLICT' });
+  assert.equal(f.store.read().sources.filter(row => row.state !== 'deleted').length, 1);
+});
+
+test('Android knowledge local rejects expired operation beyond 24 hours and preserves existing documents', async t => {
+  const f = await localKnowledgeFixture(t);
+  const source = await f.import();
+  const before = f.store.read();
+  await assert.rejects(f.manage('remove', f.operation({ sourceId: source.id, expectedRevision: source.revision,
+    createdAt: Date.now() - 24 * 60 * 60 * 1000 - 1000 })), { code: 'KNOWLEDGE_OPERATION_EXPIRED' });
+  assert.deepEqual(f.store.read(), before);
+  assert.equal(await f.store.sourceText(source), '数据库恢复必须保留数据目录。');
+});
+
+test('Android knowledge local edits metadata once and rejects stale source revisions', async t => {
+  const f = await localKnowledgeFixture(t);
+  const source = await f.import();
+  await f.manage('update', f.operation({ sourceId: source.id, expectedRevision: source.revision, patch: { title: '新标题', note: '重要资料' } }));
+  await f.store.idle();
+  const updated = f.store.read().sources.find(row => row.id === source.id);
+  assert.equal(updated.title, '新标题'); assert.equal(updated.note, '重要资料');
+  assert.equal(updated.version, source.version); assert.ok(updated.revision > source.revision);
+  await assert.rejects(f.manage('update', f.operation({ sourceId: source.id, expectedRevision: source.revision, patch: { title: '过期覆盖' } })), { code: 'KNOWLEDGE_CONFLICT' });
+  assert.equal(f.store.read().sources.find(row => row.id === source.id).title, '新标题');
+});
+
+test('Android knowledge local body replacement publishes a new version while invalid replacement retains old text', async t => {
+  const f = await localKnowledgeFixture(t);
+  const source = await f.import('旧版必须保留文件');
+  await assert.rejects(f.manage('update', f.operation({ sourceId: source.id, expectedRevision: source.revision, patch: { text: '' } })), { code: 'KNOWLEDGE_INPUT' });
+  assert.equal(await f.store.sourceText(f.store.read().sources.find(row => row.id === source.id)), '旧版必须保留文件');
+  await f.manage('update', f.operation({ sourceId: source.id, expectedRevision: source.revision, patch: { text: '新版应保留数据库🙂' } }));
+  await f.store.idle();
+  const updated = f.store.read().sources.find(row => row.id === source.id);
+  assert.ok(updated.version > source.version); assert.ok(updated.revision > source.revision);
+  assert.equal(await f.store.sourceText(updated), '新版应保留数据库🙂');
+});
+
+test('Android knowledge local collection tree rejects cycles excessive depth and nonempty removal', async t => {
+  const f = await localKnowledgeFixture(t);
+  const root = await f.collection('根集合');
+  const child = await f.collection('子集合', { parentId: root.id });
+  const leaf = await f.collection('末级集合', { parentId: child.id });
+  await assert.rejects(f.collection('第四层', { parentId: leaf.id }), error => ['KNOWLEDGE_INPUT', 'KNOWLEDGE_LIMIT'].includes(error.code));
+  await assert.rejects(f.manage('collection', f.operation({ type: 'update', id: root.id, expectedRevision: root.revision, parentId: child.id })), error => ['KNOWLEDGE_INPUT', 'KNOWLEDGE_CONFLICT'].includes(error.code));
+  await assert.rejects(f.manage('collection', f.operation({ type: 'remove', id: root.id, expectedRevision: f.store.read().collections.find(row => row.id === root.id).revision })), error => ['KNOWLEDGE_INPUT', 'KNOWLEDGE_CONFLICT', 'KNOWLEDGE_BUSY'].includes(error.code));
+  assert.equal(f.store.read().collections.length, 3);
+});
+
+test('Android knowledge local disabled knowledge still permits management reading and exporting', async t => {
+  const f = await localKnowledgeFixture(t);
+  const source = await f.import('关闭工具仍保留用户资料');
+  assert.equal(f.store.read().enabled, false);
+  assert.equal((await f.manage('read', { sourceId: source.id })).text, '关闭工具仍保留用户资料');
+  assert.ok((await f.manage('list')).sources.some(row => row.id === source.id));
+  assert.ok((await localKnowledgeExport(f)).bytes.length > 0);
+  await f.start();
+  const agent = await f.agent();
+  await assert.rejects(f.execute(agent, 'knowledge_search', { query: '资料' }), { code: 'KNOWLEDGE_NOT_READY' });
+});
+
+test('Android knowledge local cancelled request cannot publish or delete source data', async t => {
+  const f = await localKnowledgeFixture(t);
+  const source = await f.import();
+  const controller = new AbortController(); controller.abort();
+  const before = f.store.read();
+  await assert.rejects(f.manage('remove', f.operation({ sourceId: source.id, expectedRevision: source.revision }), { signal: controller.signal }),
+    error => error.name === 'AbortError' || error.code === 'KNOWLEDGE_CANCELLED');
+  await f.store.idle();
+  assert.deepEqual(f.store.read(), before);
+  assert.equal(await f.store.sourceText(source), '数据库恢复必须保留数据目录。');
+});
+
+for (const corrupt of ['{broken', JSON.stringify({ unit: { name: 'knowledge', version: 1 }, global: { schemaVersion: 99 }, tables: {} })]) {
+  test(`Android knowledge local preserves corrupt catalog ${corrupt.startsWith('{broken') ? 'JSON' : 'schema'} on failed reopen`, async t => {
+    const f = await localMemoryFixture(t, { open: false });
+    const { openKnowledge } = await localKnowledgeModules();
+    const target = join(f.dir, 'knowledge', 'state.json');
+    await mkdir(join(f.dir, 'knowledge'), { recursive: true });
+    await writeFile(target, corrupt);
+    await assert.rejects(openKnowledge(f.ctx, { root: join(f.dir, 'knowledge') }));
+    assert.equal(await readFile(target, 'utf8'), corrupt);
+  });
+}
+
+test('Android knowledge local tools require a registered real agent and a user request', async t => {
+  const f = await localKnowledgeFixture(t); await f.enable(); await f.start();
+  const agent = await f.agent();
+  await assert.rejects(f.execute({ ...agent, id: 'unregistered' }, 'knowledge_search', { query: '资料' }), { code: 'KNOWLEDGE_NOT_READY' });
+  const session = f.ctx.sessions.create(globalThis.crypto.randomUUID(), { meta: { cwd: workspace } });
+  const empty = { id: 'empty', session }; f.agents.push(empty);
+  await assert.rejects(f.execute(empty, 'knowledge_search', { query: '资料' }), { code: 'KNOWLEDGE_NOT_READY' });
+  assert.deepEqual((await f.execute(agent, 'knowledge_search', { query: '不存在的资料' })).results, []);
+});
+
+test('Android knowledge local filters workspace sources before limiting search candidates', async t => {
+  const f = await localKnowledgeFixture(t);
+  const elsewhere = await f.collection('其他工作区', { scope: { kind: 'workspace', workspace: f.workspaces[1] } });
+  for (let i = 0; i < 24; i++) await f.import(`恢复数据库：另一个项目的重要资料 ${i}`, { title: `恢复数据库 ${i}`, collectionId: elsewhere.id });
+  const here = await f.collection('当前工作区', { scope: { kind: 'workspace', workspace } });
+  const source = await f.import('当前项目恢复数据库需要保留目录', { collectionId: here.id });
+  await f.enable(); await f.start();
+  const result = await f.execute(await f.agent(), 'knowledge_search', { query: '恢复数据库', limit: 1 });
+  assert.equal(result.results.length, 1); assert.equal(result.results[0].sourceId, source.id);
+  assert.equal(result.coverage.eligible, source.chunkCount);
+});
+
+test('Android knowledge local old refs reject body changes while new refs read the new text', async t => {
+  const f = await localKnowledgeFixture(t);
+  const source = await f.import('旧词条数据库保留'); await f.enable(); await f.start();
+  const agent = await f.agent();
+  const old = (await f.execute(agent, 'knowledge_search', { query: '旧词条' })).results[0];
+  assert.ok(old.ref);
+  await f.manage('update', f.operation({ sourceId: source.id, expectedRevision: source.revision, patch: { text: '新词条数据库备份🙂' } }));
+  await f.store.idle();
+  await assert.rejects(f.execute(agent, 'knowledge_read', { ref: old.ref }), { code: 'KNOWLEDGE_VERSION_CHANGED' });
+  const result = (await f.execute(agent, 'knowledge_search', { query: '新词条' })).results[0];
+  assert.notEqual(result.ref, old.ref);
+  assert.equal((await f.execute(agent, 'knowledge_read', { ref: result.ref })).text, '新词条数据库备份🙂');
+});
+
+test('Android knowledge local deleted refs reject reads and removed text does not return to search', async t => {
+  const f = await localKnowledgeFixture(t);
+  const source = await f.import('待删除的独特知识'); await f.enable(); await f.start();
+  const agent = await f.agent();
+  const old = (await f.execute(agent, 'knowledge_search', { query: '独特知识' })).results[0];
+  await f.manage('remove', f.operation({ sourceId: source.id, expectedRevision: source.revision }));
+  await f.store.idle();
+  await assert.rejects(f.execute(agent, 'knowledge_read', { ref: old.ref }), error => ['KNOWLEDGE_MISSING', 'KNOWLEDGE_VERSION_CHANGED'].includes(error.code));
+  assert.deepEqual((await f.execute(agent, 'knowledge_search', { query: '独特知识' })).results, []);
+  await assert.rejects(f.manage('read', { sourceId: source.id }), { code: 'KNOWLEDGE_MISSING' });
+});
+
+test('Android knowledge local tools reject caller supplied paths scopes and oversized queries', async t => {
+  const f = await localKnowledgeFixture(t); await f.enable(); await f.start();
+  const agent = await f.agent();
+  for (const args of [{ query: '资料', workspace: f.workspaces[1] }, { query: '资料', path: '/etc/passwd' }, { query: '中'.repeat(501) }]) {
+    await assert.rejects(f.execute(agent, 'knowledge_search', args), { code: 'KNOWLEDGE_INPUT' });
+  }
+  const other = await f.agent();
+  await assert.rejects(f.execute(other, 'knowledge_read', { ref: '../../etc/passwd' }), error => ['KNOWLEDGE_INPUT', 'KNOWLEDGE_VERSION_CHANGED', 'KNOWLEDGE_MISSING'].includes(error.code));
+});
+
+test('Android knowledge local reading offsets count whole emoji characters and retain pagination boundaries', async t => {
+  const f = await localKnowledgeFixture(t);
+  const source = await f.import('甲🙂乙🚀丙\n第二行'); await f.enable(); await f.start();
+  const agent = await f.agent();
+  const ref = `kb:document:${source.id}:v${source.version}:text`;
+  const first = await f.execute(agent, 'knowledge_read', { ref, maxChars: 2 });
+  assert.equal(first.text, '甲🙂'); assert.equal(first.nextOffset, 2); assert.equal(first.truncated, true);
+  const second = await f.execute(agent, 'knowledge_read', { ref, offset: first.nextOffset, maxChars: 3 });
+  assert.equal(second.text, '乙🚀丙'); assert.equal(second.nextOffset, 5);
+  const last = await f.execute(agent, 'knowledge_read', { ref, offset: second.nextOffset, maxChars: 20 });
+  assert.equal(last.text, '\n第二行'); assert.equal(last.nextOffset, null); assert.equal(last.truncated, false);
+  assert.equal(first.text + second.text + last.text, '甲🙂乙🚀丙\n第二行');
+});
+
+test('Android knowledge local search cursors bind query session and catalog revision', async t => {
+  const f = await localKnowledgeFixture(t); const collection = await f.collection();
+  for (let i = 0; i < 5; i++) await f.import(`恢复说明 ${i}`, { collectionId: collection.id, title: `恢复说明 ${i}` });
+  await f.enable(); await f.start();
+  const agent = await f.agent(), other = await f.agent();
+  const first = await f.execute(agent, 'knowledge_search', { query: '恢复', limit: 1 });
+  assert.equal(first.hasMore, true); assert.ok(first.cursor);
+  await assert.rejects(f.execute(other, 'knowledge_search', { query: '恢复', limit: 1, cursor: first.cursor }), { code: 'KNOWLEDGE_VERSION_CHANGED' });
+  await assert.rejects(f.execute(agent, 'knowledge_search', { query: '说明', limit: 1, cursor: first.cursor }), { code: 'KNOWLEDGE_VERSION_CHANGED' });
+  await f.import('新增恢复说明', { collectionId: collection.id });
+  await assert.rejects(f.execute(agent, 'knowledge_search', { query: '恢复', limit: 1, cursor: first.cursor }), { code: 'KNOWLEDGE_VERSION_CHANGED' });
+});
+
+test('Android knowledge local per user request search budget survives repeated calls and resets on new user input', async t => {
+  const f = await localKnowledgeFixture(t); await f.enable(); await f.start();
+  const agent = await f.agent();
+  for (let i = 0; i < 3; i++) await f.execute(agent, 'knowledge_search', { query: '资料' });
+  await assert.rejects(f.execute(agent, 'knowledge_search', { query: '资料' }), { code: 'KNOWLEDGE_LIMIT' });
+  const { createUserMessage } = await load('@deepseek-ai/dsh-llm');
+  agent.session.append('user/message', createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: '新的知识问题' }] }), { surfaceOp: 'append' });
+  assert.deepEqual((await f.execute(agent, 'knowledge_search', { query: '资料' })).results, []);
+});
+
+test('Android knowledge local concurrent calls reserve shared request capacity before reading', async t => {
+  const f = await localKnowledgeFixture(t); await f.import('知识库并发预算正文'.repeat(100)); await f.enable();
+  const gate = Promise.withResolvers(); let started = 0;
+  await f.start({ capacity: 900, search: async rows => { started++; await gate.promise; return { mode: 'keyword', results: rows.map(row => ({ row, score: 1 })) }; } });
+  const agent = await f.agent();
+  const first = f.execute(agent, 'knowledge_search', { query: '正文' });
+  await localMemoryWait(() => started === 1, '第一个请求未进入检索');
+  try { await assert.rejects(f.execute(agent, 'knowledge_search', { query: '正文' }), { code: 'KNOWLEDGE_LIMIT' }); }
+  finally { gate.resolve(); }
+  const result = await first;
+  assert.ok(Buffer.byteLength(JSON.stringify(result)) <= 900);
+});
+
+test('Android knowledge local cancels delayed search before returning prepared evidence', async t => {
+  const f = await localKnowledgeFixture(t); await f.import('取消后的证据不返回'); await f.enable();
+  const gate = Promise.withResolvers(); let started = false;
+  await f.start({ search: async rows => { started = true; await gate.promise; return { mode: 'keyword', results: rows.map(row => ({ row, score: 1 })) }; } });
+  const agent = await f.agent(), controller = new AbortController();
+  const result = f.execute(agent, 'knowledge_search', { query: '证据' }, controller.signal);
+  await localMemoryWait(() => started, '延迟检索未开始');
+  controller.abort(); gate.resolve();
+  await assert.rejects(result, error => error.name === 'AbortError' || error.code === 'KNOWLEDGE_CANCELLED');
+});
+
+test('Android knowledge local effective memory filters pending expired and foreign facts without enabling documents', async t => {
+  const f = await localKnowledgeFixture(t);
+  const now = Date.now();
+  const entry = { id: 'valid-fact', summary: '咖啡偏好', content: '用户喜欢无糖咖啡🙂', state: 'active', scope: { kind: 'user' }, updatedAt: now, expiresAt: null, source: { kind: 'manual' } };
+  const entries = [entry, { ...entry, id: 'pending', state: 'pending' }, { ...entry, id: 'expired', expiresAt: now - 1 },
+    { ...entry, id: 'foreign', scope: { kind: 'workspace', workspace: f.workspaces[1] } }];
+  let revision = 1, enabled = true;
+  await f.start({ memory: { view: () => ({ enabled, revision, entries }) } });
+  const agent = await f.agent();
+  const result = await f.execute(agent, 'knowledge_search', { query: '咖啡' });
+  assert.deepEqual(result.results.map(row => row.sourceId), ['valid-fact']);
+  assert.deepEqual(result.disabledKinds, ['document']);
+  const read = await f.execute(agent, 'knowledge_read', { ref: result.results[0].ref });
+  assert.equal(read.text, entry.content); assert.deepEqual(read.source, entry.source);
+  entries[0] = { ...entry, content: '改为饮茶', updatedAt: now + 1 }; revision++;
+  await assert.rejects(f.execute(agent, 'knowledge_read', { ref: result.results[0].ref }), { code: 'KNOWLEDGE_VERSION_CHANGED' });
+  enabled = false; revision++;
+  await assert.rejects(f.execute(agent, 'knowledge_search', { query: '咖啡' }), { code: 'KNOWLEDGE_NOT_READY' });
+});
+
+async function localKnowledgeVectors(rows, changes = {}) {
+  const { vectorKey } = await import(pathToFileURL(join(core, 'knowledge-search.mjs')));
+  const { normalizeEmbedding, embeddingIdentity, embeddingInput } = await import(pathToFileURL(join(core, 'knowledge-model.mjs')));
+  const config = normalizeEmbedding({ enabled: true, configId: 'fixture-vector-config', provider: 'fixture', model: 'embedding-fixture', dimensions: 2, kinds: ['document', 'memory'], ...changes });
+  const vectors = new Map(rows.map((row, index) => [vectorKey(row, config), {
+    modelConfigId: embeddingIdentity(config), inputTemplateVersion: config.inputTemplateVersion,
+    inputTextHash: createHash('sha256').update(embeddingInput(row, config)).digest('hex'),
+    sourceId: row.sourceId, sourceVersion: row.sourceVersion, vector: index ? [0, 1] : [1, 0],
+  }]));
+  return { ...config, vectors, embedQuery: async () => [1, 0] };
+}
+
+test('Android knowledge local hybrid combines complete compatible vectors with keyword candidates', async () => {
+  const { hybridSearch } = await localKnowledgeModules();
+  const rows = localKnowledgeRows(['数据库故障恢复方案', '骑车通勤计划']);
+  const embedding = await localKnowledgeVectors(rows);
+  const result = await hybridSearch(rows, '数据库恢复', { embedding });
+  assert.equal(result.mode, 'hybrid'); assert.deepEqual(result.coverage, { eligible: 2, indexed: 2 });
+  assert.equal(result.results[0].row.id, rows[0].id);
+  assert.deepEqual(new Set(result.results[0].matchedBy), new Set(['keyword', 'semantic']));
+  assert.equal(new Set(result.results.map(hit => hit.row.id)).size, result.results.length);
+});
+
+test('Android knowledge local partial semantic coverage falls back completely without requesting a query vector', async () => {
+  const { hybridSearch } = await localKnowledgeModules();
+  const rows = localKnowledgeRows(['数据库恢复方案', '数据库备份资料']);
+  const embedding = await localKnowledgeVectors(rows); embedding.vectors.delete(embedding.vectors.keys().next().value);
+  embedding.embedQuery = async () => assert.fail('覆盖不完整时不能调用查询嵌入');
+  const result = await hybridSearch(rows, '数据库', { embedding });
+  assert.equal(result.mode, 'keyword'); assert.deepEqual(result.coverage, { eligible: 2, indexed: 1 });
+  assert.ok(result.degradedReason); assert.ok(result.results.every(row => row.matchedBy.join() === 'keyword'));
+  assert.equal(result.results.length, 2);
+});
+
+for (const [name, change] of [
+  ['wrong model', record => { record.modelConfigId = 'another-model'; }],
+  ['stale version', record => { record.sourceVersion++; }],
+  ['wrong text hash', record => { record.inputTextHash = '0'.repeat(64); }],
+  ['nonfinite vector', record => { record.vector = [NaN, Infinity]; }],
+  ['wrong dimensions', record => { record.vector = [1, 0, 0]; }],
+  ['zero vector', record => { record.vector = [0, 0]; }],
+]) {
+  test(`Android knowledge local hybrid rejects ${name} cache and keeps keyword evidence`, async () => {
+    const { hybridSearch } = await localKnowledgeModules();
+    const rows = localKnowledgeRows(['数据库恢复的真实正文']);
+    const embedding = await localKnowledgeVectors(rows); change(embedding.vectors.values().next().value);
+    embedding.embedQuery = async () => assert.fail('不兼容缓存不得触发查询向量');
+    const result = await hybridSearch(rows, '数据库', { embedding });
+    assert.equal(result.mode, 'keyword'); assert.deepEqual(result.coverage, { eligible: 1, indexed: 0 });
+    assert.equal(result.results[0].row.text, rows[0].text);
+  });
+}
+
+test('Android knowledge local query vector failure and invalid results degrade to keyword evidence', async () => {
+  const { hybridSearch } = await localKnowledgeModules();
+  const rows = localKnowledgeRows(['数据库恢复方案']);
+  const embedding = await localKnowledgeVectors(rows);
+  for (const embedQuery of [async () => { throw new Error('服务端敏感响应'); }, async () => [NaN, 1], async () => [1], async () => [0, 0]]) {
+    const result = await hybridSearch(rows, '数据库', { embedding: { ...embedding, embedQuery } });
+    assert.equal(result.mode, 'keyword'); assert.equal(result.coverage.indexed, 1);
+    assert.equal(result.results[0].row.id, rows[0].id);
+    assert.ok(result.degradedReason); assert.doesNotMatch(JSON.stringify(result), /敏感响应/);
+  }
+});
+
+test('Android knowledge local semantic kinds must cover both document and memory before hybrid ranking', async () => {
+  const { hybridSearch } = await localKnowledgeModules();
+  const rows = localKnowledgeRows(['数据库恢复手册', '用户数据库保留偏好']); rows[1].kind = 'memory';
+  const embedding = await localKnowledgeVectors(rows, { kinds: ['document'] });
+  const result = await hybridSearch(rows, '数据库', { embedding });
+  assert.equal(result.mode, 'keyword'); assert.deepEqual(result.coverage, { eligible: 2, indexed: 1 });
+  assert.equal(result.results.length, 2);
+  assert.equal((await hybridSearch([rows[0]], '数据库', { embedding })).mode, 'hybrid');
+});
+
+test('Android knowledge local hybrid honors cancellation before exposing semantic candidates', async () => {
+  const { hybridSearch } = await localKnowledgeModules();
+  const rows = localKnowledgeRows(['数据库恢复']); const controller = new AbortController();
+  const embedding = await localKnowledgeVectors(rows);
+  embedding.embedQuery = async () => { controller.abort(); return [1, 0]; };
+  await assert.rejects(hybridSearch(rows, '数据库', { embedding, signal: controller.signal }), { code: 'KNOWLEDGE_CANCELLED' });
+});
+
+async function localKnowledgeModel(t, fetch, overrides = {}) {
+  const { createModelClient } = await import(pathToFileURL(join(core, 'knowledge-model.mjs')));
+  const events = [], ctx = {
+    llm: { listConfigurableProviders: () => [{ provider: 'fixture', settingsNs: 'fixture', defaultBaseURL: 'https://fixture.invalid/v1' }] },
+    settings: { describe: () => [{ ns: 'fixture', revision: 1, value: { baseURL: 'https://fixture.invalid/v1', apiKeyEnv: 'KNOWLEDGE_TEST_KEY' } }] },
+    credentials: { resolve: async () => ({ value: 'private-knowledge-key' }) },
+  };
+  const client = createModelClient(ctx, { fetch, reportUsage: event => events.push(event), ...overrides });
+  t.after(() => client.close());
+  return { client, events, ctx, config: { enabled: true, configId: 'fixture-protocol-config', provider: 'fixture', model: 'fixture-embedding', dimensions: 2 } };
+}
+
+test('Android knowledge local embedding protocol orders indexed responses and records only actual known usage', async t => {
+  let attempts = 0;
+  const f = await localKnowledgeModel(t, async (url, request) => {
+    attempts++; assert.equal(url, 'https://fixture.invalid/v1/embeddings'); assert.equal(request.redirect, 'error');
+    assert.deepEqual(JSON.parse(request.body).input, ['正文甲', '正文乙']);
+    return Response.json({ model: 'fixture-embedding', data: [{ index: 1, embedding: [0, 2] }, { index: 0, embedding: [3, 0] }], usage: { prompt_tokens: 8 } });
+  });
+  const result = await f.client.embed(['正文甲', '正文乙'], f.config);
+  assert.deepEqual(result.map(row => Array.from(row)), [[1, 0], [0, 1]]); assert.equal(attempts, 1);
+  const finish = f.events.find(row => row.phase === 'finish');
+  assert.equal(finish.outcome, 'success'); assert.equal(finish.usageStatus, 'partial');
+  assert.deepEqual(finish.requestUsage, { inputTokens: 8 });
+  assert.doesNotMatch(JSON.stringify(f.events), /正文甲|正文乙|private-knowledge-key/);
+});
+
+for (const [name, data] of [
+  ['duplicate indices', [{ index: 0, embedding: [1, 0] }, { index: 0, embedding: [0, 1] }]],
+  ['missing response', [{ index: 0, embedding: [1, 0] }]],
+  ['wrong vector dimensions', [{ index: 0, embedding: [1] }, { index: 1, embedding: [0, 1] }]],
+  ['invalid vector values', [{ index: 0, embedding: [null, 0] }, { index: 1, embedding: [0, 1] }]],
+]) {
+  test(`Android knowledge local embedding protocol rejects ${name} without retrying invalid data`, async t => {
+    let attempts = 0;
+    const f = await localKnowledgeModel(t, async () => { attempts++; return Response.json({ data }); });
+    await assert.rejects(f.client.embed(['正文甲', '正文乙'], f.config), { code: 'KNOWLEDGE_MODEL' });
+    assert.equal(attempts, 1);
+    assert.equal(f.events.filter(row => row.phase === 'start').length, 1);
+    assert.equal(f.events.filter(row => row.phase === 'finish' && row.outcome === 'failure').length, 1);
+  });
+}
+
+test('Android knowledge local embedding retries transient failure once and accounts both attempts', async t => {
+  let attempts = 0;
+  const f = await localKnowledgeModel(t, async () => ++attempts === 1 ? new Response('private service detail', { status: 503 })
+    : Response.json({ data: [{ index: 0, embedding: [1, 0] }] }));
+  assert.deepEqual(Array.from((await f.client.embed(['正文'], f.config))[0]), [1, 0]);
+  assert.equal(attempts, 2); assert.equal(f.events.filter(row => row.phase === 'start').length, 2);
+  assert.deepEqual(f.events.filter(row => row.phase === 'finish').map(row => row.outcome), ['failure', 'success']);
+  assert.ok(f.events.every(row => row.usageStatus === 'unknown'));
+  assert.doesNotMatch(JSON.stringify(f.events), /private service detail/);
+});
+
+test('Android knowledge local embedding rejects oversized batches and input before network calls', async t => {
+  const f = await localKnowledgeModel(t, async () => assert.fail('超限请求不能发出网络调用'));
+  await assert.rejects(f.client.embed(Array(17).fill('正文'), f.config), { code: 'KNOWLEDGE_INPUT' });
+  await assert.rejects(f.client.embed(['中'.repeat(3000)], f.config), { code: 'KNOWLEDGE_LIMIT' });
+  assert.equal(f.events.length, 0);
+});
+
+async function localKnowledgeTicket(f, bytes, { format = 'txt', title = '票据资料', operation = f.operation() } = {}) {
+  const ticket = globalThis.crypto.randomUUID();
+  await mkdir(join(f.root, 'inbox', ticket), { recursive: true });
+  await writeFile(join(f.root, 'inbox', ticket, 'input'), bytes);
+  await f.manage('ticket', { ...operation, ticket, bytes: bytes.length, hash: createHash('sha256').update(bytes).digest('hex'), format, title });
+  return { ...operation, ticket };
+}
+
+async function localKnowledgeExport(f, data = {}) {
+  const operation = f.operation(data), result = await f.manage('export', operation);
+  const job = await f.store.wait(result.job.id);
+  assert.equal(job.state, 'succeeded', JSON.stringify(job));
+  const status = await f.manage('status', { operationId: operation.operationId });
+  assert.ok(status.archive?.path);
+  return { ...status, bytes: await readFile(join(f.root, status.archive.path)) };
+}
+
+test('Android knowledge local file ticket imports once and binds instance operation and integrity', async t => {
+  const f = await localKnowledgeFixture(t), collection = await f.collection();
+  const payload = await localKnowledgeTicket(f, Buffer.from('\ufeff中文文件🙂\r\n恢复说明'));
+  await assert.rejects(f.manage('import', { ...payload, collectionId: collection.id }, { instance: 'another-app-instance' }), { code: 'KNOWLEDGE_INPUT' });
+  await assert.rejects(f.manage('import', { ...payload, operationId: globalThis.crypto.randomUUID(), collectionId: collection.id }), { code: 'KNOWLEDGE_INPUT' });
+  const result = await f.manage('import', { ...payload, collectionId: collection.id });
+  assert.equal((await f.store.wait(result.job.id)).state, 'succeeded');
+  const source = f.store.read().sources[0];
+  assert.equal(await f.store.sourceText(source), '中文文件🙂\n恢复说明');
+  const retry = await f.manage('import', { ...payload, collectionId: collection.id });
+  assert.equal(retry.job.id, result.job.id);
+  assert.equal(f.store.read().sources.length, 1);
+});
+
+test('Android knowledge local ticket rejects invalid UTF8 incorrect hash and tampering after registration', async t => {
+  const f = await localKnowledgeFixture(t), collection = await f.collection();
+  await assert.rejects(localKnowledgeTicket(f, Buffer.from([0xc3, 0x28])), { code: 'KNOWLEDGE_INPUT' });
+  const ticket = globalThis.crypto.randomUUID();
+  await mkdir(join(f.root, 'inbox', ticket), { recursive: true });
+  await writeFile(join(f.root, 'inbox', ticket, 'input'), '真实文件');
+  await assert.rejects(f.manage('ticket', f.operation({ ticket, bytes: Buffer.byteLength('真实文件'), hash: '0'.repeat(64), format: 'txt' })), { code: 'KNOWLEDGE_INPUT' });
+  const good = await localKnowledgeTicket(f, Buffer.from('登记时的正文'));
+  await writeFile(join(f.root, 'inbox', good.ticket, 'input'), '被篡改的正文');
+  await assert.rejects(f.manage('import', { ...good, collectionId: collection.id }), { code: 'KNOWLEDGE_INPUT' });
+  assert.equal(f.store.read().sources.length, 0);
+});
+
+test('Android knowledge local ticket rejects path traversal symbolic links and ambiguous text plus file input', async t => {
+  const f = await localKnowledgeFixture(t), collection = await f.collection();
+  await assert.rejects(f.manage('ticket', f.operation({ ticket: '../escape', bytes: 1, hash: '0'.repeat(64), format: 'txt' })), { code: 'KNOWLEDGE_INPUT' });
+  const ticket = globalThis.crypto.randomUUID(), target = join(f.dir, 'outside.txt');
+  await writeFile(target, '外部文件'); await mkdir(join(f.root, 'inbox', ticket));
+  await symlink(target, join(f.root, 'inbox', ticket, 'input'));
+  await assert.rejects(f.manage('ticket', f.operation({ ticket, bytes: Buffer.byteLength('外部文件'), hash: createHash('sha256').update('外部文件').digest('hex'), format: 'txt' })),
+    error => ['KNOWLEDGE_INPUT', 'ELOOP'].includes(error.code));
+  const good = await localKnowledgeTicket(f, Buffer.from('正常资料'));
+  await assert.rejects(f.manage('import', { ...good, text: '有歧义的正文', collectionId: collection.id }), { code: 'KNOWLEDGE_INPUT' });
+  assert.equal(f.store.read().sources.length, 0); assert.equal(await readFile(target, 'utf8'), '外部文件');
+});
+
+test('Android knowledge local durable catalog failure preserves snapshot and leaves write queue usable', async t => {
+  const f = await localKnowledgeFixture(t), before = f.store.read();
+  const save = f.store.domain.global.set.bind(f.store.domain.global);
+  let fail = true;
+  f.store.domain.global.set = async next => { if (fail) throw new Error('private disk failure'); return save(next); };
+  await assert.rejects(f.enable(), { code: 'KNOWLEDGE_WRITE' });
+  assert.deepEqual(f.store.read(), before);
+  fail = false;
+  await f.enable(); assert.equal(f.store.read().enabled, true);
+  assert.equal(JSON.parse(await readFile(join(f.dir, 'knowledge', 'state.json'), 'utf8')).global.enabled, true);
+});
+
+test('Android knowledge local failed replacement publication retains old version and cleans prepared files', async t => {
+  const f = await localKnowledgeFixture(t), source = await f.import('正式旧版正文');
+  const save = f.store.domain.global.set.bind(f.store.domain.global);
+  let rejected = false;
+  f.store.domain.global.set = async next => {
+    if (next.sources.some(row => row.id === source.id && row.version > source.version)) { rejected = true; throw new Error('private publication failure'); }
+    return save(next);
+  };
+  const result = await f.manage('update', f.operation({ sourceId: source.id, expectedRevision: source.revision, patch: { text: '不可发布的新版正文' } }));
+  const job = await f.store.wait(result.job.id);
+  assert.equal(rejected, true); assert.equal(job.state, 'failed'); assert.equal(job.errorCode, 'KNOWLEDGE_WRITE');
+  const current = f.store.read().sources.find(row => row.id === source.id);
+  assert.equal(current.version, source.version); assert.equal(current.revision, source.revision);
+  assert.equal(await f.store.sourceText(current), '正式旧版正文');
+  assert.deepEqual(await readdir(join(f.root, 'sources', source.id)), [String(source.version)]);
+});
+
+test('Android knowledge local successful operation and source remain consistent after reopening durable storage', async t => {
+  const f = await localKnowledgeFixture(t), collection = await f.collection();
+  const operation = f.operation({ text: '跨重启仍可核对的正文🙂', title: '重启资料', format: 'txt', collectionId: collection.id });
+  const accepted = await f.manage('import', operation); await f.store.idle();
+  const before = f.store.read(); await f.store.close();
+  f.store = await f.openKnowledge(f.ctx, { root: f.root }); await f.store.ready;
+  assert.deepEqual(f.store.read(), before);
+  const retry = await f.manage('import', operation);
+  assert.equal(retry.job.id, accepted.job.id); assert.equal(f.store.read().sources.length, 1);
+  assert.equal(await f.store.sourceText(f.store.read().sources[0]), operation.text);
+});
+
+test('Android knowledge local keyword rebuild preserves refs while chunks rebuild invalidates their version', async t => {
+  const f = await localKnowledgeFixture(t), source = await f.import('关键词重建保留原文引用🙂');
+  await f.enable(); await f.start(); const agent = await f.agent();
+  const hit = (await f.execute(agent, 'knowledge_search', { query: '重建' })).results[0];
+  const keyword = await f.manage('rebuild', f.operation({ kind: 'keyword', sourceId: source.id, expectedRevision: source.revision }));
+  assert.equal((await f.store.wait(keyword.job.id)).state, 'succeeded');
+  assert.equal((await f.execute(agent, 'knowledge_read', { ref: hit.ref })).text, '关键词重建保留原文引用🙂');
+  const current = f.store.read().sources.find(row => row.id === source.id);
+  const chunks = await f.manage('rebuild', f.operation({ kind: 'chunks', sourceId: source.id, expectedRevision: current.revision }));
+  assert.equal((await f.store.wait(chunks.job.id)).state, 'succeeded');
+  await assert.rejects(f.execute(agent, 'knowledge_read', { ref: hit.ref }), { code: 'KNOWLEDGE_VERSION_CHANGED' });
+  const newest = f.store.read().sources.find(row => row.id === source.id);
+  assert.ok(newest.version > current.version); assert.equal(await f.store.sourceText(newest), '关键词重建保留原文引用🙂');
+});
+
+test('Android knowledge local export includes verified document files and omits memory secrets and derived indexes', async t => {
+  const f = await localKnowledgeFixture(t); await f.import('导出的资料原文🙂');
+  const exported = await localKnowledgeExport(f);
+  assert.equal(exported.archive.bytes, exported.bytes.length);
+  assert.equal(exported.archive.hash, createHash('sha256').update(exported.bytes).digest('hex'));
+  const { gunzipSync } = await import('node:zlib');
+  const archive = JSON.parse(gunzipSync(exported.bytes));
+  assert.equal(archive.format, 'dshx-knowledge'); assert.equal(archive.version, 1);
+  assert.equal(archive.sources.length, 1); assert.equal(archive.entries.length, 3);
+  assert.doesNotMatch(JSON.stringify(archive), /memory\.json|apiKey|credentials|indexes\//);
+  for (const entry of archive.entries) {
+    const bytes = Buffer.from(entry.data, 'base64');
+    assert.equal(entry.bytes, bytes.length); assert.equal(entry.hash, createHash('sha256').update(bytes).digest('hex'));
+  }
+});
+
+for (const [name, corrupt] of [
+  ['path traversal', archive => { archive.entries[0].path = '../outside'; }],
+  ['absolute path', archive => { archive.entries[0].path = '/tmp/outside'; }],
+  ['wrong hash', archive => { archive.entries[0].hash = '0'.repeat(64); }],
+  ['wrong bytes', archive => { archive.entries[0].bytes++; }],
+  ['duplicate entry', archive => { archive.entries.push(structuredClone(archive.entries[0])); }],
+  ['missing entry', archive => { archive.entries.pop(); }],
+  ['unknown format version', archive => { archive.version = 99; }],
+]) {
+  test(`Android knowledge local restore rejects archive ${name} before changing live sources`, async t => {
+    const f = await localKnowledgeFixture(t); await f.import('当前库必须保留的资料');
+    const exported = await localKnowledgeExport(f), { gunzipSync } = await import('node:zlib');
+    const archive = JSON.parse(gunzipSync(exported.bytes)); corrupt(archive);
+    const before = f.store.read().sources;
+    const payload = await localKnowledgeTicket(f, gzipSync(Buffer.from(JSON.stringify(archive))), { format: 'archive' });
+    const accepted = await f.manage('restore', payload), job = await f.store.wait(accepted.job.id);
+    assert.equal(job.state, 'failed'); assert.equal(job.effect, 'none');
+    assert.ok(['KNOWLEDGE_INPUT', 'KNOWLEDGE_READ'].includes(job.errorCode));
+    assert.deepEqual(f.store.read().sources, before);
+    assert.equal(await f.store.sourceText(before[0]), '当前库必须保留的资料');
+  });
+}
+
+test('Android knowledge local merge restore skips equal content adds same title conflicts and survives retry', async t => {
+  const f = await localKnowledgeFixture(t), first = await f.import('归档中的旧版正文', { title: '同名资料' });
+  const exported = await localKnowledgeExport(f);
+  await f.manage('update', f.operation({ sourceId: first.id, expectedRevision: first.revision, patch: { text: '现有库的新正文' } }));
+  await f.store.idle();
+  const payload = await localKnowledgeTicket(f, exported.bytes, { format: 'archive' });
+  const accepted = await f.manage('restore', payload), job = await f.store.wait(accepted.job.id);
+  assert.equal(job.state, 'succeeded', JSON.stringify(job)); assert.equal(job.effect, 'restored');
+  const status = await f.manage('status', { operationId: payload.operationId });
+  assert.equal(status.restored, 1); assert.equal(status.skipped, 0); assert.deepEqual(status.conflicts, ['同名资料']);
+  const sources = f.store.read().sources.filter(row => row.state === 'active');
+  assert.equal(sources.length, 2); assert.equal(new Set(sources.map(row => row.id)).size, 2);
+  assert.deepEqual(new Set(await Promise.all(sources.map(row => f.store.sourceText(row)))), new Set(['归档中的旧版正文', '现有库的新正文']));
+  assert.equal((await f.manage('restore', payload)).job.id, accepted.job.id);
+  const again = await localKnowledgeTicket(f, exported.bytes, { format: 'archive' });
+  const repeated = await f.manage('restore', again); assert.equal((await f.store.wait(repeated.job.id)).state, 'succeeded');
+  const repeatedStatus = await f.manage('status', { operationId: again.operationId });
+  assert.equal(repeatedStatus.restored, 0); assert.equal(repeatedStatus.skipped, 1);
+  assert.equal(f.store.read().sources.filter(row => row.state === 'active').length, 2);
+  for (const row of f.store.read().sources.filter(row => row.state === 'active')) localKnowledgeCheckChunks(await f.store.sourceText(row), await f.store.sourceChunks(row), row.id, row.version);
+});
+
+test('Android knowledge local real Cordis profile registers three tools with valid schemas and execution', { timeout: 35000 }, async () => {
+  const dir = await mkdtemp(join(directory, 'local-knowledge-profile-'));
+  const yaml = require('js-yaml'), { entryListSchema } = await load('@deepseek-ai/cordis-plugin-include');
+  const patches = yaml.load(await readFile(new URL('./android.patch.yml', import.meta.url), 'utf8'), { schema: entryListSchema });
+  const entries = patches.flatMap(row => row.insert ?? []).filter(row => row.id === 'dshx-android-knowledge');
+  assert.equal(entries.length, 1); assert.equal(entries[0].name, 'file:@CORE@/knowledge.mjs');
+  const run = async () => {
+    const assert = (await import('node:assert/strict')).default;
+    const { createRequire } = await import('node:module'), { pathToFileURL } = await import('node:url');
+    const { join } = await import('node:path'), { mkdirSync, writeFileSync } = await import('node:fs');
+    const core = process.env.DSHX_CORE, dir = process.env.DSHX_KNOWLEDGE_TEST_DIR;
+    const require = createRequire(join(core, 'lib/node_modules/package.json'));
+    const load = name => import(pathToFileURL(require.resolve(name)));
+    const { packageManager } = await import(pathToFileURL(join(core, 'plugins.mjs')));
+    const { runProfile } = await load('@deepseek-ai/dsh/profile-boot');
+    const { loadProfileDirectory } = await load('@deepseek-ai/dsh-app-boot');
+    const { createLaunchEnvironmentSnapshot } = await load('@deepseek-ai/dsh-launch-environment');
+    const profile = join(dir, 'profile'); mkdirSync(profile);
+    const names = [
+      ['timer', '@deepseek-ai/cordis-plugin-timer'], ['hmr', '@deepseek-ai/dsh-hmr', { root: [] }],
+      ['plugin-manager', '@deepseek-ai/dsh-plugin-manager'], ['storage', '@deepseek-ai/dsh-storage'],
+      ['storage-json', '@deepseek-ai/dsh-storage-json', { root: join(dir, 'storages') }],
+      ['storage-domain', '@deepseek-ai/dsh-storage-domain', { backend: 'json' }],
+      ['system-prompt', '@deepseek-ai/dsh-system-prompt'], ['tools', '@deepseek-ai/dsh-tools'],
+      ['llm', '@deepseek-ai/dsh-llm'], ['agents', '@deepseek-ai/dsh-agent'], ['sessions', '@deepseek-ai/dsh-session'],
+      ['session-projection', '@deepseek-ai/dsh-session-projection'], ['fs', '@deepseek-ai/dsh-fs'],
+      ['working-directory', '@deepseek-ai/dsh-working-directory', { defaultDirectory: dir }],
+      ['session-persistence', '@deepseek-ai/dsh-session-persistence-jsonl', { root: join(dir, 'sessions'), compression: 'none' }],
+    ];
+    const entries = names.map(([id, name, config]) => ({ id, name: pathToFileURL(require.resolve(name)).href, ...(config ? { config } : {}) }));
+    entries.push({ id: 'knowledge', name: pathToFileURL(join(core, 'knowledge.mjs')).href });
+    writeFileSync(join(profile, 'package.json'), '{"private":true,"dsh":{"profile":{"bundles":[]}}}');
+    writeFileSync(join(profile, 'cordis.patch.yml'), JSON.stringify([{ insert: entries }]));
+    const anchor = require.resolve('@deepseek-ai/dsh/package.json'), invocation = packageManager(core);
+    const app = await runProfile({ environment: createLaunchEnvironmentSnapshot([]), profile: 'knowledge-local-test', patchFiles: [], args: [],
+      resolvedProfile: { profile: loadProfileDirectory('dsh', profile, anchor), installAnchor: anchor },
+      packageManager: { ...invocation, env: { ...invocation.env, npm_config_offline: 'true' } },
+    });
+    try {
+      const { policyHost } = await import(pathToFileURL(join(core, 'host.mjs')));
+      assert.equal(typeof policyHost.knowledge, 'function');
+      const status = await policyHost.knowledge('status');
+      console.log('KNOWLEDGE_PROFILE_STATUS', JSON.stringify({ ready: status.ready, enabled: status.enabled, message: status.message ?? null }));
+      const knowledgeModule = await import(pathToFileURL(join(core, 'knowledge.mjs')));
+      console.log('KNOWLEDGE_PROFILE_INJECT', JSON.stringify(knowledgeModule.inject));
+      assert.equal(status.ready, true, JSON.stringify(status)); assert.equal(status.enabled, false);
+      const list = app.ctx.tools.get('knowledge_list'), search = app.ctx.tools.get('knowledge_search'), read = app.ctx.tools.get('knowledge_read');
+      console.log('KNOWLEDGE_PROFILE_SCHEMAS', JSON.stringify([list, search, read].map(tool => ({ name: tool?.name, parameters: tool?.parameters, output: tool?.output?.schema }))));
+      for (const tool of [list, search, read]) {
+        assert.ok(tool); assert.equal(tool.parameters.type, 'object'); assert.equal(tool.output.schema.type, 'object');
+        assert.equal(typeof tool.execute, 'function');
+        const validArgs = tool.name === 'knowledge_search' ? { query: '资料' } : tool.name === 'knowledge_read' ? { ref: 'kb:document:sample:v1:text' } : {};
+        console.log('KNOWLEDGE_PROFILE_CONCURRENCY', JSON.stringify({ name: tool.name, valid: tool.isConcurrencySafe(validArgs), empty: tool.isConcurrencySafe({}) }));
+        assert.equal(tool.isConcurrencySafe(validArgs), true);
+        assert.doesNotMatch(JSON.stringify(tool.parameters), /workspace|operationId|sourceId/);
+      }
+      assert.ok(search.parameters.required.includes('query')); assert.ok(read.parameters.required.includes('ref'));
+      await assert.rejects(search.execute({}, {}), error => {
+        console.log('KNOWLEDGE_PROFILE_VIOLATIONS', JSON.stringify({ name: search.name, code: error.code, violations: error.violations }));
+        return error.code === 'INVALID_ARGS';
+      });
+      await assert.rejects(search.execute({ query: '资料', kind: 'unknown' }, {}), { code: 'INVALID_ARGS' });
+      await assert.rejects(read.execute({}, {}), error => {
+        console.log('KNOWLEDGE_PROFILE_VIOLATIONS', JSON.stringify({ name: read.name, code: error.code, violations: error.violations }));
+        return error.code === 'INVALID_ARGS';
+      });
+      await policyHost.knowledge('settings', { operationId: crypto.randomUUID(), createdAt: Date.now(), expectedRevision: status.settingsRevision, settings: { enabled: true } });
+      const { createUserMessage } = await load('@deepseek-ai/dsh-llm');
+      const session = app.ctx.sessions.create(crypto.randomUUID(), { meta: { cwd: dir } });
+      session.append('user/message', createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: '查阅知识库' }] }), { surfaceOp: 'append' });
+      session.requestHeader = () => ({ config: { provider: 'fixture', model: 'fixture', maxTokens: 1024 } });
+      app.ctx.llm.resolveModelInfo = async () => ({ context: { contextWindow: 32000 } });
+      const agent = { id: session.id, session, ctx: app.ctx };
+      const detach = await app.ctx.agents.register(agent);
+      try {
+        const exec = { agent, signal: new AbortController().signal };
+        const listed = await list.execute({}, exec); assert.deepEqual(listed.entries, []);
+        const found = await search.execute({ query: '不存在的知识' }, exec); assert.equal(found.mode, 'keyword'); assert.deepEqual(found.results, []);
+        const rendered = search.output.render({ query: '不存在的知识' }, found);
+        assert.deepEqual(JSON.parse(rendered[0].text), found);
+      } finally { await detach(); }
+      console.log('Local knowledge Cordis profile passed');
+    } finally { await app.shutdown.shutdown(0); }
+  };
+  const child = spawn(process.execPath, ['--expose-internals', '--preserve-symlinks', '--preserve-symlinks-main', '--import', join(core, 'compat.mjs'), '--input-type=module', '-e', '(' + run.toString() + ')().catch(error => { console.error(error); process.exitCode = 1; })'], {
+    env: { ...process.env, DSHX_KNOWLEDGE_TEST_DIR: dir, DSH_HOME: join(dir, 'home') }, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  child.stdout.on('data', chunk => { output += chunk; }); child.stderr.on('data', chunk => { output += chunk; });
+  const timeout = setTimeout(() => child.kill('SIGKILL'), 25000);
+  try {
+    const code = await new Promise((resolve, reject) => { child.once('error', reject); child.once('close', resolve); });
+    for (const line of output.split('\n')) if (line.startsWith('KNOWLEDGE_PROFILE_')) console.log(line);
+    assert.equal(code, 0, output); assert.match(output, /Local knowledge Cordis profile passed/);
+  } finally { clearTimeout(timeout); if (child.exitCode === null) child.kill('SIGKILL'); }
+});
+
+test('Android knowledge local explicit job cancellation before publication retains the previous version', async t => {
+  const f = await localKnowledgeFixture(t), source = await f.import('取消前的正式正文');
+  const prepare = f.store.prepare.bind(f.store), gate = Promise.withResolvers(); let started = false;
+  f.store.prepare = async (...args) => { started = true; await gate.promise; return prepare(...args); };
+  const accepted = await f.manage('update', f.operation({ sourceId: source.id, expectedRevision: source.revision, patch: { text: '不得发布的取消正文' } }));
+  await localMemoryWait(() => started, '正文准备任务未开始');
+  try { await f.manage('cancel', f.operation({ jobId: accepted.job.id })); }
+  finally { gate.resolve(); }
+  const job = await f.store.wait(accepted.job.id);
+  assert.equal(job.state, 'cancelled'); assert.equal(job.effect, 'none');
+  const current = f.store.read().sources.find(row => row.id === source.id);
+  assert.equal(current.version, source.version); assert.equal(current.revision, source.revision);
+  assert.equal(await f.store.sourceText(current), '取消前的正式正文');
+});
+
+test('Android knowledge local cancellation after source publication stops processing and preserves the published effect', async t => {
+  const gate = Promise.withResolvers(); let started = false;
+  const f = await localKnowledgeFixture(t, { process: async () => { started = true; await gate.promise; return { complete: true }; } });
+  const collection = await f.collection();
+  await f.manage('settings', f.operation({ expectedRevision: f.store.read().settingsRevision, settings: { enabled: true,
+    embedding: { enabled: true, configId: 'fixture-embedding', provider: 'fixture', model: 'fixture', dimensions: 2 } } }));
+  const accepted = await f.manage('import', f.operation({ text: '已经发布的正式资料', format: 'txt', title: '发布后取消', collectionId: collection.id }));
+  await localMemoryWait(() => started, '发布后的模型加工未开始');
+  const source = f.store.read().sources.find(row => row.title === '发布后取消');
+  assert.ok(source); assert.equal(await f.store.sourceText(source), '已经发布的正式资料');
+  try { await f.manage('cancel', f.operation({ jobId: accepted.job.id })); }
+  finally { gate.resolve(); }
+  const job = await f.store.wait(accepted.job.id);
+  assert.equal(job.state, 'cancelled'); assert.equal(job.effect, 'published');
+  assert.equal(await f.store.sourceText(f.store.read().sources.find(row => row.id === source.id)), '已经发布的正式资料');
+  assert.equal((await f.manage('status', { operationId: accepted.operation.operationId })).operation.effect, 'published');
+});
+
+test('Android knowledge local retries accepted operations within 24 hours and refuses the same expired request', async t => {
+  const f = await localKnowledgeFixture(t), collection = await f.collection();
+  const data = f.operation({ text: '完整窗口内的幂等资料', title: '有效窗口', format: 'txt', collectionId: collection.id });
+  const accepted = await f.manage('import', data); await f.store.idle();
+  const before = f.store.read(), now = Date.now();
+  const clock = t.mock.method(Date, 'now', () => now + 23 * 60 * 60 * 1000);
+  try {
+    assert.equal((await f.manage('import', data)).job.id, accepted.job.id);
+    clock.mock.mockImplementation(() => now + 24 * 60 * 60 * 1000 + 1000);
+    await assert.rejects(f.manage('import', data), { code: 'KNOWLEDGE_OPERATION_EXPIRED' });
+    assert.deepEqual(f.store.read(), before);
+  } finally { clock.mock.restore(); }
+});
+
+test('Android knowledge local restore refuses corrupt gzip and requires an explicit allowed workspace mapping', async t => {
+  const f = await localKnowledgeFixture(t), collection = await f.collection('旧工作区集合', { scope: { kind: 'workspace', workspace: f.workspaces[1] } });
+  await f.import('映射后才可恢复的工作区资料', { collectionId: collection.id });
+  const exported = await localKnowledgeExport(f), sources = f.store.read().sources;
+  const broken = await localKnowledgeTicket(f, Buffer.from('not a gzip archive'), { format: 'archive' });
+  const bad = await f.manage('restore', broken); assert.equal((await f.store.wait(bad.job.id)).state, 'failed');
+  assert.deepEqual(f.store.read().sources, sources);
+  const unmapped = await localKnowledgeTicket(f, exported.bytes, { format: 'archive' });
+  const rejected = await f.manage('restore', unmapped);
+  const failed = await f.store.wait(rejected.job.id); assert.equal(failed.state, 'failed'); assert.equal(failed.errorCode, 'KNOWLEDGE_INPUT');
+  assert.deepEqual(f.store.read().sources, sources);
+  const mapped = await localKnowledgeTicket(f, exported.bytes, { format: 'archive' });
+  const accepted = await f.manage('restore', { ...mapped, workspaceMap: { [f.workspaces[1]]: 'user' } });
+  assert.equal((await f.store.wait(accepted.job.id)).state, 'succeeded');
+  const restored = f.store.read().sources.find(row => row.scope.kind === 'user');
+  assert.ok(restored); assert.notEqual(restored.id, sources[0].id);
+  assert.equal(await f.store.sourceText(restored), '映射后才可恢复的工作区资料');
+});
+
+// 仅替换模型服务；存储、任务、批次文件、切换和运行时检索均使用实际实现。
+async function localKnowledgeRuntime(t) {
+  const f = await localKnowledgeFixture(t);
+  const { createKnowledgeSearch, loadVectorGeneration, processKnowledgeJob } = await import(pathToFileURL(join(core, 'knowledge-search.mjs')));
+  f.loadVectorGeneration = loadVectorGeneration; f.processKnowledgeJob = processKnowledgeJob;
+  f.model = { calls: [], summaries: [], fail: false, summaryText: '恢复前先停止服务，必须保留数据库和备份。' };
+  f.ctx.llm = {
+    listConfigurableProviders: () => [{ provider: 'fixture', settingsNs: 'knowledge-runtime', defaultBaseURL: 'https://fixture.invalid/v1' }],
+    resolveModelInfo: async () => ({ provider: 'fixture', id: 'fixture-summary', context: { contextWindow: 32000 } }),
+    prepareCall: async (config, signal, adjust) => {
+      adjust?.({}, { provider: config.provider, id: config.model, context: { contextWindow: 32000 } });
+      return { config, stream: async function* (request) {
+        f.model.summaries.push(request);
+        await f.model.onSummary?.(request);
+        request.signal.throwIfAborted();
+        yield { type: 'text-delta', text: f.model.summaryText };
+        yield { type: 'finish', reason: { kind: 'stop' } };
+      } };
+    },
+  };
+  f.ctx.settings = { describe: () => [{ ns: 'knowledge-runtime', revision: 1,
+    value: { baseURL: 'https://fixture.invalid/v1', apiKeyEnv: 'KNOWLEDGE_RUNTIME_TEST_KEY' } }] };
+  f.ctx.credentials = { resolve: async () => ({ value: 'private-runtime-fixture-key' }) };
+  for (const name of ['llm', 'settings', 'credentials']) f.ctx.provide(name, f.ctx[name]);
+  f.runtimeOptions = { usageDirectory: f.root, fetch: async (url, request) => {
+    const body = JSON.parse(request.body); f.model.calls.push({ url, inputs: body.input });
+    if (f.model.onEmbed) return f.model.onEmbed(body, request);
+    if (f.model.fail) return new Response('private model failure', { status: 400 });
+    return Response.json({ model: body.model, data: body.input.map((text, index) => ({ index, embedding: text.includes('通勤') ? [0, 1] : [1, 0] })) });
+  } };
+  f.newRuntime = () => createKnowledgeSearch(f.ctx, f.store, f.runtimeOptions);
+  f.runtime = f.newRuntime();
+  f.store.options.process = (job, store) => f.runtime.process(job, store);
+  t.after(async () => { await f.runtime.close(); });
+  f.rows = async () => {
+    const rows = [];
+    for (const source of f.store.read().sources.filter(row => row.state === 'active')) {
+      for (const chunk of await f.store.sourceChunks(source)) rows.push({ ...chunk, id: `${source.id}:${chunk.id}`, chunkId: chunk.id,
+        kind: 'document', title: source.title, ref: `kb:document:${source.id}:v${source.version}:${chunk.id}` });
+    }
+    return rows;
+  };
+  f.configure = (settings = {}) => f.manage('settings', f.operation({ expectedRevision: f.store.read().settingsRevision,
+    settings: { enabled: true, ...settings } }));
+  f.embedding = (extra = {}) => ({ enabled: true, configId: 'runtime-embedding-v1', provider: 'fixture', model: 'fixture-embedding',
+    dimensions: 2, normalized: true, kinds: ['document'], batchSize: 1, ...extra });
+  f.summary = (extra = {}) => ({ enabled: true, configId: 'runtime-summary-v1', provider: 'fixture', model: 'fixture-summary', promptVersion: 1, ...extra });
+  f.rebuild = async (kind, extra = {}) => {
+    const accepted = await f.manage('rebuild', f.operation({ kind, ...extra }));
+    const job = await f.store.wait(accepted.job.id);
+    return { accepted, job, status: await f.manage('status', { operationId: accepted.operation.operationId }) };
+  };
+  f.reopen = async () => {
+    await f.runtime.close(); await f.store.close();
+    f.store = await f.openKnowledge(f.ctx, { root: f.root, process: (job, store) => f.runtime.process(job, store) });
+    f.runtime = f.newRuntime();
+  };
+  return f;
+}
+
+function localKnowledgeReload(f) {
+  const run = async () => {
+    const { createRequire } = await import('node:module'), { pathToFileURL } = await import('node:url'), { join } = await import('node:path');
+    const core = process.env.DSHX_CORE, require = createRequire(join(core, 'lib/node_modules/package.json'));
+    const load = name => import(pathToFileURL(require.resolve(name)));
+    const { Context } = await load('@deepseek-ai/cordis'), ctx = new Context(); let store;
+    try {
+      await ctx.plugin((await load('@deepseek-ai/dsh-storage')).default);
+      await ctx.plugin(await load('@deepseek-ai/dsh-storage-json'), { root: process.env.DSHX_KNOWLEDGE_CATALOG_DIR });
+      await ctx.plugin(await load('@deepseek-ai/dsh-storage-domain'), { backend: 'json' });
+      const { openKnowledge } = await import(pathToFileURL(join(core, 'knowledge-store.mjs')));
+      const { loadVectorGeneration } = await import(pathToFileURL(join(core, 'knowledge-search.mjs')));
+      store = await openKnowledge(ctx, { root: process.env.DSHX_KNOWLEDGE_ROOT });
+      const loaded = await loadVectorGeneration(store, store.read().embedding);
+      console.log(JSON.stringify({ generation: loaded?.generation, count: loaded?.vectors.size,
+        finite: [...loaded?.vectors.values() ?? []].every(row => Array.from(row.vector).every(Number.isFinite)) }));
+    } catch (error) { console.error(JSON.stringify({ code: error.code, frames: error.stack?.split('\n').slice(1, 4) })); process.exitCode = 1; }
+    finally { await store?.close(); await ctx.fiber.dispose(); }
+  };
+  return spawnSync(process.execPath, ['--input-type=module', '-e', '(' + run.toString() + ')()'], {
+    env: { ...process.env, DSHX_KNOWLEDGE_CATALOG_DIR: f.dir, DSHX_KNOWLEDGE_ROOT: f.root }, encoding: 'utf8', timeout: 15000,
+  });
+}
+
+test('Android knowledge local runtime rebuild writes a complete generation readable by fresh process and hybrid search', async t => {
+  const f = await localKnowledgeRuntime(t);
+  await f.import('恢复数据库必须保留备份。', { title: '恢复手册' });
+  await f.import('每天骑车通勤。', { title: '通勤说明' });
+  await f.configure({ embedding: f.embedding() });
+  const built = await f.rebuild('semantic');
+  assert.equal(built.job.state, 'succeeded', JSON.stringify(built.job)); assert.equal(built.job.effect, 'switched');
+  const snapshot = f.store.read(), generation = snapshot.semanticIndex.generation;
+  assert.equal(snapshot.semanticGeneration, generation);
+  const manifest = JSON.parse(await readFile(join(f.root, 'indexes', generation, 'manifest.json'), 'utf8'));
+  assert.equal(manifest.complete, true); assert.equal(manifest.count, (await f.rows()).length);
+  for (const [name, info] of Object.entries(manifest.files)) {
+    const bytes = await readFile(join(f.root, 'indexes', generation, name));
+    assert.equal(bytes.length, info.bytes); assert.equal(createHash('sha256').update(bytes).digest('hex'), info.hash);
+  }
+  const found = await f.runtime.search(await f.rows(), '数据库恢复');
+  assert.equal(found.mode, 'hybrid'); assert.deepEqual(found.coverage, { eligible: 2, indexed: 2 });
+  assert.ok(found.results[0].matchedBy.includes('semantic'));
+  const restarted = localKnowledgeReload(f);
+  assert.equal(restarted.status, 0, restarted.stderr);
+  assert.deepEqual(JSON.parse(restarted.stdout.trim()), { generation, count: 2, finite: true });
+  await f.reopen();
+  assert.equal((await f.runtime.search(await f.rows(), '数据库恢复')).mode, 'hybrid');
+});
+
+test('Android knowledge local runtime updated document falls back to new keyword text without old vectors', async t => {
+  const f = await localKnowledgeRuntime(t), source = await f.import('旧版恢复要求保留数据库');
+  await f.configure({ embedding: f.embedding() });
+  assert.equal((await f.rebuild('semantic')).job.state, 'succeeded');
+  const generation = f.store.read().semanticGeneration;
+  f.model.fail = true;
+  const accepted = await f.manage('update', f.operation({ sourceId: source.id, expectedRevision: source.revision, patch: { text: '新版恢复要求保留快照🙂' } }));
+  const job = await f.store.wait(accepted.job.id);
+  assert.equal(job.effect, 'published'); assert.equal(job.state, 'waitingRetry');
+  assert.equal(f.store.read().semanticGeneration, generation);
+  const rows = await f.rows(), found = await f.runtime.search(rows, '新版恢复');
+  assert.equal(found.mode, 'keyword'); assert.deepEqual(found.coverage, { eligible: 1, indexed: 0 });
+  assert.equal(found.results[0].row.text, '新版恢复要求保留快照🙂');
+  assert.ok(found.results.every(hit => hit.row.sourceVersion > source.version));
+  assert.ok(found.results.every(hit => !hit.matchedBy.includes('semantic')));
+});
+
+test('Android knowledge local runtime deleted document never returns from a previously complete generation', async t => {
+  const f = await localKnowledgeRuntime(t), removed = await f.import('独特秘密资料只能属于已删文档', { title: '独特秘密' });
+  await f.import('保留的恢复手册', { title: '恢复手册' });
+  await f.configure({ embedding: f.embedding() });
+  assert.equal((await f.rebuild('semantic')).job.state, 'succeeded');
+  const accepted = await f.manage('remove', f.operation({ sourceId: removed.id, expectedRevision: removed.revision }));
+  assert.equal((await f.store.wait(accepted.job.id)).state, 'succeeded');
+  const result = await f.runtime.search(await f.rows(), '独特秘密');
+  assert.equal(result.coverage.eligible, 1);
+  assert.ok(result.results.every(hit => hit.row.sourceId !== removed.id && !hit.row.text.includes('独特秘密')));
+});
+
+test('Android knowledge local runtime incomplete semantic rebuild keeps the prior generation and does not report full coverage', async t => {
+  const f = await localKnowledgeRuntime(t);
+  await f.import('第一份恢复资料'); await f.import('第二份恢复资料');
+  await f.configure({ embedding: f.embedding() });
+  assert.equal((await f.rebuild('semantic')).job.state, 'succeeded');
+  const previous = f.store.read().semanticGeneration;
+  await f.configure({ embedding: f.embedding({ configId: 'runtime-embedding-v2' }) });
+  let calls = 0;
+  f.model.onEmbed = async body => ++calls === 1 ? Response.json({ model: body.model, data: body.input.map((_, index) => ({ index, embedding: [1, 0] })) })
+    : new Response('interrupted second batch', { status: 400 });
+  const rebuilt = await f.rebuild('semantic');
+  assert.equal(rebuilt.job.state, 'waitingRetry'); assert.equal(rebuilt.job.effect, 'none');
+  assert.equal(f.store.read().semanticGeneration, previous); assert.equal(calls, 2);
+  const result = await f.runtime.search(await f.rows(), '恢复资料');
+  assert.equal(result.mode, 'keyword'); assert.equal(result.coverage.indexed, 0);
+  assert.equal(result.results.length, 2);
+  const unfinished = (await readdir(join(f.root, 'indexes'))).filter(name => name.startsWith('g-') && name !== previous);
+  assert.equal(unfinished.length, 1);
+  await assert.rejects(readFile(join(f.root, 'indexes', unfinished[0], 'manifest.json')), { code: 'ENOENT' });
+  await f.reopen();
+  assert.equal(f.store.read().semanticGeneration, previous);
+  assert.equal((await f.runtime.search(await f.rows(), '恢复资料')).mode, 'keyword');
+});
+
+for (const filename of ['records.json', 'vectors.f32']) {
+  test(`Android knowledge local runtime fresh process rejects corrupted generation ${filename} and preserves source text`, async t => {
+    const f = await localKnowledgeRuntime(t), source = await f.import('索引损坏不能损坏正式原文');
+    await f.configure({ embedding: f.embedding() });
+    assert.equal((await f.rebuild('semantic')).job.state, 'succeeded');
+    const generation = f.store.read().semanticGeneration, path = join(f.root, 'indexes', generation, filename);
+    const bytes = await readFile(path); bytes[0] ^= 1; await writeFile(path, bytes);
+    const restarted = localKnowledgeReload(f);
+    assert.equal(restarted.status, 1); assert.equal(JSON.parse(restarted.stderr.trim()).code, 'KNOWLEDGE_INDEX');
+    assert.equal(await f.store.sourceText(f.store.read().sources.find(row => row.id === source.id)), '索引损坏不能损坏正式原文');
+    assert.equal(f.store.read().semanticGeneration, generation);
+  });
+}
+
+test('Android knowledge local runtime failed generation switch preserves the previous durable index pointer', async t => {
+  const f = await localKnowledgeRuntime(t); await f.import('切换失败后仍保留原文和旧批次');
+  await f.configure({ embedding: f.embedding() }); assert.equal((await f.rebuild('semantic')).job.state, 'succeeded');
+  const previous = f.store.read().semanticGeneration;
+  await f.configure({ embedding: f.embedding({ configId: 'runtime-switch-v2' }) });
+  const save = f.store.domain.global.set.bind(f.store.domain.global); let refused = false;
+  f.store.domain.global.set = async next => {
+    if (next.semanticGeneration && next.semanticGeneration !== previous) { refused = true; throw new Error('fixture switch failure'); }
+    return save(next);
+  };
+  const result = await f.rebuild('semantic');
+  assert.equal(refused, true); assert.equal(result.job.state, 'waitingRetry'); assert.equal(result.job.effect, 'none');
+  assert.equal(result.job.errorCode, 'KNOWLEDGE_WRITE'); assert.equal(f.store.read().semanticGeneration, previous);
+  const disk = JSON.parse(await readFile(join(f.dir, 'knowledge', 'state.json'), 'utf8'));
+  assert.equal(disk.global.semanticGeneration, previous);
+  const other = (await readdir(join(f.root, 'indexes'))).find(name => name.startsWith('g-') && name !== previous);
+  assert.ok(other);
+  assert.equal(JSON.parse(await readFile(join(f.root, 'indexes', other, 'manifest.json'), 'utf8')).complete, true);
+  assert.equal((await f.runtime.search(await f.rows(), '保留原文')).mode, 'keyword');
+});
+
+test('Android knowledge local runtime cancellation during semantic batching cannot switch a partial generation', async t => {
+  const f = await localKnowledgeRuntime(t); await f.import('取消批次仍保留正式资料');
+  await f.configure({ embedding: f.embedding() });
+  const gate = Promise.withResolvers(); let started = false;
+  f.model.onEmbed = async body => { started = true; await gate.promise; return Response.json({ model: body.model, data: [{ index: 0, embedding: [1, 0] }] }); };
+  const accepted = await f.manage('rebuild', f.operation({ kind: 'semantic' }));
+  await localMemoryWait(() => started, '语义批次没有开始');
+  try { await f.manage('cancel', f.operation({ jobId: accepted.job.id })); }
+  finally { gate.resolve(); }
+  const job = await f.store.wait(accepted.job.id);
+  assert.equal(job.state, 'cancelled'); assert.equal(job.effect, 'none');
+  assert.equal(f.store.read().semanticGeneration, undefined);
+  assert.equal((await f.runtime.search(await f.rows(), '保留正式资料')).mode, 'keyword');
+  assert.equal(await f.store.sourceText(f.store.read().sources[0]), '取消批次仍保留正式资料');
+});
+
+test('Android knowledge local runtime generated overview is persisted readable and exposed through actual knowledge tool refs', async t => {
+  const f = await localKnowledgeRuntime(t), collection = await f.collection('恢复资料集合');
+  await f.import('恢复前停止服务，保留数据库。', { collectionId: collection.id, title: '恢复步骤' });
+  await f.import('备份文件必须妥善保留。', { collectionId: collection.id, title: '备份要求' });
+  await f.configure({ summary: f.summary() });
+  const built = await f.rebuild('summary', { collectionId: collection.id, expectedRevision: f.store.read().collections.find(row => row.id === collection.id).revision });
+  assert.equal(built.job.state, 'succeeded', JSON.stringify(built.job)); assert.equal(built.job.effect, 'switched');
+  const current = f.store.read().collections.find(row => row.id === collection.id), overview = await f.runtime.overview(current);
+  assert.ok(overview); assert.equal(overview.generated, true); assert.equal(overview.text, f.model.summaryText);
+  assert.equal(overview.coveredCount, 2); assert.equal(overview.totalCount, 2);
+  assert.deepEqual(new Set(overview.sources.map(row => row.sourceId)), new Set(f.store.read().sources.map(row => row.id)));
+  const saved = await readFile(join(f.root, current.summary.path));
+  assert.equal(createHash('sha256').update(saved).digest('hex'), current.summary.fileHash);
+  assert.equal(f.model.summaries.length, 1);
+  assert.deepEqual(f.model.summaries[0].tools, []);
+  await f.start(); const agent = await f.agent();
+  const listed = await f.execute(agent, 'knowledge_list', { kind: 'document' });
+  const item = listed.entries.find(row => row.id === collection.id);
+  assert.match(item.overviewRef, /^kb:overview:/); assert.equal(item.summaryState, 'ready');
+  const read = await f.execute(agent, 'knowledge_read', { ref: item.overviewRef });
+  assert.equal(read.kind, 'overview'); assert.equal(read.generated, true); assert.equal(read.text, f.model.summaryText);
+  assert.deepEqual(read.coverage, { coveredCount: 2, totalCount: 2 });
+  assert.equal(read.sources.length, 2); assert.ok(read.sources.every(row => row.ref.startsWith('kb:document:')));
+  await f.reopen();
+  assert.equal((await f.runtime.overview(f.store.read().collections.find(row => row.id === collection.id))).text, f.model.summaryText);
+});
+
+test('Android knowledge local runtime corrupt overview falls back to verified navigation and rejects its old generated ref', async t => {
+  const f = await localKnowledgeRuntime(t), collection = await f.collection('概览损坏测试');
+  await f.import('保留数据库和备份。', { collectionId: collection.id, title: '正式恢复原文' });
+  await f.configure({ summary: f.summary() });
+  assert.equal((await f.rebuild('summary', { collectionId: collection.id, expectedRevision: collection.revision })).job.state, 'succeeded');
+  await f.start(); const firstAgent = await f.agent();
+  const generated = (await f.execute(firstAgent, 'knowledge_list', { kind: 'document' })).entries.find(row => row.id === collection.id);
+  assert.match(generated.overviewRef, /^kb:overview:/);
+  const current = f.store.read().collections.find(row => row.id === collection.id);
+  await writeFile(join(f.root, current.summary.path), '{broken overview');
+  assert.equal(await f.runtime.overview(current), null);
+  const agent = await f.agent(), fallback = (await f.execute(agent, 'knowledge_list', { kind: 'document' })).entries.find(row => row.id === collection.id);
+  assert.equal(fallback.summaryState, 'stale'); assert.notEqual(fallback.overviewRef, generated.overviewRef);
+  await assert.rejects(f.execute(agent, 'knowledge_read', { ref: generated.overviewRef }), { code: 'KNOWLEDGE_VERSION_CHANGED' });
+  const read = await f.execute(agent, 'knowledge_read', { ref: fallback.overviewRef });
+  assert.equal(read.generated, false); assert.equal(read.navigation, true); assert.match(read.text, /正式恢复原文/);
+  assert.doesNotMatch(read.text, /broken overview/);
+  assert.equal(await f.store.sourceText(f.store.read().sources[0]), '保留数据库和备份。');
+});
+
+test('Android knowledge local runtime member update invalidates both generated overview and earlier navigation fingerprints', async t => {
+  const f = await localKnowledgeRuntime(t), collection = await f.collection('成员变更测试');
+  const source = await f.import('旧版保留数据库', { collectionId: collection.id });
+  await f.enable(); await f.start();
+  const initialAgent = await f.agent();
+  const navigation = (await f.execute(initialAgent, 'knowledge_list', { kind: 'document' })).entries.find(row => row.id === collection.id);
+  assert.match(navigation.overviewRef, /:overview:n/);
+  await f.configure({ summary: f.summary() });
+  assert.equal((await f.rebuild('summary', { collectionId: collection.id, expectedRevision: collection.revision })).job.state, 'succeeded');
+  const agent = await f.agent(), generated = (await f.execute(agent, 'knowledge_list', { kind: 'document' })).entries.find(row => row.id === collection.id);
+  assert.match(generated.overviewRef, /^kb:overview:/);
+  f.model.onSummary = async () => { throw new Error('fixture summary unavailable'); };
+  const accepted = await f.manage('update', f.operation({ sourceId: source.id, expectedRevision: source.revision, patch: { text: '新版改为保留快照' } }));
+  const job = await f.store.wait(accepted.job.id); assert.equal(job.effect, 'published'); assert.equal(job.state, 'waitingRetry');
+  const current = f.store.read().collections.find(row => row.id === collection.id);
+  assert.equal(await f.runtime.overview(current), null);
+  await assert.rejects(f.execute(agent, 'knowledge_read', { ref: generated.overviewRef }), { code: 'KNOWLEDGE_VERSION_CHANGED' });
+  await assert.rejects(f.execute(agent, 'knowledge_read', { ref: navigation.overviewRef }), { code: 'KNOWLEDGE_VERSION_CHANGED' });
+  const after = (await f.execute(await f.agent(), 'knowledge_list', { kind: 'document' })).entries.find(row => row.id === collection.id);
+  assert.notEqual(after.overviewRef, navigation.overviewRef);
+  assert.equal((await f.execute(agent, 'knowledge_read', { ref: after.overviewRef })).generated, false);
+});
+
+test('Android knowledge local runtime incomplete summary input cannot publish a generated overview', async t => {
+  const f = await localKnowledgeRuntime(t), collection = await f.collection('完整覆盖测试');
+  await f.import('第一份恢复步骤', { collectionId: collection.id });
+  await f.import('第二份必要条件', { collectionId: collection.id });
+  await f.configure({ summary: f.summary() });
+  f.runtimeOptions.getRows = async () => (await f.rows()).slice(0, 1);
+  const built = await f.rebuild('summary', { collectionId: collection.id, expectedRevision: collection.revision });
+  assert.equal(built.job.state, 'waitingRetry'); assert.equal(built.job.effect, 'none');
+  assert.equal(built.job.errorCode, 'KNOWLEDGE_VERSION_CHANGED');
+  assert.equal(f.model.summaries.length, 0);
+  const current = f.store.read().collections.find(row => row.id === collection.id);
+  assert.notEqual(current.summaryState, 'ready'); assert.equal(await f.runtime.overview(current), null);
+});
+
+// Emoji 的回归在子进程运行，旧版同步截断死循环也不会卡住整组定向测试。
+test('Android knowledge local P1 emoji snippet fitting terminates when metadata cannot fit the budget', async () => {
+  const run = async () => {
+    const assert = (await import('node:assert/strict')).default;
+    const { createRequire } = await import('node:module'), { pathToFileURL } = await import('node:url'), { join } = await import('node:path');
+    const { rm } = await import('node:fs/promises');
+    const core = process.env.DSHX_CORE, require = createRequire(join(core, 'lib/node_modules/package.json'));
+    const load = name => import(pathToFileURL(require.resolve(name)));
+    const { Context } = await load('@deepseek-ai/cordis'), ctx = new Context();
+    const dir = process.env.DSHX_KNOWLEDGE_EMOJI_DIR; let knowledge, store;
+    try {
+      await ctx.plugin((await load('@deepseek-ai/dsh-storage')).default);
+      await ctx.plugin(await load('@deepseek-ai/dsh-storage-json'), { root: dir });
+      await ctx.plugin(await load('@deepseek-ai/dsh-storage-domain'), { backend: 'json' });
+      await ctx.plugin((await load('@deepseek-ai/dsh-session')).default);
+      await ctx.plugin((await load('@deepseek-ai/dsh-system-prompt')).default);
+      await ctx.plugin((await load('@deepseek-ai/dsh-session-projection')).default);
+      await ctx.plugin((await load('@deepseek-ai/dsh-fs')).default);
+      await ctx.plugin((await load('@deepseek-ai/dsh-working-directory')).default, { defaultDirectory: dir });
+      const { createUserMessage } = await load('@deepseek-ai/dsh-llm');
+      const { openKnowledge } = await import(pathToFileURL(join(core, 'knowledge-store.mjs')));
+      const { knowledgeSession } = await import(pathToFileURL(join(core, 'knowledge.mjs')));
+      store = await openKnowledge(ctx, { root: join(dir, 'knowledge') });
+      const operation = data => ({ operationId: crypto.randomUUID(), createdAt: Date.now(), ...data });
+      await store.manage('settings', operation({ expectedRevision: store.read().settingsRevision, settings: { enabled: true } }));
+      const session = ctx.sessions.create('emoji-fit', { meta: { cwd: dir } }), agent = { id: 'emoji-agent', session };
+      session.append('user/message', createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: '查阅🙂' }] }), { surfaceOp: 'append' });
+      ctx.agents = { list: () => [agent] };
+      const memory = { view: () => ({ enabled: true, revision: 1, entries: [{ id: 'emoji-source', updatedAt: 1, expiresAt: null,
+        state: 'active', summary: '🙂资料', content: '🙂'.repeat(100), scope: { kind: 'user' }, source: { kind: 'manual' } }] }) };
+      knowledge = knowledgeSession(ctx, { store, memory, capacity: 256,
+        search: async rows => ({ mode: 'keyword', results: rows.map(row => ({ row, matchedBy: ['keyword'] })) }) });
+      await knowledge.ready;
+      await assert.rejects(knowledge.execute('knowledge_search', { query: '🙂' }, { agent, signal: new AbortController().signal }), { code: 'KNOWLEDGE_LIMIT' });
+      console.log('emoji fit rejected bounded output');
+    } finally { await knowledge?.close(); await store?.close(); await ctx.fiber.dispose(); await rm(dir, { recursive: true, force: true }); }
+  };
+  const dir = await mkdtemp(join(directory, 'knowledge-emoji-fit-'));
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', '(' + run.toString() + ')().catch(error => { console.error(error); process.exitCode = 1; })'],
+    { env: { ...process.env, DSHX_KNOWLEDGE_EMOJI_DIR: dir }, encoding: 'utf8', timeout: 4000 });
+  assert.equal(child.error, undefined, `emoji 截断没有在时限内终止：${child.error?.code}`);
+  assert.equal(child.status, 0, child.stderr); assert.match(child.stdout, /emoji fit rejected bounded output/);
+});
+
+for (const tool of ['knowledge_search', 'knowledge_read']) {
+  test(`Android knowledge local P1 ${tool} revalidates sources after the outer await`, async t => {
+    const f = await localKnowledgeFixture(t);
+    const entry = { id: 'outer-await-fact', summary: '旧来源', content: '旧来源不能越过外层等待返回', state: 'active',
+      updatedAt: 10, expiresAt: null, scope: { kind: 'user' }, source: { kind: 'auto', session: 'source-session', events: [0] } };
+    let revision = 1, entries = [entry], armed = false, invalidated = false;
+    f.ctx.provide('sessionPersistence', { open: async () => ({
+      read: async () => ({ events: [{ seq: 0, type: 'user/message' }] }), close: async () => { armed = true; },
+    }) });
+    await f.start({ memory: { view: () => {
+      // 内层 ensure 读取旧快照后安排一次已提交的来源变化；变化先于外层 await 恢复。
+      if (armed) { armed = false; queueMicrotask(() => { entries = []; revision++; invalidated = true; }); }
+      return { enabled: true, revision, entries };
+    } }, search: async rows => { armed = true;
+      return { mode: 'keyword', results: rows.map(row => ({ row, matchedBy: ['keyword'] })) };
+    } });
+    const agent = await f.agent();
+    const args = tool === 'knowledge_search' ? { query: '来源' } : { ref: `kb:memory:${entry.id}:u${entry.updatedAt}` };
+    await assert.rejects(f.execute(agent, tool, args), { code: 'KNOWLEDGE_VERSION_CHANGED' });
+    assert.equal(invalidated, true, '必须在内层读取完成、外层等待恢复之间使来源失效');
+  });
+}
+
+test('Android knowledge local pagination keeps the original ranked candidate snapshot across model ordering changes', async t => {
+  const f = await localKnowledgeFixture(t), collection = await f.collection();
+  for (let i = 0; i < 4; i++) await f.import(`分页资料正文${i}`, { collectionId: collection.id, title: `分页资料${i}` });
+  await f.enable(); let searches = 0, original;
+  await f.start({ search: async rows => {
+    original ??= rows.map(row => row.ref);
+    const ranked = ++searches === 1 ? rows : rows.toReversed();
+    return { mode: 'keyword', results: ranked.map(row => ({ row, matchedBy: ['keyword'] })) };
+  } });
+  const refs = []; let cursor;
+  do {
+    const page = await f.knowledge.call('search', { query: '分页', limit: 1, ...cursor ? { cursor } : {} });
+    refs.push(...page.results.map(row => row.ref)); cursor = page.cursor;
+    assert.ok(refs.length <= 4, '分页不能无限返回重复候选');
+  } while (cursor);
+  assert.deepEqual(refs, original); assert.equal(new Set(refs).size, 4);
+  assert.equal(searches, 1, '后续页应复用首轮候选，避免额外模型请求和排序漂移');
+});
+
+test('Android knowledge local final output remeasures a model context window changed during search', async t => {
+  const f = await localKnowledgeFixture(t); await f.import('正文🙂'.repeat(100)); await f.enable();
+  let window = 16000, measurements = 0;
+  f.ctx.llm.resolveModelInfo = async () => { measurements++; return { context: { contextWindow: window } }; };
+  await f.start({ capacity: undefined, search: async rows => {
+    window = 2400;
+    return { mode: 'keyword', results: rows.map(row => ({ row, matchedBy: ['keyword'] })) };
+  } });
+  const agent = await f.agent();
+  agent.session.requestHeader = () => ({ config: { provider: 'fixture', model: 'fixture', maxTokens: 100 } });
+  const result = await f.execute(agent, 'knowledge_search', { query: '正文' });
+  assert.ok(measurements >= 2, '返回前必须重新读取当前模型容量');
+  assert.ok(Buffer.byteLength(JSON.stringify(result)) <= 600, '最终 JSON 必须服从更新后窗口四分之一的容量上限');
+  assert.ok(!result.results[0].snippet.includes('\ufffd'));
+});
+
+test('Android knowledge local final output includes context tokens added while evidence was prepared', async t => {
+  const f = await localKnowledgeFixture(t); await f.import('不能挤出最终上下文的正文'.repeat(30)); await f.enable();
+  let measured = 0;
+  f.ctx.provide('tokenMeter', { measure: () => ({ totalTokens: measured }) });
+  f.ctx.llm.resolveModelInfo = async () => ({ context: { contextWindow: 8000 } });
+  await f.start({ capacity: undefined, search: async rows => {
+    measured = 7500;
+    return { mode: 'keyword', results: rows.map(row => ({ row, matchedBy: ['keyword'] })) };
+  } });
+  const agent = await f.agent(); agent.session.requestHeader = () => ({ config: { provider: 'fixture', model: 'fixture', maxTokens: 100 } });
+  await assert.rejects(f.execute(agent, 'knowledge_search', { query: '正文' }), { code: 'KNOWLEDGE_LIMIT' });
+});
+
+test('Android knowledge local disposed agent cannot replenish the same root user request budget', async t => {
+  const f = await localKnowledgeFixture(t); await f.enable(); await f.start();
+  const agent = await f.agent();
+  for (let i = 0; i < 3; i++) await f.execute(agent, 'knowledge_search', { query: '资料' });
+  f.ctx.emit('agent/disposed', { agent });
+  const replacement = { id: crypto.randomUUID(), session: agent.session };
+  f.agents.splice(f.agents.indexOf(agent), 1, replacement);
+  await assert.rejects(f.execute(replacement, 'knowledge_search', { query: '资料' }), { code: 'KNOWLEDGE_LIMIT' });
+  const { createUserMessage } = await load('@deepseek-ai/dsh-llm');
+  replacement.session.append('user/message', createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: '新的根用户问题' }] }), { surfaceOp: 'append' });
+  assert.deepEqual((await f.execute(replacement, 'knowledge_search', { query: '资料' })).results, []);
+});
+
+for (const route of ['execute', 'call']) {
+  test(`Android knowledge local close waits for pending ${route} and rejects delayed evidence`, async t => {
+    const f = await localKnowledgeFixture(t); await f.import('关闭后不得返回的证据'); await f.enable();
+    const gate = Promise.withResolvers(); let started = false, finished = false;
+    await f.start({ search: async rows => { started = true; await gate.promise; finished = true;
+      return { mode: 'keyword', results: rows.map(row => ({ row, matchedBy: ['keyword'] })) }; } });
+    const agent = await f.agent();
+    const request = route === 'execute' ? f.execute(agent, 'knowledge_search', { query: '证据' }) : f.knowledge.call('search', { query: '证据' });
+    const rejected = assert.rejects(request, { code: 'KNOWLEDGE_CANCELLED' });
+    await localMemoryWait(() => started, '待关闭检索没有进入等待');
+    let closed = false; const closing = f.knowledge.close().then(() => { closed = true; });
+    try {
+      await delay(20);
+      assert.equal(closed, false, 'close 必须等待已开始的工具或管理请求离开');
+    } finally { gate.resolve(); await Promise.all([rejected, closing]); }
+    assert.equal(finished, true); assert.equal(closed, true);
+    await assert.rejects(f.execute(agent, 'knowledge_search', { query: '证据' }), { code: 'KNOWLEDGE_NOT_READY' });
+    await assert.rejects(f.knowledge.call('search', { query: '证据' }), { code: 'KNOWLEDGE_NOT_READY' });
+  });
+}
+
+for (const [tool, change] of [['knowledge_search', 'update'], ['knowledge_read', 'remove']]) {
+  test(`Android knowledge local P1 ${tool} refuses a document ${change} committed during final model resolution`, async t => {
+    const f = await localKnowledgeFixture(t), source = await f.import('旧版正式原文不得在最终等待后返回');
+    await f.enable();
+    const gate = Promise.withResolvers(); let resolutions = 0, entered = false, settled = false;
+    f.ctx.llm.resolveModelInfo = async () => {
+      if (++resolutions === 2) { entered = true; await gate.promise; }
+      return { context: { contextWindow: 16000 } };
+    };
+    await f.start({ capacity: undefined });
+    const agent = await f.agent(); agent.session.requestHeader = () => ({ config: { provider: 'fixture', model: 'fixture', maxTokens: 100 } });
+    const args = tool === 'knowledge_search' ? { query: '正式原文' } : { ref: `kb:document:${source.id}:v${source.version}:text` };
+    const request = f.execute(agent, tool, args);
+    request.then(() => { settled = true; }, () => { settled = true; });
+    const rejected = assert.rejects(request, { code: 'KNOWLEDGE_VERSION_CHANGED' });
+    try {
+      await localMemoryWait(() => entered || settled, '最终模型容量查询没有完成也没有进入等待');
+      assert.equal(entered, true, '必须在返回证据前再次异步解析当前模型');
+      const result = await f.manage(change, f.operation({ sourceId: source.id, expectedRevision: source.revision,
+        ...change === 'update' ? { patch: { text: '已发布新版正式原文' } } : {} }));
+      assert.equal((await f.store.wait(result.job.id)).state, 'succeeded');
+    } finally { gate.resolve(); await rejected; }
+    if (change === 'update') assert.equal(await f.store.sourceText(f.store.read().sources.find(row => row.id === source.id)), '已发布新版正式原文');
+    else assert.ok(f.store.read().sources.every(row => row.id !== source.id || row.state === 'deleted'));
+  });
+}
+
+// 调度回归使用真实 MemoryStore、extract 和输入构造，仅模型传输返回固定空数组。
+async function localMemoryFlow(t, options = {}) {
+  const f = await localMemoryFixture(t);
+  const { createUserMessage, createAssistantMessage } = await load('@deepseek-ai/dsh-llm');
+  const { extract } = await import(pathToFileURL(join(core, 'memory-extract.mjs')));
+  const handlers = new Map(), events = [], requests = [];
+  let time = 1000000, window = options.window ?? 32768;
+  const session = { id: crypto.randomUUID(), seq: 0, header: { cwd: workspace }, snapshotEvents: () => events,
+    requestHeader: () => ({ config: { provider: 'fixture', model: 'source-model' } }) };
+  const ctx = {
+    on(name, handler) { if (!handlers.has(name)) handlers.set(name, new Set()); handlers.get(name).add(handler); return () => handlers.get(name).delete(handler); },
+    workingDirectory: { get: () => workspace }, sessions: { flush: async () => true },
+    sessionPersistence: { open: async () => ({ read: async (from = 0, count = events.length - from) => ({ events: events.slice(from, from + count) }), close: async () => {} }) },
+    llm: { listProviders: () => [{ id: 'fixture' }], async prepareCall(config, signal, refine) {
+      const controls = refine(config, { provider: 'fixture', id: 'source-model', context: { contextWindow: window }, defaultMaxTokens: 256 });
+      return { config: controls, async *stream(request) {
+        requests.push({ system: request.system, input: JSON.parse(request.messages[0].content[0].text) });
+        yield { type: 'text-delta', index: 0, text: '[]' }; yield { type: 'finish', reason: { kind: 'stop' } };
+      } };
+    } },
+  };
+  const emit = (name, ...args) => { for (const handler of handlers.get(name) ?? []) handler(...args); };
+  const start = async () => {
+    f.memory = f.memorySession(ctx, { store: f.store, extract, now: () => time, ...options });
+    await f.memory.ready;
+  };
+  await start(); await f.settings(true, true);
+  const settle = async () => {
+    for (let i = 0; i < 8; i++) { await new Promise(resolve => setImmediate(resolve)); await f.store.queue; }
+  };
+  return Object.assign(f, { events, requests, session, flow: ctx, emit, start, settle,
+    advance(ms) { time += ms; }, window(value) { window = value; },
+    async turn(text = '请说明当前代码如何工作') {
+      const message = createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text }] });
+      await f.memory.before({ agent: { session }, messages: [], signal: new AbortController().signal }, async () => ({ kind: 'enter', messages: [message] }));
+      const append = (type, data) => { const event = { seq: events.length, type, data }; events.push(event); session.seq = events.length; return event; };
+      append('request/header', { header: session.requestHeader() });
+      append('user/message', message);
+      append('assistant/message', { message: createAssistantMessage({ source: session.requestHeader().config, content: [{ type: 'text', text: '这是助手背景' }] }) });
+      const end = append('turn/end', { turn: events.length, reason: { kind: 'completed' } });
+      emit('session/event', session, end);
+      await localMemoryWait(() => f.store.read().jobs.some(job => job.to === session.seq) || f.store.read().cursors[session.id]?.next === session.seq, '回合范围未持久登记');
+      await settle();
+    },
+  });
+}
+
+test('Android memory local schedule batches four user turns and preserves pending progress before the threshold', async t => {
+  const f = await localMemoryFlow(t);
+  for (let i = 0; i < 3; i++) await f.turn(`第${i}轮，请分析项目结构`);
+  assert.equal(f.requests.length, 0);
+  assert.equal(f.store.read().jobs.length, 1);
+  assert.equal(f.store.read().jobs[0].ready, false);
+  assert.equal(f.store.read().cursors[f.session.id].next, 0);
+  await f.turn('第四轮，继续分析模块');
+  await localMemoryWait(() => !f.store.read().jobs.length, '四轮批次没有完成');
+  assert.equal(f.requests.length, 1);
+  assert.equal(f.requests[0].input.messages.filter(row => row.role === 'user').length, 4);
+  assert.equal(f.store.read().cursors[f.session.id].next, f.events.length);
+});
+
+test('Android memory local schedule cools ordinary batches while explicit memory requests bypass the delay', async t => {
+  const f = await localMemoryFlow(t);
+  for (let i = 0; i < 8; i++) await f.turn();
+  assert.equal(f.requests.length, 1);
+  assert.equal(f.store.read().jobs.length, 1);
+  assert.equal(f.store.read().jobs[0].ready, true);
+  assert.ok(f.store.read().jobs[0].notBefore > f.store.read().cursors[f.session.id].lastRun);
+  await f.turn('请记住：我习惯先检查受影响的模块');
+  await localMemoryWait(() => !f.store.read().jobs.length, '明确记住没有绕过冷却');
+  assert.equal(f.requests.length, 2);
+  assert.equal(f.requests[1].input.messages.filter(row => row.role === 'user').length, 5);
+});
+
+test('Android memory local schedule drains a cooled batch when the interval has elapsed', async t => {
+  const f = await localMemoryFlow(t, { schedule: { cooldown: 50 } });
+  for (let i = 0; i < 8; i++) await f.turn();
+  assert.equal(f.requests.length, 1);
+  f.advance(51);
+  await localMemoryWait(() => !f.store.read().jobs.length, '到期的批次没有继续');
+  assert.equal(f.requests.length, 2);
+});
+
+for (const trigger of ['retry', 'organize', 'compaction/start']) {
+  test(`Android memory local schedule ${trigger} flushes accumulated evidence before the ordinary threshold`, async t => {
+    const f = await localMemoryFlow(t);
+    await f.turn('这是一条尚未达到整理阈值的普通消息');
+    assert.equal(f.requests.length, 0);
+    if (trigger === 'compaction/start') {
+      const event = { seq: f.events.length, type: trigger, data: {} }; f.events.push(event); f.session.seq++;
+      f.emit('session/event', f.session, event);
+    } else await f.memory.call(trigger, trigger === 'retry' ? { id: f.store.read().jobs[0].id } : {});
+    await localMemoryWait(() => f.requests.length === 1 && !f.store.read().jobs.length, `${trigger} 未整理当前积累`);
+    assert.equal(f.requests[0].input.messages.filter(row => row.role === 'user').length, 1);
+  });
+}
+
+test('Android memory local schedule restarts without sending and combines the saved pending range', async t => {
+  const f = await localMemoryFlow(t);
+  for (let i = 0; i < 3; i++) await f.turn();
+  const pending = f.store.read().jobs[0];
+  await f.memory.close(); f.store = await f.openMemory(f.ctx); await f.start();
+  assert.equal(f.requests.length, 0);
+  assert.equal(f.store.read().jobs.length, 1);
+  assert.equal(f.store.read().jobs[0].from, pending.from);
+  assert.equal(f.store.read().jobs[0].to, pending.to);
+  await f.turn('重启后的第四个回合');
+  await localMemoryWait(() => !f.store.read().jobs.length, '恢复范围没有和新增内容一起处理');
+  assert.equal(f.requests.length, 1);
+  assert.equal(f.requests[0].input.messages.filter(row => row.role === 'user').length, 4);
+});
+
+test('Android memory local schedule byte trigger processes complete evidence across a smaller actual model window', async t => {
+  const f = await localMemoryFlow(t, { window: 6000 });
+  for (let i = 0; i < 2; i++) await f.turn(`第${i}条` + '中文'.repeat(350));
+  await localMemoryWait(() => !f.store.read().jobs.length, '实际窗口收紧后未继续分批');
+  assert.equal(f.requests.length, 2);
+  const ids = f.requests.flatMap(row => row.input.messages.filter(message => message.role === 'user').map(message => message.id));
+  assert.deepEqual(ids, f.events.filter(row => row.type === 'user/message').map(row => row.seq));
+  assert.equal(f.store.read().cursors[f.session.id].next, f.events.length);
+});
+
+test('Android memory local schedule oversized single message stays failed without advancing or automatic retry', async t => {
+  const f = await localMemoryFlow(t);
+  await f.turn('超大原文'.repeat(3000));
+  await localMemoryWait(() => f.store.read().jobs[0]?.state === 'failed', '超大单条没有留下失败任务');
+  assert.equal(f.requests.length, 0);
+  assert.equal(f.store.read().cursors[f.session.id].next, 0);
+  assert.equal(f.store.read().jobs[0].attempts, 1);
+  assert.match(f.store.read().jobs[0].message, /单条用户消息.*保留/);
+  await f.turn('稍后的普通内容');
+  await f.settle();
+  assert.equal(f.requests.length, 0);
+  assert.equal(f.store.read().jobs[0].attempts, 1);
+  assert.equal(f.store.read().cursors[f.session.id].next, 0);
+});
+
+test('Android memory local extraction backgrounds rank related topics and keep locked correction context within its own budget', async t => {
+  const f = await localMemoryFixture(t);
+  const { selectEvents } = await import(pathToFileURL(join(core, 'memory-extract.mjs')));
+  const { createUserMessage } = await load('@deepseek-ai/dsh-llm');
+  const scope = { kind: 'workspace', workspace };
+  await f.store.save(f.data('coffee', { scope, summary: '无糖咖啡偏好', content: '我通常喜欢无糖咖啡' }));
+  for (let i = 0; i < 20; i++) await f.store.save(f.data(`unrelated-${i}`, { scope, summary: `门禁编号${i}`, content: `门禁编号${i}由管理员维护` }));
+  const event = text => [{ seq: 1, type: 'user/message', data: createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text }] }) }];
+  const regular = selectEvents(event('我通常喜欢无糖咖啡'), { entries: f.store.read().entries, scope });
+  assert.equal(regular.entries.length, 1);
+  assert.equal(regular.entries[0].key, 'coffee');
+  assert.equal(regular.entries[0].locked, true);
+  assert.equal(regular.entries[0].content, undefined, '普通批次不重复传旧正文');
+  const correction = selectEvents(event('更正咖啡偏好：我现在喜欢加奶咖啡'), { entries: f.store.read().entries, scope });
+  assert.equal(correction.entries[0].content, '我通常喜欢无糖咖啡');
+  assert.ok(Buffer.byteLength(JSON.stringify(correction.entries)) <= 1536);
+  assert.deepEqual(selectEvents(event('请分析星系的形成'), { entries: f.store.read().entries, scope }).entries, []);
+});
+
+async function localSharedMemory(f, options = {}) {
+  const memory = await import(pathToFileURL(join(core, 'memory.mjs')));
+  const storage = await import(pathToFileURL(join(core, 'memory-store.mjs')));
+  const store = await storage.openMemory(f.ctx);
+  f.memory = memory.memorySession(f.ctx, { store, capacity: 100000, ...options });
+  await f.memory.ready;
+  await f.memory.call('settings', { enabled: true, autoSave: false, revision: store.read().revision });
+  await store.save(f.data('shared', { content: '共享读取预算的事实正文' }));
+  return { store, memory: f.memory, execute: (agent, tool, args = {}, signal) => f.memory.execute(tool, args, { agent, signal }) };
+}
+
+for (const first of ['memory_search', 'knowledge_search']) {
+  test(`Android knowledge local shared ${first} cannot bypass the search count through the other tool family`, async t => {
+    const f = await localKnowledgeFixture(t); await f.enable(); await f.start();
+    const memory = await localSharedMemory(f), agent = await f.agent();
+    const old = (tool) => tool.startsWith('memory') ? memory.execute(agent, tool, { query: '共享' }) : f.execute(agent, tool, { query: '共享' });
+    for (let i = 0; i < 3; i++) await old(first);
+    const other = first === 'memory_search' ? 'knowledge_search' : 'memory_search';
+    await assert.rejects(old(other), { code: other.startsWith('memory') ? 'MEMORY_TOOL_LIMIT' : 'KNOWLEDGE_LIMIT' });
+  });
+}
+
+test('Android knowledge local shared read counts combine old memory reads with knowledge reads', async t => {
+  const f = await localKnowledgeFixture(t), source = await f.import('共享读取的知识正文'); await f.enable(); await f.start();
+  const memory = await localSharedMemory(f), agent = await f.agent(), row = memory.store.read().entries[0];
+  for (let i = 0; i < 3; i++) {
+    assert.equal((await memory.execute(agent, 'memory_read', { id: row.id })).content, row.content);
+    await f.execute(agent, 'knowledge_read', { ref: `kb:document:${source.id}:v${source.version}:text` });
+  }
+  await assert.rejects(memory.execute(agent, 'memory_read', { id: row.id }), { code: 'MEMORY_TOOL_LIMIT' });
+  await assert.rejects(f.execute(agent, 'knowledge_read', { ref: `kb:document:${source.id}:v${source.version}:text` }), { code: 'KNOWLEDGE_LIMIT' });
+  assert.equal((await memory.memory.call('read', { id: row.id })).entry.content, row.content, '原生管理读取不消耗模型工具额度');
+});
+
+test('Android knowledge local shared bytes from memory reads reduce the remaining knowledge capacity', async t => {
+  const f = await localKnowledgeFixture(t), source = await f.import('长知识正文'.repeat(160)); await f.enable(); await f.start({ capacity: 900 });
+  const memory = await localSharedMemory(f, { capacity: 900 }), agent = await f.agent(), row = memory.store.read().entries[0];
+  let used = Buffer.byteLength(JSON.stringify(await memory.execute(agent, 'memory_read', { id: row.id })));
+  try {
+    const result = await f.execute(agent, 'knowledge_read', { ref: `kb:document:${source.id}:v${source.version}:text` });
+    used += Buffer.byteLength(JSON.stringify(result));
+  } catch (error) { assert.equal(error.code, 'KNOWLEDGE_LIMIT'); }
+  assert.ok(used <= 900);
+  await assert.rejects(memory.execute(agent, 'memory_read', { id: row.id }), { code: 'MEMORY_TOOL_LIMIT' });
+});
+
+test('Android knowledge local shared concurrency reserves knowledge capacity before an old memory read', async t => {
+  const f = await localKnowledgeFixture(t); await f.import('并发读取正文'); await f.enable();
+  const gate = Promise.withResolvers(); let started = false;
+  await f.start({ capacity: 900, search: async rows => { started = true; await gate.promise; return { mode: 'keyword', results: rows.map(row => ({ row, score: 1 })) }; } });
+  const memory = await localSharedMemory(f, { capacity: 900 }), agent = await f.agent(), row = memory.store.read().entries[0];
+  const request = f.execute(agent, 'knowledge_search', { query: '正文' });
+  try {
+    await localMemoryWait(() => started, '知识读取没有进入并发准备');
+    await assert.rejects(memory.execute(agent, 'memory_read', { id: row.id }), { code: 'MEMORY_TOOL_LIMIT' });
+  } finally { gate.resolve(); await request; }
+  assert.equal((await memory.execute(agent, 'memory_read', { id: row.id })).content, row.content, '并发预留必须在完成后释放');
+});
+
+test('Android memory local tool preserves full legacy entries and rejects oversized complete results', async t => {
+  const f = await localKnowledgeFixture(t);
+  const memory = await localSharedMemory(f, { capacity: 700 }), agent = await f.agent(), row = memory.store.read().entries[0];
+  await memory.store.save(f.data('shared', { id: row.id, content: '中文长正文'.repeat(300) }));
+  await assert.rejects(memory.execute(agent, 'memory_read', { id: row.id }), { code: 'MEMORY_TOOL_LIMIT' });
+  assert.equal((await memory.memory.call('read', { id: row.id })).entry.content, '中文长正文'.repeat(300));
+  await assert.rejects(memory.execute({ session: agent.session }, 'memory_read', { id: row.id }), { code: 'MEMORY_NOT_READY' });
+});
+
+for (const change of ['remove', 'expiry', 'workspace', 'cancel', 'close']) {
+  test(`Android memory local tool ${change} during final model resolution cannot expose prepared evidence`, async t => {
+    const f = await localKnowledgeFixture(t);
+    const memory = await localSharedMemory(f, { capacity: undefined }), agent = await f.agent(), row = memory.store.read().entries[0];
+    const gate = Promise.withResolvers(); let calls = 0, entered = false;
+    f.ctx.llm.resolveModelInfo = async () => { if (++calls === 2) { entered = true; await gate.promise; } return { context: { contextWindow: 32768 } }; };
+    agent.session.requestHeader = () => ({ config: { provider: 'fixture', model: 'fixture', maxTokens: 100 } });
+    const controller = new AbortController();
+    const request = memory.execute(agent, 'memory_read', { id: row.id }, controller.signal);
+    const rejected = assert.rejects(request, error => error.name === 'AbortError' || ['MEMORY_VERSION_CHANGED', 'MEMORY_STOPPED', 'MEMORY_MISSING'].includes(error.code));
+    let closing;
+    try {
+      await localMemoryWait(() => entered, '记忆返回前未复核模型容量');
+      if (change === 'remove') await memory.store.remove({ id: row.id });
+      if (change === 'expiry') await memory.store.change(next => { next.entries[0].expiresAt = Date.now() - 1; });
+      if (change === 'workspace') f.ctx.workingDirectory.get = () => join(workspace, 'changed');
+      if (change === 'cancel') controller.abort();
+      if (change === 'close') closing = memory.memory.close();
+    } finally { gate.resolve(); await rejected; await closing; }
+  });
+}
+
+test('Android knowledge local shared budget survives a knowledge module close and reopen', async t => {
+  const f = await localKnowledgeFixture(t); await f.enable(); await f.start();
+  const agent = await f.agent();
+  for (let i = 0; i < 3; i++) await f.execute(agent, 'knowledge_search', { query: '资料' });
+  await f.knowledge.close();
+  const { openKnowledge } = await localKnowledgeModules();
+  f.store = await openKnowledge(f.ctx, { root: f.root }); await f.store.ready;
+  await f.start();
+  await assert.rejects(f.execute(agent, 'knowledge_search', { query: '资料' }), { code: 'KNOWLEDGE_LIMIT' });
+});
+
+test('Android knowledge local shared budget follows real plugin child contexts under one engine', async t => {
+  const f = await localKnowledgeFixture(t); await f.enable();
+  const { knowledgeSession } = await import(pathToFileURL(join(core, 'knowledge.mjs')));
+  const child = f.ctx.extend();
+  assert.notEqual(child, f.ctx); assert.equal(child.root, f.ctx.root);
+  f.knowledge = knowledgeSession(child, { store: f.store, capacity: 100000, memory: { view: () => ({ enabled: false, revision: 0, entries: [] }) } });
+  await f.knowledge.ready;
+  const memory = await localSharedMemory(f), agent = await f.agent();
+  for (let i = 0; i < 3; i++) await f.execute(agent, 'knowledge_search', { query: '共享' });
+  await assert.rejects(memory.execute(agent, 'memory_search', { query: '共享' }), { code: 'MEMORY_TOOL_LIMIT' });
+});
+
+test('Android memory local extraction keeps the message limit as a continuation boundary', async () => {
+  const { selectEvents } = await import(pathToFileURL(join(core, 'memory-extract.mjs')));
+  const { createUserMessage } = await load('@deepseek-ai/dsh-llm');
+  const events = Array.from({ length: 40 }, (_, seq) => ({ seq, type: 'user/message', data: createUserMessage({
+    source: { kind: 'user' }, content: [{ type: 'text', text: `第${seq}条` }],
+  }) }));
+  const first = selectEvents(events);
+  assert.equal(first.messages.length, 32); assert.equal(first.next, 32);
+  assert.deepEqual(first.skipped, []);
+  const last = selectEvents(events.filter(row => row.seq >= first.next));
+  assert.deepEqual([...first.messages, ...last.messages].map(row => row.id), events.map(row => row.seq));
+});
+
+for (const event of ['llm/adapters-updated', 'loader/volatile-update', 'credentials/reference-updated', 'credentials/record-updated']) {
+  test(`Android memory local tool source change ${event} rejects delayed reads while automatic extraction is disabled`, async t => {
+    const f = await localKnowledgeFixture(t);
+    const memory = await localSharedMemory(f, { capacity: undefined }), agent = await f.agent(), row = memory.store.read().entries[0];
+    const gate = Promise.withResolvers(); let calls = 0, entered = false;
+    f.ctx.llm.resolveModelInfo = async () => { if (++calls === 2) { entered = true; await gate.promise; } return { context: { contextWindow: 32768 } }; };
+    agent.session.requestHeader = () => ({ config: { provider: 'fixture', model: 'fixture', maxTokens: 100 } });
+    assert.equal(memory.store.read().settings.autoSave, false);
+    const request = memory.execute(agent, 'memory_read', { id: row.id });
+    const rejected = assert.rejects(request, { code: 'MEMORY_VERSION_CHANGED' });
+    try { await localMemoryWait(() => entered, '读取未进入最终容量等待'); f.ctx.emit(event); }
+    finally { gate.resolve(); await rejected; }
+  });
+}
+
+test('Android memory local schedule route boundary releases an earlier accumulating range before an urgent later range', async t => {
+  const f = await localMemoryFlow(t);
+  await f.turn('路由A下的普通内容');
+  assert.equal(f.requests.length, 0);
+  f.session.requestHeader = () => ({ config: { provider: 'fixture', model: 'source-model-b' } });
+  f.flow.llm.prepareCall = async (config, signal, refine) => {
+    const controls = refine(config, { provider: config.provider, id: config.model, context: { contextWindow: 32768 }, defaultMaxTokens: 256 });
+    return { config: controls, async *stream(request) {
+      f.requests.push({ route: config.model, input: JSON.parse(request.messages[0].content[0].text) });
+      yield { type: 'text-delta', index: 0, text: '[]' }; yield { type: 'finish', reason: { kind: 'stop' } };
+    } };
+  };
+  await f.turn('请记住：路由B下我习惯保留数据');
+  await localMemoryWait(() => !f.store.read().jobs.length, '来源边界的积累任务挡住后续明确请求');
+  assert.deepEqual(f.requests.map(row => row.route), ['source-model', 'source-model-b']);
+  assert.deepEqual(f.requests.flatMap(row => row.input.messages.filter(m => m.role === 'user').map(m => m.id)), [1, 5]);
+  assert.equal(f.store.read().cursors[f.session.id].next, f.events.length);
+});
+
+test('Android memory local schedule recalculates ordinary cooldown after a previous in-flight batch commits', async t => {
+  const f = await localMemoryFlow(t);
+  const prepare = f.flow.llm.prepareCall, gate = Promise.withResolvers(); let started = false;
+  f.flow.llm.prepareCall = async (...args) => {
+    const call = await prepare(...args);
+    return { ...call, async *stream(request) { started = true; await gate.promise; yield* call.stream(request); } };
+  };
+  for (let i = 0; i < 4; i++) await f.turn();
+  assert.equal(started, true);
+  for (let i = 0; i < 4; i++) await f.turn();
+  assert.equal(f.store.read().jobs.length, 2);
+  assert.equal(f.store.read().jobs[1].ready, true);
+  gate.resolve();
+  await localMemoryWait(() => f.requests.length >= 1 && !f.store.read().jobs.some(row => row.message === '整理中'), '首批没有离开运行状态');
+  await f.settle();
+  assert.equal(f.requests.length, 1, '新普通任务必须以首批刚写入的成功时间计算冷却');
+  assert.equal(f.store.read().jobs.length, 1);
+  await f.memory.call('organize');
+  await localMemoryWait(() => f.requests.length === 2 && !f.store.read().jobs.length, '手动整理仍应绕过冷却');
+});
+
+test('Android knowledge local shared budget rejects a request header changed while evidence was prepared', async t => {
+  const f = await localKnowledgeFixture(t); await f.import('请求路由变化前的证据'); await f.enable();
+  f.ctx.llm.resolveModelInfo = async () => ({ context: { contextWindow: 32768 } });
+  const agent = await f.agent(), header = { config: { provider: 'fixture', model: 'original', maxTokens: 100 } };
+  agent.session.requestHeader = () => header;
+  await f.start({ capacity: undefined, search: async rows => {
+    header.config.model = 'changed';
+    return { mode: 'keyword', results: rows.map(row => ({ row, matchedBy: ['keyword'] })) };
+  } });
+  await assert.rejects(f.execute(agent, 'knowledge_search', { query: '证据' }), { code: 'KNOWLEDGE_VERSION_CHANGED' });
 });

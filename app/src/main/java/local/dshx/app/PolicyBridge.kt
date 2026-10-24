@@ -35,22 +35,57 @@ class PolicyBridge(
     private data class Call(val id: Long, val session: String, val cancelled: AtomicBoolean = AtomicBoolean())
     @Volatile private var phoneCall: Call? = null
     @Volatile private var modelCall: Call? = null
-    private val voiceCalls = ConcurrentHashMap<String, CompletableFuture<JSONObject>>()
+    private val nativeCalls = ConcurrentHashMap<String, CompletableFuture<JSONObject>>()
 
     /** Called off the main thread; replies share the existing authenticated connection. */
-    fun voice(action: String, data: JSONObject = JSONObject()): JSONObject {
-        val socket = client ?: throw IllegalStateException("语音会话尚未连接，请先启动 dsh。")
-        check(!closed) { "语音会话连接已停止。" }
+    fun voice(action: String, data: JSONObject = JSONObject()): JSONObject = request("voice", action, data, 180)
+
+    fun memory(action: String, data: JSONObject = JSONObject()): JSONObject = request("memory", action, data, 60)
+
+    /** 中断和超时只释放等待；业务取消必须显式调用 cancel 并提供任务编号。 */
+    fun knowledge(action: String, data: JSONObject = JSONObject()): JSONObject {
+        KnowledgeStore.request(action, data)
+        return request("knowledge", action, data, 30).also { result ->
+            when (action) {
+                "status" -> KnowledgeStore.status(result)
+                "list" -> KnowledgeStore.catalog(result)
+                "read" -> if (data.has("ref")) KnowledgeStore.reference(result) else KnowledgeStore.page(result)
+                "search" -> KnowledgeStore.search(result)
+                else -> KnowledgeStore.accepted(result, action, data)
+            }
+        }
+    }
+
+    private fun request(channel: String, action: String, data: JSONObject, timeout: Long): JSONObject {
+        val socket = client ?: throw IllegalStateException("引擎尚未连接，请先启动 dsh。")
+        check(!closed) { "引擎连接已停止。" }
         val id = UUID.randomUUID().toString()
+        val key = "$channel:$id"
         val result = CompletableFuture<JSONObject>()
-        voiceCalls[id] = result
+        nativeCalls[key] = result
+        var cancel = false
         try {
-            check(client === socket && !closed) { "语音会话连接已停止。" }
-            send(socket, JSONObject().put("voice", id).put("action", action).put("data", data))
-            val response = result.get(180, TimeUnit.SECONDS)
-            check(response.optBoolean("ok")) { response.optString("error", "语音会话请求失败。") }
+            check(client === socket && !closed) { "引擎连接已停止。" }
+            send(socket, JSONObject().put(channel, id).put("action", action).put("data", data))
+            val response = result.get(timeout, TimeUnit.SECONDS)
+            if (channel == "knowledge" && !response.getBoolean("ok"))
+                throw KnowledgeStore.Error(response.getString("code"), KnowledgeStore.error(response.getString("code")))
+            check(response.optBoolean("ok")) { response.optString("error", "请求失败，请重试。") }
             return response.getJSONObject("result")
-        } finally { voiceCalls.remove(id) }
+        } catch (error: InterruptedException) {
+            cancel = true
+            throw error
+        } catch (error: java.util.concurrent.TimeoutException) {
+            cancel = true
+            throw IllegalStateException(if (channel == "knowledge") "等待知识回执超时；任务可能已受理，请用原操作编号核实结果。"
+                else "请求等待超时，请重新读取长期记忆或语音状态确认实际结果。", error)
+        } finally {
+            nativeCalls.remove(key)
+            result.cancel(false)
+            if (cancel && channel == "memory" && !closed && client === socket) runCatching {
+                send(socket, JSONObject().put("memory", id).put("action", "cancel").put("data", JSONObject().put("id", id)))
+            }
+        }
     }
 
     fun start() {
@@ -90,11 +125,19 @@ class PolicyBridge(
             socket.soTimeout = 0
             send(socket, JSONObject().put("id", 0).put("ok", true).put("state", snapshot()))
             while (!closed) {
-                val request = JSONObject(line(input) ?: break)
-                if (request.has("voice")) {
-                    require(request.keys().asSequence().all { it in setOf("voice", "ok", "result", "error") })
+                val frame = line(input, limit = MemoryStore.MAX_BYTES + 65_536) ?: break
+                val request = JSONObject(frame)
+                if (request.has("knowledge")) {
+                    require(frame.toByteArray(Charsets.UTF_8).size <= KnowledgeStore.MAX_FRAME) { "知识帧超过 256 KiB。" }
+                    KnowledgeStore.response(request)
+                    nativeCalls["knowledge:${request.getString("knowledge")}"]?.complete(request)
+                    continue
+                }
+                if (request.has("voice") || request.has("memory")) {
+                    val channel = if (request.has("memory")) "memory" else "voice"
+                    require(request.keys().asSequence().all { it in setOf(channel, "ok", "result", "error") })
                     require(request.get("ok") is Boolean)
-                    voiceCalls[request.getString("voice")]?.complete(request)
+                    nativeCalls["$channel:${request.getString(channel)}"]?.complete(request)
                     continue
                 }
                 val id = request.get("id")
@@ -207,7 +250,9 @@ class PolicyBridge(
 
     private fun send(socket: Socket, value: JSONObject) = synchronized(socket) {
         if (value.optBoolean("ok")) value.put("state", snapshot())
-        socket.getOutputStream().apply { write((value.toString() + "\n").toByteArray(Charsets.UTF_8)); flush() }
+        val bytes = value.toString().toByteArray(Charsets.UTF_8)
+        if (value.has("knowledge")) require(bytes.size <= KnowledgeStore.MAX_FRAME) { "知识消息超过 256 KiB。" }
+        socket.getOutputStream().apply { write(bytes); write(10); flush() }
     }
 
     override fun close() {
@@ -216,8 +261,8 @@ class PolicyBridge(
     }
 
     private fun release() {
-        voiceCalls.values.forEach { it.completeExceptionally(IllegalStateException("语音会话连接已停止。")) }
-        voiceCalls.clear()
+        nativeCalls.values.forEach { it.completeExceptionally(IllegalStateException("引擎连接已停止。")) }
+        nativeCalls.clear()
         phoneCall?.cancelled?.set(true)
         modelCall?.cancelled?.set(true)
         runCatching { server.close() }
@@ -226,13 +271,16 @@ class PolicyBridge(
     }
 
     companion object {
-        private fun line(input: InputStream, beforeRead: (() -> Unit)? = null): String? {
+        private fun line(input: InputStream, limit: Int = 32_768, beforeRead: (() -> Unit)? = null): String? {
             val bytes = ByteArrayOutputStream()
-            while (bytes.size() <= 32_768) {
+            while (bytes.size() <= limit) {
                 beforeRead?.invoke()
                 val value = input.read()
                 if (value == -1) { require(bytes.size() == 0); return null }
-                if (value == 10) return bytes.toString("UTF-8")
+                if (value == 10) {
+                    require(bytes.size() <= limit) { "查询消息过长" }
+                    return Charsets.UTF_8.newDecoder().decode(java.nio.ByteBuffer.wrap(bytes.toByteArray())).toString()
+                }
                 bytes.write(value)
             }
             throw IllegalArgumentException("查询消息过长")

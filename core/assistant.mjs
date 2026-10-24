@@ -215,7 +215,7 @@ function start(state, dispatch) {
   write(state, {
     event: 'start', id, provider: options.provider, model: options.model,
     ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
-    purpose: ['conversation', 'compaction', 'session-title'].includes(options.purpose) ? options.purpose : 'other',
+    purpose: ['conversation', 'compaction', 'session-title', 'memory-extraction', 'knowledge-summary', 'knowledge-embedding'].includes(options.purpose) ? options.purpose : 'other',
     dispatch, startedAt: Date.now(),
     // Tool results (including images) are billed when a subsequent request reads
     // them. Keep all input references, rather than charging an image to its capture.
