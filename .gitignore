@@ -29,5 +29,8 @@ app/src/main/assets/voice/wake/
 __pycache__/
 *.pyc
 
-# 本地项目文档，不纳入版本管理
-/docs/
+# 本地计划、历史记录与调研材料，不纳入版本管理
+/plan/
+
+# 本地早期验证材料，不纳入版本管理
+/p0/
