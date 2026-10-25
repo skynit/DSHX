@@ -614,6 +614,75 @@ class CoreTest {
         assertFalse(engine.restore { fail("未恢复的引擎不能导入"); ByteArrayInputStream(byteArrayOf()) })
     }
 
+    @Test fun voiceStartExplainsMissingModelsBeforeOpeningTheMicrophone() {
+        val app = RuntimeEnvironment.getApplication()
+        val root = folder.newFolder()
+        val context = object : ContextWrapper(app) { override fun getFilesDir() = root }
+        val engine = Engine(context)
+        ReflectionHelpers.setField(engine, "state", EngineState(url = "http://127.0.0.1:3080/"))
+        val voice = VoiceControl(context, engine)
+        for (mode in listOf("input", "talk", "wake")) {
+            voice.start(mode)
+            assertFalse(voice.state.active)
+            assertEquals("请先在设置中下载本地语音识别模型。", voice.state.error)
+        }
+    }
+
+    @Test fun chatUrlOpensTheVoiceSessionAndKeepsInstanceAuthentication() {
+        val instance = "http://127.0.0.1:3080/?token=test-token"
+        assertEquals(instance, MainActivity.chatUrl(instance, null))
+        val url = Uri.parse(MainActivity.chatUrl(instance, "session-1"))
+        assertEquals("test-token", url.getQueryParameter("token"))
+        assertEquals("session-1", url.getQueryParameter("dshx-session"))
+        assertTrue(MainActivity.sameOrigin(instance, url.toString()))
+    }
+
+    @Test fun voiceSessionSwitchClearsOnlyThePreviousConversationDisplay() {
+        val app = RuntimeEnvironment.getApplication()
+        val voice = VoiceControl(app, Engine(app))
+        ReflectionHelpers.setField(voice, "state", VoiceControl.State(
+            session = "session-1", turns = listOf(VoiceControl.Turn("turn-1", "刚才的问题", "刚才的回答")), draft = "草稿"))
+        voice.select("session-1")
+        assertEquals("刚才的回答", voice.state.turns.single().reply)
+        voice.select("session-2")
+        assertEquals("session-2", voice.state.session)
+        assertTrue(voice.state.turns.isEmpty())
+        assertEquals("", voice.state.draft)
+    }
+
+    @Test fun voiceConversationShowsRecognitionBeforeReplyAndKeepsEveryTurn() {
+        val first = VoiceControl.State().recognized("turn-1", "你好，请介绍自己。")
+        assertEquals("你好，请介绍自己。", first.turns.single().text)
+        assertNull(first.turns.single().reply)
+        assertEquals(first.turns.single().text, first.draft)
+        val answered = first.answered("turn-1", "session-1", "你好，我是你的助手。")
+        assertEquals("session-1", answered.session)
+        assertEquals("", answered.draft)
+        val next = answered.recognized("turn-2", "再说详细一些。")
+        assertEquals(listOf("turn-1", "turn-2"), next.turns.map { it.id })
+        assertEquals("你好，我是你的助手。", next.turns.first().reply)
+        assertNull(next.turns.last().reply)
+        val completed = next.answered("turn-2", "session-1", "我可以回答问题，并将回答朗读给你。")
+        assertEquals(2, completed.turns.size)
+        assertEquals("你好，我是你的助手。", completed.turns.first().reply)
+        assertEquals("我可以回答问题，并将回答朗读给你。", completed.turns.last().reply)
+        assertNull("更新不能修改之前已发布的状态", first.turns.single().reply)
+        assertEquals(1, answered.turns.size)
+    }
+
+    @Test fun voiceConversationRetainsRecognizedTextAfterStopAndFailure() {
+        val app = RuntimeEnvironment.getApplication()
+        val voice = VoiceControl(app, Engine(app))
+        val recognized = voice.state.recognized("turn-1", "保留这句话")
+        ReflectionHelpers.setField(voice, "state", recognized.copy(active = true))
+        voice.stop()
+        assertEquals(recognized.turns, voice.state.turns)
+        ReflectionHelpers.setField(voice, "state", voice.state.copy(active = false))
+        voice.start("talk")
+        assertNotNull(voice.state.error)
+        assertEquals(recognized.turns, voice.state.turns)
+    }
+
     @Test fun voiceModelsPublishOnlyVerifiedSetsAndRepairSameSizeDamage() {
         val app = RuntimeEnvironment.getApplication()
         val root = folder.newFolder()
@@ -636,6 +705,112 @@ class CoreTest {
         models.verify("wake")
     }
 
+    @Test fun voiceSmallModelSettingsKeepOnlineRoutesWithoutDownloadingLocalWeights() {
+        val app = RuntimeEnvironment.getApplication()
+        val root = folder.newFolder()
+        val context = object : ContextWrapper(app) {
+            override fun getFilesDir() = root
+            override fun getSharedPreferences(name: String, mode: Int) = super.getSharedPreferences("small-${root.name}-$name", mode)
+        }
+        val store = SmallModel(context)
+        assertEquals(SmallModel.Settings(), store.settings())
+        assertEquals("qwen3-0.6b", store.settings().route().getString("model"))
+        assertThrows(IllegalArgumentException::class.java) { store.save(SmallModel.Settings("custom")) }
+        for (invalid in listOf(SmallModel.Settings("unknown"), SmallModel.Settings("online"),
+            SmallModel.Settings("online", "dshx-local", "custom"), SmallModel.Settings("online", "service\n", "bad\u0000name"),
+            SmallModel.Settings("online", "a".repeat(257), "small"))) {
+            assertThrows(IllegalArgumentException::class.java) { store.save(invalid) }
+        }
+        store.save(SmallModel.Settings("online", " my-service ", " my-small-model "))
+        val recreated = VoiceControl(context, Engine(context))
+        assertEquals(SmallModel.Settings("online", "my-service", "my-small-model"), recreated.state.smallModel)
+        assertTrue(recreated.state.smallReady)
+        assertFalse(recreated.state.localReady)
+        assertEquals("my-service", recreated.state.smallModel.route().getString("provider"))
+        ReflectionHelpers.setField(recreated, "state", recreated.state.copy(active = true))
+        assertThrows(IllegalStateException::class.java) { recreated.saveSmallModel(SmallModel.Settings()) }
+        ReflectionHelpers.setField(recreated, "state", recreated.state.copy(active = false))
+        recreated.saveSmallModel(SmallModel.Settings())
+        assertFalse(recreated.state.smallReady)
+        assertEquals("default", store.settings().source)
+        // 截图可独立配置，不要求先下载文本模型；旧配置仍沿用原来源。
+        assertEquals("qwen3-0.6b", store.settings().imageRoute().getString("model"))
+        store.save(SmallModel.Settings(imageProvider = " image-service ", imageModel = " vision-small "))
+        val saved = SmallModel(context).settings()
+        assertEquals("image-service", saved.imageRoute().getString("provider"))
+        assertEquals("vision-small", saved.imageRoute().getString("model"))
+        assertEquals("qwen3-0.6b", saved.route().getString("model"))
+        assertFalse(store.status().getBoolean("enabled"))
+        recreated.local = true
+        assertTrue(store.status().getBoolean("enabled"))
+        assertEquals("vision-small", store.status().getJSONObject("route").getString("model"))
+        for (invalid in listOf(saved.copy(imageModel = ""), saved.copy(imageProvider = ""),
+            saved.copy(imageProvider = "dshx-local"), saved.copy(imageModel = "bad\u0000model"))) {
+            assertThrows(IllegalArgumentException::class.java) { store.save(invalid) }
+        }
+        assertEquals(saved, store.settings())
+    }
+
+    @Test fun voiceSmallModelImportPreservesTheLastPublishedFileOnFailureAndCancellation() {
+        val app = RuntimeEnvironment.getApplication()
+        val root = folder.newFolder()
+        val context = object : ContextWrapper(app) { override fun getFilesDir() = root }
+        val store = SmallModel(context)
+        val bytes = byteArrayOf(71, 71, 85, 70, 3, 0, 0, 0) + ByteArray(128) { 42 }
+        var validated = 0
+        fun install(data: ByteArray, cancel: () -> Boolean = { false }, validate: (File) -> Unit = { validated++ }) =
+            store.install(ByteArrayInputStream(data), "../我的模型.gguf", cancel, {}, validate)
+        install(bytes)
+        assertEquals(1, validated)
+        assertTrue(store.ready())
+        assertEquals("../我的模型.gguf", store.name())
+        val published = store.withFile { assertArrayEquals(bytes, it.readBytes()); it }
+        assertEquals("custom-model", published.parentFile!!.name)
+        assertThrows(IllegalArgumentException::class.java) { install("not a model".toByteArray()) }
+        assertThrows(IllegalArgumentException::class.java) { install(byteArrayOf(71, 71, 85, 70, 4, 0, 0, 0)) }
+        assertThrows(IllegalStateException::class.java) { install(bytes, validate = { error("模板不受支持") }) }
+        assertThrows(java.util.concurrent.CancellationException::class.java) { install(bytes, { true }) }
+        var cancelled = false
+        assertThrows(java.util.concurrent.CancellationException::class.java) { install(bytes, { cancelled }, { cancelled = true }) }
+        assertEquals(published, store.withFile { it })
+        assertEquals(1, File(root, "voice/custom-model").listFiles()!!.count { it.extension == "gguf" })
+        assertArrayEquals(bytes, published.readBytes())
+        java.io.RandomAccessFile(published, "rw").use { it.writeByte(0) }
+        assertTrue(store.ready())
+        assertThrows(IllegalStateException::class.java) { store.withFile { fail("损坏的文件不能用于推理") } }
+        install(bytes)
+        assertFalse(published.exists())
+        assertArrayEquals(bytes, store.withFile { it.readBytes() })
+    }
+
+    @Test fun voiceSmallModelReplacementWaitsForAnActiveReaderAndMemoryPressureRejectsLoading() {
+        val app = RuntimeEnvironment.getApplication()
+        val root = folder.newFolder()
+        val context = object : ContextWrapper(app) { override fun getFilesDir() = root }
+        val store = SmallModel(context)
+        val bytes = byteArrayOf(71, 71, 85, 70, 2, 0, 0, 0) + ByteArray(64)
+        store.install(ByteArrayInputStream(bytes), "旧模型", { false }, {}, {})
+        val checked = CountDownLatch(1)
+        val executor = Executors.newSingleThreadExecutor()
+        lateinit var replacement: java.util.concurrent.Future<*>
+        try {
+            store.withFile { old ->
+                replacement = executor.submit {
+                    store.install(ByteArrayInputStream(bytes), "新模型", { false }, {}, { checked.countDown() })
+                }
+                assertTrue(checked.await(3, TimeUnit.SECONDS))
+                assertFalse(replacement.isDone)
+                assertTrue(old.isFile)
+                assertEquals("旧模型", store.name())
+            }
+            replacement.get(3, TimeUnit.SECONDS)
+            assertEquals("新模型", store.name())
+        } finally { executor.shutdownNow() }
+        val memory = android.app.ActivityManager.MemoryInfo().apply { lowMemory = true }
+        shadowOf(app.getSystemService(android.app.ActivityManager::class.java)).setMemoryInfo(memory)
+        store.withFile { file -> assertThrows(IllegalStateException::class.java) { store.requireMemory(file, 512) } }
+    }
+
     @Test fun voiceKeywordUsesModelPhonesAndRemovesOnlyTheLeadingWake() {
         folder.newFile("pinyin.txt").writeText("U+4F60: nǐ # 你\nU+597D: hǎo,hào # 好\nU+5C0F: xiǎo # 小\nU+6A59: chéng # 橙\nU+7A0B: chéng # 程\n")
         val tokens = folder.newFile("tokens.txt").apply { writeText("n 0\nǐ 1\nh 2\nǎo 3\nx 4\niǎo 5\nch 6\néng 7\nHH 8\nAH0 9\nL 10\nOW1 11\n") }
@@ -651,6 +826,165 @@ class CoreTest {
         assertEquals("你好小橙，打开设置", VoiceInput.removeWake("你好小程！你好小橙，打开设置", "你好小橙", tokens, english))
     }
 
+    @Test fun voiceOutputDefaultsIgnoreLegacyCloneAndKeepProviderCredentialsSeparate() {
+        val context = RuntimeEnvironment.getApplication()
+        val old = context.getSharedPreferences("voice", 0)
+        val preferences = context.getSharedPreferences("voice-output", 0)
+        preferences.edit().clear().commit()
+        old.edit().putString("profile", "old-local-clone").commit()
+        try {
+            val initial = VoiceOutput.settings(context)
+            assertEquals("edge", initial.provider)
+            assertEquals("zh-CN-XiaoxiaoNeural", initial.edgeVoice)
+            assertEquals("zh_female_wanwanxiaohe_moon_bigtts", initial.volcVoice)
+            VoiceOutput(context).use { it.prepare { false } }
+            val volc = initial.copy(provider = "volc", auth = "token", appId = "app-123", accessKey = "secret-value")
+            VoiceOutput.save(context, volc)
+            assertEquals(volc, VoiceOutput.settings(context))
+            assertFalse(volc.toString().contains("secret-value"))
+            VoiceOutput.save(context, volc.copy(provider = "edge"))
+            assertEquals("secret-value", VoiceOutput.settings(context).accessKey)
+            assertEquals("old-local-clone", old.getString("profile", null))
+            assertThrows(IllegalArgumentException::class.java) { VoiceOutput.save(context, volc.copy(accessKey = "")) }
+            assertThrows(IllegalArgumentException::class.java) { VoiceOutput.save(context, volc.copy(appId = "bad\r\nheader")) }
+            assertThrows(IllegalArgumentException::class.java) { VoiceOutput.save(context, initial.copy(edgeVoice = "<injected>")) }
+            assertEquals("edge", VoiceOutput.settings(context).provider)
+        } finally { preferences.edit().clear().commit(); old.edit().remove("profile").commit() }
+    }
+
+    @Test fun voiceEdgeTokenMatchesCurrentProtocolAndFiveMinuteBuckets() {
+        assertEquals("52BC7A17B50DFEC9-28C4394775C8751CD2F6859C030C06DB1489ACAB3B3A7651831FC26895177ED6", VoiceOutput.edgeToken(0))
+        assertEquals("2CD23A2CA0B2595A-F3C846C370E05F9CC83ACC5F995C5F5D87A4D0F14CE8936A0F902E64099E38A2", VoiceOutput.edgeToken(1700000000000))
+        assertEquals("029A1405A8605637-9CE33F2C27361A4B3F67B8F2767CD45E13CBC9C8E11A0343F2E597520D35BF63", VoiceOutput.edgeToken(1792972800000))
+        assertEquals(VoiceOutput.edgeToken(1792972800000), VoiceOutput.edgeToken(1792973099999))
+        assertNotEquals(VoiceOutput.edgeToken(1792972800000), VoiceOutput.edgeToken(1792973100000))
+    }
+
+    @Test fun voiceEdgeEscapesMarkupAndRejectsMalformedAudioFrames() {
+        val xml = VoiceOutput.edgeSsml("zh-CN-XiaoxiaoNeural", "你好<&'\"\u0000🙂")
+        assertTrue(xml.contains("你好&lt;&amp;&apos;&quot;🙂"))
+        val headers = "Path:audio\r\nContent-Type:audio/mpeg\r\n".toByteArray()
+        val frame = byteArrayOf((headers.size shr 8).toByte(), headers.size.toByte()) + headers + byteArrayOf(1, 2, 3)
+        assertArrayEquals(byteArrayOf(1, 2, 3), VoiceOutput.edgeAudio(frame))
+        assertThrows(IllegalStateException::class.java) { VoiceOutput.edgeAudio(byteArrayOf(0)) }
+        assertThrows(IllegalStateException::class.java) { VoiceOutput.edgeAudio(byteArrayOf(127, 127)) }
+        val wrong = "Path:audio\r\nContent-Type:text/html\r\n".toByteArray()
+        assertThrows(IllegalStateException::class.java) {
+            VoiceOutput.edgeAudio(byteArrayOf(0, wrong.size.toByte()) + wrong + byteArrayOf(1))
+        }
+    }
+
+    @Test fun voiceEdgeWebSocketReceivesAudioOnlyAfterTurnCompletes() {
+        val context = RuntimeEnvironment.getApplication()
+        context.getSharedPreferences("voice-output", 0).edit().clear().commit()
+        val messages = java.util.concurrent.CopyOnWriteArrayList<String>()
+        okhttp3.mockwebserver.MockWebServer().use { server ->
+            server.enqueue(okhttp3.mockwebserver.MockResponse().withWebSocketUpgrade(object : okhttp3.WebSocketListener() {
+                override fun onMessage(webSocket: okhttp3.WebSocket, text: String) {
+                    messages += text
+                    if (text.contains("Path:ssml")) {
+                        val headers = "Path:audio\r\nContent-Type:audio/mpeg\r\n".toByteArray()
+                        val frame = byteArrayOf(0, headers.size.toByte()) + headers + byteArrayOf(1, 2, 3)
+                        webSocket.send(okio.ByteString.of(*frame))
+                        webSocket.send("Path:turn.end\r\n\r\n")
+                    }
+                }
+            }))
+            VoiceOutput(context).use { output ->
+                assertArrayEquals(byteArrayOf(1, 2, 3), output.synthesize("你好<&", { false }, server.url("/edge").toString()))
+            }
+            assertEquals(2, messages.size)
+            assertTrue(messages[0].contains("audio-24khz-48kbitrate-mono-mp3"))
+            assertTrue(messages[1].contains("你好&lt;&amp;"))
+            val request = server.takeRequest(2, TimeUnit.SECONDS)!!
+            assertTrue(request.path!!.contains("Sec-MS-GEC-Version=2-"))
+            assertNull(request.getHeader("X-Api-Access-Key"))
+        }
+    }
+
+    @Test fun voiceEdgeCancellationEndsPendingConnection() {
+        val context = RuntimeEnvironment.getApplication()
+        context.getSharedPreferences("voice-output", 0).edit().clear().commit()
+        val worker = Executors.newSingleThreadExecutor()
+        try {
+            okhttp3.mockwebserver.MockWebServer().use { server ->
+                server.enqueue(okhttp3.mockwebserver.MockResponse().withWebSocketUpgrade(object : okhttp3.WebSocketListener() {}))
+                VoiceOutput(context).use { output ->
+                    val future = worker.submit<ByteArray> { output.synthesize("你好", { false }, server.url("/edge").toString()) }
+                    assertNotNull(server.takeRequest(3, TimeUnit.SECONDS))
+                    output.stop()
+                    val error = assertThrows(java.util.concurrent.ExecutionException::class.java) { future.get(2, TimeUnit.SECONDS) }
+                    assertTrue(generateSequence(error as Throwable) { it.cause }.any { it is java.util.concurrent.CancellationException })
+                }
+            }
+        } finally { worker.shutdownNow() }
+    }
+
+    @Test fun voiceVolcSendsDefaultSpeakerAndReceivesCompleteAudio() {
+        val context = RuntimeEnvironment.getApplication()
+        val settings = VoiceOutput.Settings(provider = "volc", auth = "token", appId = "test-app", accessKey = "test-access")
+        VoiceOutput.save(context, settings)
+        try {
+            okhttp3.mockwebserver.MockWebServer().use { server ->
+                server.enqueue(okhttp3.mockwebserver.MockResponse().setHeader("Content-Type", "application/json")
+                    .setBody("\n{\"code\":0,\"data\":\"AQI=\"}\n\n{\"code\":0,\"data\":\"AwQ=\"}\n{\"code\":20000000,\"data\":null}\n"))
+                VoiceOutput(context).use { output ->
+                    assertArrayEquals(byteArrayOf(1, 2, 3, 4), output.synthesize("火山你好", { false }, server.url("/tts").toString()))
+                }
+                val request = server.takeRequest(2, TimeUnit.SECONDS)!!
+                assertEquals("test-app", request.getHeader("X-Api-App-Id"))
+                assertEquals("test-access", request.getHeader("X-Api-Access-Key"))
+                assertEquals("seed-tts-1.0", request.getHeader("X-Api-Resource-Id"))
+                assertNotNull(request.getHeader("X-Api-Request-Id"))
+                val body = JSONObject(request.body.readUtf8()).getJSONObject("req_params")
+                assertEquals("火山你好", body.getString("text"))
+                assertEquals("zh_female_wanwanxiaohe_moon_bigtts", body.getString("speaker"))
+                assertEquals("mp3", body.getJSONObject("audio_params").getString("format"))
+            }
+        } finally { context.getSharedPreferences("voice-output", 0).edit().clear().commit() }
+    }
+
+    @Test fun voiceVolcApiKeyUsesItsOwnHeaderAndTerminalAudio() {
+        val context = RuntimeEnvironment.getApplication()
+        VoiceOutput.save(context, VoiceOutput.Settings(provider = "volc", apiKey = "new-api-key", appId = "old-app", accessKey = "old-token"))
+        try {
+            okhttp3.mockwebserver.MockWebServer().use { server ->
+                server.enqueue(okhttp3.mockwebserver.MockResponse().setBody("{\"code\":20000000,\"data\":\"AQI=\"}\n"))
+                VoiceOutput(context).use { output ->
+                    assertArrayEquals(byteArrayOf(1, 2), output.synthesize("你好", { false }, server.url("/tts").toString()))
+                }
+                val request = server.takeRequest(2, TimeUnit.SECONDS)!!
+                assertEquals("new-api-key", request.getHeader("X-Api-Key"))
+                assertNull(request.getHeader("X-Api-App-Id"))
+                assertNull(request.getHeader("X-Api-Access-Key"))
+            }
+        } finally { context.getSharedPreferences("voice-output", 0).edit().clear().commit() }
+    }
+
+    @Test fun voiceVolcRejectsPartialAudioErrorsAndCredentialRedirects() {
+        val context = RuntimeEnvironment.getApplication()
+        VoiceOutput.save(context, VoiceOutput.Settings(provider = "volc", auth = "token", appId = "test-app", accessKey = "test-access"))
+        try {
+            okhttp3.mockwebserver.MockWebServer().use { server ->
+                val responses = listOf(
+                    okhttp3.mockwebserver.MockResponse().setBody("{\"code\":0,\"data\":\"AQI=\"}\n"),
+                    okhttp3.mockwebserver.MockResponse().setBody("{\"code\":45000000,\"message\":\"secret-provider-message\"}\n"),
+                    okhttp3.mockwebserver.MockResponse().setResponseCode(403),
+                    okhttp3.mockwebserver.MockResponse().setResponseCode(302).setHeader("Location", server.url("/do-not-send-credentials")),
+                )
+                for (response in responses) {
+                    server.enqueue(response)
+                    VoiceOutput(context).use { output ->
+                        val failure = assertThrows(IllegalStateException::class.java) { output.synthesize("你好", { false }, server.url("/tts").toString()) }
+                        assertFalse(failure.message.orEmpty().contains("secret-provider-message"))
+                    }
+                    assertNotNull(server.takeRequest(2, TimeUnit.SECONDS))
+                }
+                assertEquals(4, server.requestCount)
+            }
+        } finally { context.getSharedPreferences("voice-output", 0).edit().clear().commit() }
+    }
+
     @Test fun voiceSpeechChunksPreserveEmojiAndKeepCodeOutOfPlayback() {
         val text = "🙂".repeat(650)
         val chunks = VoiceOutput.chunks(text)
@@ -658,12 +992,6 @@ class CoreTest {
         assertEquals(text, chunks.joinToString(""))
         assertEquals(text, VoiceOutput.chunks(text, 60).joinToString(""))
         assertTrue(VoiceOutput.chunks(text, 60).all { it.codePointCount(0, it.length) <= 60 })
-        var cancelled = false
-        val callback = VoiceOutput.callback { cancelled }
-        assertEquals(java.lang.Integer::class.java, callback.javaClass.getMethod("invoke", FloatArray::class.java).returnType)
-        assertEquals(1, callback(floatArrayOf(0f)))
-        cancelled = true
-        assertEquals(0, callback(floatArrayOf(0f)))
         assertEquals(listOf("你好。", "链接，代码请查看聊天界面。"), VoiceOutput.chunks("**你好。**[链接](https://example.com)```bash\nprivate command\n```"))
     }
 
@@ -714,7 +1042,8 @@ class CoreTest {
         shadowOf(manager).setMemoryInfo(info)
         val models = VoiceModels(app)
         models.requireMemory("speech")
-        models.requireMemory("output")
+        assertThrows(IllegalStateException::class.java) { models.requireMemory("output") }
+        assertFalse(models.ready("output"))
         models.requireMemory("local", 512)
         assertThrows(IllegalStateException::class.java) { models.requireMemory("local") }
         info.lowMemory = true
@@ -729,7 +1058,8 @@ class CoreTest {
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
         val executor = Executors.newSingleThreadExecutor()
-        PolicyBridge(policy, "voice-instance", model = { _, valid ->
+        PolicyBridge(policy, "voice-instance", model = { request, valid ->
+            assertEquals("custom", request.getString("model"))
             entered.countDown(); check(release.await(3, TimeUnit.SECONDS))
             check(valid()); JSONObject().put("text", "不应返回")
         }) {}.use { bridge ->
@@ -746,7 +1076,7 @@ class CoreTest {
                 val voice = executor.submit<JSONObject> { bridge.voice("prompt", JSONObject().put("text", "你好")) }
                 val request = read()
                 assertEquals("prompt", request.getString("action"))
-                send(JSONObject().put("id", 2).put("method", "local-model").put("session", "root").put("messages", org.json.JSONArray()))
+                send(JSONObject().put("id", 2).put("method", "local-model").put("session", "root").put("model", "custom").put("messages", org.json.JSONArray()))
                 assertTrue(entered.await(3, TimeUnit.SECONDS))
                 send(JSONObject().put("id", 3).put("method", "local-cancel").put("session", "root").put("call", 2))
                 assertEquals(3, read().getInt("id"))
@@ -1199,7 +1529,11 @@ class CoreTest {
         val policy = ToolPolicy()
         policy.begin("instance")
         val lost = AtomicInteger()
-        PolicyBridge(policy, "instance") { lost.incrementAndGet() }.use { bridge ->
+        var smallModelQueries = 0
+        PolicyBridge(policy, "instance", smallModel = {
+            smallModelQueries++
+            JSONObject().put("enabled", true).put("route", JSONObject().put("provider", "image-service").put("model", "vision-small"))
+        }) { lost.incrementAndGet() }.use { bridge ->
             bridge.start()
             fun connect(token: String = bridge.token, version: Any = 1): Socket = Socket("127.0.0.1", bridge.port).apply {
                 soTimeout = 3000
@@ -1221,6 +1555,10 @@ class CoreTest {
                     return JSONObject(reader.readLine()).also { assertEquals(id, it.getInt("id")) }
                 }
                 assertTrue(query("register") { it.put("title", "当前会话").put("parent", JSONObject.NULL) }.getBoolean("ok"))
+                assertEquals("vision-small", query("small-model").getJSONObject("result").getJSONObject("route").getString("model"))
+                assertEquals(1, smallModelQueries)
+                assertFalse(query("small-model") { it.put("route", JSONObject()) }.getBoolean("ok"))
+                assertEquals(1, smallModelQueries)
                 assertFalse(query("set-mode") { it.put("mode", "danger-full-access") }.getBoolean("ok"))
                 assertFalse(query("mode") { it.put("mode", "workspace-write") }.getBoolean("ok"))
                 assertEquals(ToolPolicy.FULL, policy.mode("instance", "root"))
@@ -1231,6 +1569,8 @@ class CoreTest {
                 assertEquals(0, lost.get())
                 assertEquals(ToolPolicy.FULL, query("mode").getJSONObject("state").getJSONArray("sessions").getJSONObject(0).getString("mode"))
                 assertTrue(query("end").getBoolean("ok"))
+                assertFalse(query("small-model").getBoolean("ok"))
+                assertEquals(1, smallModelQueries)
                 assertFalse(query("mode").getBoolean("ok"))
                 bridge.close()
             }
@@ -2705,6 +3045,15 @@ class CoreTest {
         assertTrue(snapshot.calls.drop(3).all { it.dispatch == "adapter-attempt" })
         assertEquals(3, snapshot.warnings.size)
         assertTrue(snapshot.warnings.all { it.contains("发送分类不合法") })
+    }
+
+    @Test fun assistantUsageKeepsScreenshotRecognitionSeparateFromMainConversation() {
+        assistantLedger(assistantStart(1, "screenshot-recognition"), assistantUsage(1, 32, 18), assistantFinish(1, "success"))
+        val snapshot = AssistantStore(folder.root).readUsage()
+        assertTrue(snapshot.warnings.isEmpty())
+        assertEquals(1, snapshot.summary.count)
+        assertEquals("50", snapshot.sources.getValue("screenshot-recognition").knownTokens.toString())
+        assertFalse(snapshot.sources.containsKey("conversation"))
     }
 
     @Test fun assistantUsageReplacesSnapshotsAndKeepsCacheReasoningAndFailedUsage() {

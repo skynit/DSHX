@@ -79,17 +79,23 @@ export function localInput(messages, needsHistory = false) {
 export function localAdapter(Base, host = policyHost) {
   return new class extends Base {
     providerInfo(provider) { return { id: provider, name: '本机小模型' }; }
-    async listModels() { return [{ provider: route.provider, id: route.model, name: 'Qwen3 0.6B · 本地短对话', inputModalities: ['text'] }]; }
+    async listModels() { return [
+      { provider: route.provider, id: route.model, name: 'Qwen3 0.6B · 本地短对话', inputModalities: ['text'] },
+      { provider: route.provider, id: 'custom', name: '自定义本地模型', inputModalities: ['text'] },
+    ]; }
     async resolveModel(provider, model) {
-      if (provider !== route.provider || model !== route.model) throw new Error('不支持的本地模型。');
-      return { ...(await this.listModels())[0], defaultMaxTokens: 192 };
+      const selected = (await this.listModels()).find(row => row.provider === provider && row.id === model);
+      if (!selected) throw new Error('不支持的本地模型。');
+      return { ...selected, defaultMaxTokens: 192 };
     }
     async *stream(options) {
       const id = randomUUID();
       const started = Date.now();
       let outcome = 'failed';
       let usage;
-      localUsage({ event: 'start', id, sessionId: options.sessionId ?? null, ...route, at: started });
+      const selected = { provider: route.provider, model: options.model ?? route.model };
+      if (![route.model, 'custom'].includes(selected.model)) throw new Error('不支持的本地模型。');
+      localUsage({ event: 'start', id, sessionId: options.sessionId ?? null, ...selected, at: started });
       try {
         const latest = options.messages.findLast(message => message.role === 'user' && (!message.source?.kind || message.source.kind === 'user'));
         const task = latest?.content.filter(part => part.type === 'text').map(part => part.text).join('\n') ?? '';
@@ -103,7 +109,8 @@ export function localAdapter(Base, host = policyHost) {
           } } };
           return;
         }
-        const result = await host.query('local-model', { session: options.sessionId, messages }, options.signal);
+        const result = await host.query('local-model', { session: options.sessionId, messages,
+          ...(selected.model === 'custom' ? { model: 'custom' } : {}) }, options.signal);
         options.signal?.throwIfAborted();
         if (typeof result.text !== 'string' || !result.text.trim() ||
           !Number.isSafeInteger(result.inputTokens) || result.inputTokens < 0 ||
@@ -115,7 +122,7 @@ export function localAdapter(Base, host = policyHost) {
         yield { type: 'finish', reason: { kind: outcome === 'success' ? 'stop' : 'max-tokens' } };
       } finally {
         if (options.signal?.aborted) outcome = 'cancelled';
-        localUsage({ event: 'finish', id, sessionId: options.sessionId ?? null, ...route, outcome, usage: usage ?? null, durationMs: Date.now() - started });
+        localUsage({ event: 'finish', id, sessionId: options.sessionId ?? null, ...selected, outcome, usage: usage ?? null, durationMs: Date.now() - started });
       }
     }
   }();
@@ -159,17 +166,17 @@ export function voiceSession(ctx) {
         // incomplete input instead of silently routing it to the original model.
         run.local = task !== null && (history.some(isMemory) || localInput([...history, message], needsHistory(run.input)) !== null);
       }
-      if (run.local) {
+      if (run.local || run.online) {
         run.selection = ctx.sessionController.agents.selectionFor(agent);
         run.previous = run.selection.current;
         // Keep the original route pending in durable history. A local request header
         // must not become the next model after the application recreates this Agent.
-        if (run.previous && run.previous.provider !== route.provider) {
+        if (run.previous && (run.previous.provider !== run.route.provider || run.previous.model !== run.route.model)) {
           run.recording = true;
           try { ctx.sessionController.agents.selectForNextRequest(agent, run.previous); }
           finally { run.recording = false; }
         }
-        run.selection.current = { ...route };
+        run.selection.current = { ...run.route };
       }
     } else {
       run.finished = true; run.cancelled = true;
@@ -243,10 +250,19 @@ export function voiceSession(ctx) {
       if (active) throw new Error('上一轮语音对话尚未结束。');
       if (typeof data.interaction !== 'string' || !/^[a-zA-Z0-9-]{1,80}$/.test(data.interaction)) throw new Error('语音轮次无效。');
       if (typeof data.text !== 'string' || !data.text.trim() || Buffer.byteLength(data.text) > 16000) throw new Error('语音文字为空或过长。');
+      const selected = data.smallModel ?? route;
+      if (!selected || typeof selected !== 'object' || Array.isArray(selected) ||
+          Object.keys(selected).some(key => !['provider', 'model'].includes(key)) ||
+          ['provider', 'model'].some(key => typeof selected[key] !== 'string' || !selected[key].trim() || selected[key].length > 256 || /[\u0000-\u001f\u007f]/.test(selected[key])) ||
+          selected.provider === route.provider && ![route.model, 'custom'].includes(selected.model)) throw new Error('小模型配置无效。');
+      const target = { provider: selected.provider.trim(), model: selected.model.trim() };
+      const split = data.local === true && localQuestion(data.text.trim());
       let resolve, reject;
       const reply = new Promise((yes, no) => { resolve = yes; reject = no; });
       reply.catch(() => {});
-      const run = { request: randomUUID(), interaction: data.interaction, session: data.session, resolve, reject, input: data.text.trim(), local: data.local === true && localQuestion(data.text.trim()), entered: false, cancelled: false, text: '' };
+      const run = { request: randomUUID(), interaction: data.interaction, session: data.session, resolve, reject, input: data.text.trim(),
+        route: target, local: split && target.provider === route.provider, online: split && target.provider !== route.provider,
+        entered: false, cancelled: false, text: '' };
       active = run;
       const timer = setTimeout(() => cancel(run.interaction), 170000);
       try {

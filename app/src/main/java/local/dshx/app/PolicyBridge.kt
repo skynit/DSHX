@@ -23,6 +23,7 @@ class PolicyBridge(
     private val phone: ((String, JSONObject, String, () -> Boolean) -> JSONObject)? = null,
     private val phoneFinished: ((String) -> Unit)? = null,
     private val model: ((JSONObject, () -> Boolean) -> JSONObject)? = null,
+    private val smallModel: (() -> JSONObject)? = null,
     private val lost: () -> Unit,
 ) : Closeable {
     val token = UUID.randomUUID().toString() + UUID.randomUUID().toString()
@@ -149,7 +150,7 @@ class PolicyBridge(
                         "register" -> setOf("id", "method", "session", "title", "parent")
                         "phone" -> setOf("id", "method", "session", "action", "args")
                         "phone-cancel" -> setOf("id", "method", "session", "call")
-                        "local-model" -> setOf("id", "method", "session", "messages")
+                        "local-model" -> setOf("id", "method", "session", "messages", "model")
                         "local-cancel" -> setOf("id", "method", "session", "call")
                         else -> setOf("id", "method", "session")
                     }
@@ -211,6 +212,7 @@ class PolicyBridge(
                     when (method) {
                         "register" -> policy.register(instance, session, request.getString("title"), if (request.isNull("parent")) null else request.getString("parent"))
                         "mode" -> policy.mode(instance, session)
+                        "small-model" -> { policy.mode(instance, session); response.put("result", requireNotNull(smallModel).invoke()) }
                         "end" -> policy.end(instance, session)
                         "phone-finish" -> { policy.mode(instance, session); phoneFinished?.invoke(session) }
                         "phone-cancel" -> {

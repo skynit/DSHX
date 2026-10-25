@@ -37,12 +37,14 @@ kotlin { compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarg
 
 dependencies {
     implementation(files("libs/sherpa-onnx-1.13.2.aar"))
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("top.yukonga.miuix.kmp:miuix:0.8.8")
     implementation("com.composables:icons-lucide:1.1.0")
     implementation("androidx.activity:activity-compose:1.8.0")
     implementation("androidx.compose.ui:ui:1.10.5")
     implementation("androidx.compose.foundation:foundation:1.10.5")
     testImplementation("junit:junit:4.13.2")
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
     testImplementation("org.robolectric:robolectric:4.15.1")
 }
 

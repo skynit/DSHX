@@ -27,7 +27,9 @@ files/
 │           └── exports/           # 等待系统保存的知识归档
 ├── assistant/                     # 助手人设与模型、动作账本
 ├── workspace/                     # 默认任务目录
-└── voice/models/                  # 校验完成的本地语音与文本模型
+└── voice/                         # 本地语音与文本模型
+    ├── models/                    # 清单下载并校验完成的模型
+    └── custom-model/              # 用户导入的小模型及摘要清单
 cache/
 └── engine/                        # 引擎临时文件
 ```

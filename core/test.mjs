@@ -1647,6 +1647,148 @@ test('phone bridge screenshot saves a real image attachment and keeps base64 out
   } finally { await ctx.fiber.dispose(); }
 });
 
+test('phone bridge screenshot delegates to a prepared image model without changing a text-only main model', async () => {
+  const { Context } = await load('@deepseek-ai/cordis');
+  const { default: LlmRuntime, LlmAdapter } = await load('@deepseek-ai/dsh-llm');
+  const { default: Attachments } = await load('@deepseek-ai/dsh-attachment-local');
+  const sharp = require('sharp');
+  const ctx = new Context(), requests = [], resolutions = [];
+  const dir = await mkdtemp(join(directory, 'phone-recognition-'));
+  const previous = process.env.DSHX_ASSISTANT_DIR;
+  process.env.DSHX_ASSISTANT_DIR = dir;
+  const data = await sharp({ create: { width: 8, height: 6, channels: 3, background: '#73716d' } }).jpeg().toBuffer();
+  class Adapter extends LlmAdapter {
+    async resolveModel(provider, id) {
+      resolutions.push(id);
+      return { provider, id, name: id, inputModalities: id === 'vision' ? ['text', 'image'] : ['text'] };
+    }
+    async *stream(request) {
+      requests.push(request);
+      const image = request.messages[0].content.find(part => part.type === 'image').attachment;
+      const stored = await ctx.attachments.readImage(image);
+      const metadata = await sharp(stored.data).metadata();
+      assert.equal(metadata.width, 8); assert.equal(metadata.height, 6);
+      yield { type: 'text-delta', index: 0, text: '画面中央有“保存”按钮，中心坐标 (4, 3)。' };
+      yield { type: 'usage', usage: { inputTokens: 32, outputTokens: 18 } };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    }
+  }
+  try {
+    await ctx.plugin(LlmRuntime);
+    await ctx.plugin(Attachments, { dshHome: dir });
+    ctx.llm.registerAdapter(['fixture'], new Adapter());
+    const options = { provider: 'fixture', model: 'main-text' };
+    const exec = { signal: new AbortController().signal, agent: { session: { id: 'screen-session' }, options } };
+    let config = { enabled: true, route: { provider: 'fixture', model: 'vision' } }, captures = 0;
+    const host = {
+      smallModel: async (session, signal) => { assert.equal(session, 'screen-session'); assert.equal(signal, exec.signal); return config; },
+      phone: async () => { captures++; return { ok: true, screenshot: 'one-use-native-id', width: 8, height: 6, expiresInMs: 10000, data: data.toString('base64') }; },
+    };
+    const result = await callPhone(ctx, host, 'screenshot', {}, exec);
+    assert.deepEqual(result.recognition, { provider: 'fixture', model: 'vision', text: '画面中央有“保存”按钮，中心坐标 (4, 3)。' });
+    assert.equal(result.screenshot, 'one-use-native-id');
+    assert.equal(result.width, 8); assert.equal(result.height, 6);
+    assert.ok(result.expiresInMs >= 0 && result.expiresInMs <= 10000);
+    assert.equal(Object.hasOwn(result, 'image'), false);
+    assert.equal(Object.hasOwn(result, 'data'), false);
+    assert.equal(phoneContent(result).some(part => part.type === 'image'), false);
+    assert.deepEqual(options, { provider: 'fixture', model: 'main-text' });
+    assert.deepEqual(resolutions, ['vision', 'vision']);
+    assert.equal(requests.length, 1); assert.deepEqual(requests[0].tools, []);
+    assert.equal(requests[0].purpose, 'screenshot-recognition');
+    assert.equal(requests[0].sessionId, 'screen-session');
+    assert.match(requests[0].system, /不能执行/);
+    assert.equal(JSON.stringify(requests[0].messages).includes('main-text'), false);
+    const rows = (await readFile(join(dir, 'usage.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+    assert.equal(rows.find(row => row.event === 'start').purpose, 'screenshot-recognition');
+    assert.deepEqual(rows.find(row => row.event === 'usage').usage, { inputTokens: 32, outputTokens: 18 });
+    assert.equal(rows.filter(row => row.event === 'finish').length, 1);
+    assert.doesNotMatch(JSON.stringify(rows), /保存|one-use-native-id/);
+    // Both kinds of conversation can use the screenshot route; disabling it is immediate.
+    options.model = 'vision';
+    config = { enabled: false };
+    const direct = await callPhone(ctx, host, 'screenshot', {}, exec);
+    assert.ok(direct.image); assert.equal(direct.recognition, undefined);
+    assert.equal(requests.length, 1);
+    config = { enabled: true, route: { provider: 'fixture', model: 'local-text' } };
+    const fallback = await callPhone(ctx, host, 'screenshot', {}, exec);
+    assert.ok(fallback.image); assert.match(fallback.recognitionFallback, /不支持图片/);
+    options.model = 'main-text';
+    await assert.rejects(callPhone(ctx, host, 'screenshot', {}, exec), /未声明支持看图/);
+    assert.equal(captures, 3, 'unsupported models must be rejected before capturing');
+  } finally {
+    await ctx.fiber.dispose();
+    if (previous === undefined) delete process.env.DSHX_ASSISTANT_DIR; else process.env.DSHX_ASSISTANT_DIR = previous;
+  }
+});
+
+test('phone bridge screenshot recognition rejects broken streams and cancellation without a second capture or model fallback', async () => {
+  const { Context } = await load('@deepseek-ai/cordis');
+  const { default: Attachments } = await load('@deepseek-ai/dsh-attachment-local');
+  const sharp = require('sharp');
+  const ctx = new Context();
+  const data = await sharp({ create: { width: 8, height: 6, channels: 3, background: '#73716d' } }).jpeg().toBuffer();
+  try {
+    await ctx.plugin(Attachments, { dshHome: join(directory, 'phone-recognition-failures') });
+    for (const mode of ['empty', 'partial', 'overflow', 'tool', 'error', 'cancel', 'metadata']) {
+      const controller = new AbortController();
+      let captures = 0, streams = 0, resolutions = 0;
+      const info = { provider: 'fixture', id: 'vision', inputModalities: ['image'] };
+      const services = { attachments: ctx.attachments, llm: {
+        resolveModelInfo: async () => { resolutions++; return info; },
+        prepareCall: async (config, signal, refine) => {
+          refine(config, mode === 'metadata' ? { ...info, id: 'changed' } : info);
+          return { config, stream: async function* (request) {
+            streams++;
+            if (mode === 'error') throw new Error('fixture recognition failed');
+            if (mode === 'cancel') {
+              controller.abort(new Error('fixture cancelled'));
+              await new Promise(() => {}); // adapter ignores the signal
+            }
+            if (mode === 'tool') yield { type: 'tool-call-delta', name: 'phone_tap' };
+            if (mode === 'overflow') yield { type: 'text-delta', text: 'a'.repeat(16385) };
+            if (mode === 'partial') yield { type: 'text-delta', text: 'incomplete' };
+            if (mode === 'empty') yield { type: 'finish', reason: { kind: 'stop' } };
+          } };
+        },
+      } };
+      const host = {
+        smallModel: async () => ({ enabled: true, route: { provider: 'fixture', model: 'vision' } }),
+        phone: async () => { captures++; return { ok: true, width: 8, height: 6, data: data.toString('base64') }; },
+      };
+      await assert.rejects(callPhone({ get: name => services[name] }, host, 'screenshot', {}, {
+        signal: controller.signal, agent: { session: { id: `recognition-${mode}` }, options: { provider: 'fixture', model: 'main-image' } },
+      }), error => /截图|fixture/.test(error.message), mode);
+      assert.equal(captures, mode === 'metadata' ? 0 : 1, mode);
+      assert.equal(streams, mode === 'metadata' ? 0 : 1, mode);
+      assert.equal(resolutions, 1, 'recognition failure must not resolve the main model for a retry');
+    }
+  } finally { await ctx.fiber.dispose(); }
+});
+
+test('phone bridge screenshot recognition consumes coordinate lifetime without renewing native credentials', async () => {
+  const controller = new AbortController();
+  const info = { provider: 'fixture', id: 'vision', inputModalities: ['image'] };
+  const services = {
+    attachments: { saveImage: async () => ({ attachmentId: 'fixture' }) },
+    llm: { resolveModelInfo: async () => info, prepareCall: async (config, signal, refine) => {
+      refine(config, info);
+      return { config, stream: async function* () {
+        await delay(10);
+        yield { type: 'text-delta', text: '识别内容' };
+        yield { type: 'finish', reason: { kind: 'stop' } };
+      } };
+    } },
+  };
+  const result = await callPhone({ get: name => services[name] }, {
+    smallModel: async () => ({ enabled: true, route: { provider: 'fixture', model: 'vision' } }),
+    phone: async () => ({ ok: true, width: 8, height: 6, screenshot: 'native-id', expiresInMs: 1, data: 'YWJj' }),
+  }, 'screenshot', {}, { signal: controller.signal, agent: { session: { id: 'expired-screen' } } });
+  assert.equal(result.expiresInMs, 0);
+  assert.equal(result.screenshot, 'native-id');
+  assert.match(result.coordinateNotice, /已过期/);
+});
+
 test('phone bridge screenshot rejects malformed or oversized base64 before saving an attachment', async () => {
   let captures = 0;
   let saves = 0;
@@ -3115,6 +3257,79 @@ test('voice local routing uses the real loop history restores selection and sepa
   }
 });
 
+for (const target of [{ provider: 'dshx-local', model: 'custom' }, { provider: 'fixture', model: 'small-online' }]) {
+  test(`voice custom split uses ${target.model} in the real loop and restores the original model`, async () => {
+    const { Context } = await load('@deepseek-ai/cordis');
+    const { default: SystemPrompt } = await load('@deepseek-ai/dsh-system-prompt');
+    const { default: Tools } = await load('@deepseek-ai/dsh-tools');
+    const { default: LlmRuntime, LlmAdapter, createUserMessage } = await load('@deepseek-ai/dsh-llm');
+    const { default: Agents, installModelSelection } = await load('@deepseek-ai/dsh-agent');
+    const { default: Sessions } = await load('@deepseek-ai/dsh-session');
+    const { default: Projections } = await load('@deepseek-ai/dsh-session-projection');
+    const { default: AgentLoop } = await load('@deepseek-ai/dsh-agent-loop');
+    const { voiceSession, localAdapter } = await import(pathToFileURL(join(core, 'voice.mjs')));
+    const ctx = new Context(), calls = [], events = [];
+    const original = { provider: 'fixture', model: 'main' };
+    const selection = { current: original };
+    class Remote extends LlmAdapter {
+      async *stream(options) {
+        calls.push({ provider: options.provider, model: options.model });
+        selection.current = undefined;
+        yield { type: 'text-delta', index: 0, text: options.model };
+        yield { type: 'finish', reason: { kind: 'stop' } };
+      }
+    }
+    let voice, dispose;
+    try {
+      for (const plugin of [SystemPrompt, Tools, LlmRuntime, Agents, Sessions, Projections]) await ctx.plugin(plugin);
+      await ctx.plugin(AgentLoop, { agents: [] });
+      ctx.llm.registerAdapter(['fixture'], new Remote());
+      ctx.llm.registerAdapter(['dshx-local'], localAdapter(LlmAdapter, { async query(method, data) {
+        assert.equal(method, 'local-model');
+        assert.equal(data.model, 'custom');
+        assert.equal(data.messages.at(-1).text, '你好');
+        calls.push({ provider: 'dshx-local', model: data.model });
+        selection.current = undefined;
+        return { text: 'custom', inputTokens: 12, outputTokens: 2 };
+      } }));
+      const agent = await ctx.agentLoop.create('custom-split', original);
+      dispose = installModelSelection(agent.ctx, selection);
+      ctx.sessionController = {
+        agents: {
+          selectionFor: () => selection,
+          selectForNextRequest(agent, selected) { agent.session.append('model/selection', selected); selection.current = selected; },
+        },
+        commands: {
+          resolveAgent: async () => agent,
+          prompt: async (request, source) => { agent.followup(createUserMessage({ content: request.content, source })); },
+        },
+      };
+      ctx.on('session/event', (_session, entry) => events.push(entry));
+      voice = voiceSession(ctx);
+      const result = await voice.call('prompt', { interaction: 'custom-task', session: agent.session.id, text: '你好', local: true, smallModel: target });
+      await agent.whenIdle();
+      assert.equal(result.text, target.model);
+      assert.equal(result.local, target.provider === 'dshx-local');
+      assert.deepEqual(calls, [target]);
+      assert.equal(selection.current, original);
+      assert.deepEqual(events.filter(entry => entry.type === 'model/selection').map(entry => entry.data), [original],
+        'only the original model is persisted as the next choice, even within the same provider');
+      await voice.call('prompt', { interaction: 'complex-task', session: agent.session.id, text: '搜索文件', local: true, smallModel: target });
+      await agent.whenIdle();
+      assert.deepEqual(calls, [target, original]);
+      selection.current = original;
+      await voice.call('prompt', { interaction: 'disabled-task', session: agent.session.id, text: '你好', local: false, smallModel: target });
+      await agent.whenIdle();
+      assert.deepEqual(calls, [target, original, original]);
+      for (const invalid of [{ provider: 'dshx-local', model: 'unknown' }, { provider: '', model: 'small' },
+        { provider: 'fixture', model: 'small', apiKey: 'must-not-cross' }, { provider: 'fixture', model: 'bad\u0000model' }]) {
+        await assert.rejects(voice.call('prompt', { interaction: 'invalid-task', session: agent.session.id, text: '你好', local: true, smallModel: invalid }), /配置无效/);
+      }
+      assert.equal(calls.length, 3);
+    } finally { voice?.close(); dispose?.(); await ctx.fiber.dispose(); }
+  });
+}
+
 test('voice cancellation removes only its pending message and cannot cancel another running task', async () => {
   const { voiceSession } = await import(pathToFileURL(join(core, 'voice.mjs')));
   const handlers = new Map();
@@ -3150,7 +3365,8 @@ test('voice cancellation removes only its pending message and cannot cancel anot
   } finally { admission.resolve(); voice.close(); }
 });
 
-test('voice temporary model selection respects user switches and rejects unsuccessful turns', async () => {
+for (const target of [{ provider: 'dshx-local', model: 'qwen3-0.6b' }, { provider: 'dshx-local', model: 'custom' }, { provider: 'fixture', model: 'small-online' }]) {
+test(`voice temporary model selection ${target.model} respects user switches and rejects unsuccessful turns`, async () => {
   const { voiceSession } = await import(pathToFileURL(join(core, 'voice.mjs')));
   const handlers = new Map();
   const selection = { current: { provider: 'original', model: 'one' } };
@@ -3173,7 +3389,7 @@ test('voice temporary model selection respects user switches and rejects unsucce
         resolveAgent: async () => agent,
         prompt: async (request, source) => {
           handlers.get('agent/inbox/claimed')({ agent, message: { role: 'user', content: request.content, source }, turn: 1 });
-          assert.equal(selection.current.provider, 'dshx-local');
+          assert.deepEqual(selection.current, target);
           const fallback = signal => handlers.get('agent/request-error')({ agent, provider: 'dshx-local',
             failure: { code: 'LOCAL_CONTEXT' }, signal }, () => 'unhandled');
           if (cancel) {
@@ -3193,15 +3409,16 @@ test('voice temporary model selection respects user switches and rejects unsucce
     },
   });
   try {
-    await assert.rejects(voice.call('prompt', { session: session.id, interaction: 'switch', text: '你好', local: true }), /失败/);
+    await assert.rejects(voice.call('prompt', { session: session.id, interaction: 'switch', text: '你好', local: true, smallModel: target }), /失败/);
     assert.equal(selection.current, chosen, 'an explicit user change wins over restoring the previous choice');
     failure = { kind: 'error', error: { message: '当前可用内存不足，本地模型暂不加载。请关闭其他占用内存的应用后重试。' } };
-    await assert.rejects(voice.call('prompt', { session: session.id, interaction: 'memory', text: '你好', local: true }), { code: 'VOICE_MEMORY' });
+    await assert.rejects(voice.call('prompt', { session: session.id, interaction: 'memory', text: '你好', local: true, smallModel: target }), { code: 'VOICE_MEMORY' });
     cancel = true;
-    await assert.rejects(voice.call('prompt', { session: session.id, interaction: 'cancel-context', text: '你好', local: true }), /取消/);
+    await assert.rejects(voice.call('prompt', { session: session.id, interaction: 'cancel-context', text: '你好', local: true, smallModel: target }), /取消/);
     assert.equal(selection.current, chosen);
   } finally { voice.close(); }
 });
+}
 
 test('voice local adapter bounds Unicode history and records cancellation without prompt content', async () => {
   const { LlmAdapter } = await load('@deepseek-ai/dsh-llm');

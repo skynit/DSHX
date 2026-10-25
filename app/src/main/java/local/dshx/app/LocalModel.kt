@@ -12,22 +12,41 @@ import kotlin.concurrent.thread
 class LocalModel(private val context: Context) {
     private external fun load(path: ByteArray): Long
     private external fun generate(handle: Long, prompt: ByteArray, maximum: Int): ByteArray
+    private external fun format(handle: Long, messages: Array<ByteArray>): ByteArray
     private external fun usage(handle: Long): IntArray
     private external fun cancel(handle: Long)
     private external fun release(handle: Long)
 
+    fun checkFile(file: File) {
+        System.loadLibrary("dshx-local")
+        val handle = load(file.path.toByteArray(Charsets.UTF_8))
+        try { format(handle, arrayOf("system".toByteArray(), "请用中文回答。".toByteArray(), "user".toByteArray(), "你好".toByteArray())) }
+        finally { release(handle) }
+    }
+
     fun reply(request: JSONObject, valid: () -> Boolean): JSONObject {
+        val model = request.optString("model", "qwen3-0.6b")
+        require(model in setOf("qwen3-0.6b", "custom")) { "不支持的本地模型。" }
+        return if (model == "custom") SmallModel(context).withFile { reply(request, valid, it, true) }
+        else {
+            val models = VoiceModels(context)
+            models.verify("local")
+            reply(request, valid, File(models.directory("local"), "Qwen3-0.6B-Q4_K_M.gguf"), false)
+        }
+    }
+
+    private fun reply(request: JSONObject, valid: () -> Boolean, file: File, custom: Boolean): JSONObject {
         System.loadLibrary("dshx-local")
         val models = VoiceModels(context)
-        models.verify("local")
         if (!valid()) throw CancellationException()
         val started = System.nanoTime()
         val settings = AssistantStore(context.filesDir).readSettings()
         val prompt = prompt(request.getJSONArray("messages"), settings)
         val encoded = prompt.toByteArray(Charsets.UTF_8)
         // UTF-8 bytes bound text token count from above; native allocation uses the exact count.
-        models.requireMemory("local", ((encoded.size + 32 + 192 + 256) / 256 * 256).coerceAtMost(4096))
-        val handle = load(File(models.directory("local"), "Qwen3-0.6B-Q4_K_M.gguf").path.toByteArray(Charsets.UTF_8))
+        val tokens = ((encoded.size + 32 + 192 + 256) / 256 * 256).coerceAtMost(4096)
+        if (custom) SmallModel(context).requireMemory(file, tokens) else models.requireMemory("local", tokens)
+        val handle = load(file.path.toByteArray(Charsets.UTF_8))
         val finished = AtomicBoolean(false)
         val monitor = thread(name = "local-model-cancel", isDaemon = true) {
             while (!finished.get()) {
@@ -36,7 +55,9 @@ class LocalModel(private val context: Context) {
             }
         }
         try {
-            val text = generate(handle, encoded, 192).toString(Charsets.UTF_8).trim()
+            val source = if (custom) format(handle, messages(request.getJSONArray("messages"), settings)
+                .flatMap { (role, text) -> listOf(role.toByteArray(Charsets.UTF_8), text.toByteArray(Charsets.UTF_8)) }.toTypedArray()) else encoded
+            val text = generate(handle, source, 192).toString(Charsets.UTF_8).trim()
             if (!valid()) throw CancellationException()
             check(text.isNotBlank()) { "本地小模型没有生成回答。" }
             val tokens = usage(handle)
@@ -47,6 +68,15 @@ class LocalModel(private val context: Context) {
 
     companion object {
         fun prompt(messages: JSONArray, settings: AssistantStore.Settings): String {
+            return buildString {
+                for ((role, text) in messages(messages, settings)) {
+                    append("<|im_start|>").append(role).append('\n').append(text).append("<|im_end|>\n")
+                }
+                append("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+            }
+        }
+
+        private fun messages(messages: JSONArray, settings: AssistantStore.Settings): List<Pair<String, String>> {
             val identity = "你是中文手机助手。简洁准确地回答，只回答用户的问题。不要假装操作了手机或查询了实时信息。" +
                 "\n名字：${settings.name}\n身份：${settings.identity}\n用户要求：${settings.prompt}"
             fun limit(text: String, maximum: Int) = String(text.codePoints().limit(maximum.toLong()).toArray(), 0,
@@ -74,15 +104,7 @@ class LocalModel(private val context: Context) {
                     else -> role to text
                 }
             }
-            return buildString {
-                append("<|im_start|>system\n").append(system).append("<|im_end|>\n")
-                for ((role, text) in recent) {
-                    append("<|im_start|>").append(role).append('\n')
-                    append(text)
-                    append("<|im_end|>\n")
-                }
-                append("<|im_start|>assistant\n<think>\n\n</think>\n\n")
-            }
+            return listOf("system" to system) + recent
         }
     }
 }

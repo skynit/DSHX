@@ -38,8 +38,41 @@ Java_local_dshx_app_LocalModel_load(JNIEnv * env, jobject, jbyteArray filename) 
     auto model = llama_model_default_params();
     model.n_gpu_layers = 0;
     local->model = llama_model_load_from_file(bytes(env, filename).c_str(), model);
-    if (!local->model) { delete local; fail(env, "Cannot load local model"); return 0; }
+    if (!local->model) { delete local; fail(env, "无法加载此本地模型，请检查文件完整性、模型架构和设备内存。"); return 0; }
     return reinterpret_cast<jlong>(local);
+}
+
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_local_dshx_app_LocalModel_format(JNIEnv * env, jobject, jlong handle, jobjectArray source) {
+    const auto * local = reinterpret_cast<Local *>(handle);
+    const char * tmpl = llama_model_chat_template(local->model, nullptr);
+    if (!tmpl) { fail(env, "模型缺少对话模板，请选择带聊天模板的 GGUF 模型。"); return nullptr; }
+    const int count = env->GetArrayLength(source);
+    std::vector<std::string> parts;
+    parts.reserve(count);
+    for (int index = 0; index < count; ++index) {
+        auto value = static_cast<jbyteArray>(env->GetObjectArrayElement(source, index));
+        parts.push_back(bytes(env, value));
+        env->DeleteLocalRef(value);
+    }
+    std::vector<llama_chat_message> messages;
+    for (int index = 0; index + 1 < count; index += 2) messages.push_back({parts[index].c_str(), parts[index + 1].c_str()});
+    std::vector<char> buffer(16384);
+    int size = llama_chat_apply_template(tmpl, messages.data(), messages.size(), true, buffer.data(), buffer.size());
+    if (size > static_cast<int>(buffer.size()) && size <= 131072) {
+        buffer.resize(size);
+        size = llama_chat_apply_template(tmpl, messages.data(), messages.size(), true, buffer.data(), buffer.size());
+    }
+    if (size <= 0 || size > static_cast<int>(buffer.size())) {
+        fail(env, "当前推理库不支持此模型的对话模板，请更换模型。"); return nullptr;
+    }
+    std::string prompt(buffer.data(), size);
+    char architecture[64] = {};
+    llama_model_meta_val_str(local->model, "general.architecture", architecture, sizeof(architecture));
+    if (std::string(architecture) == "qwen3") prompt += "<think>\n\n</think>\n\n";
+    auto result = env->NewByteArray(prompt.size());
+    env->SetByteArrayRegion(result, 0, prompt.size(), reinterpret_cast<const jbyte *>(prompt.data()));
+    return result;
 }
 
 extern "C" JNIEXPORT jbyteArray JNICALL

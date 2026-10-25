@@ -39,6 +39,16 @@ class MainActivity : ComponentActivity() {
     private val engine get() = (application as DshApp).engine
     private val voice get() = (application as DshApp).voice
     private var pendingVoice: String? = null
+    private val modelPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            val name = runCatching {
+                contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                    if (cursor.moveToFirst()) cursor.getString(0) else null
+                }
+            }.getOrNull() ?: "自定义本地模型"
+            voice.importModel(uri, name)
+        }
+    }
     private val microphone = registerForActivityResult(ActivityResultContracts.RequestPermission()) { allowed ->
         val action = pendingVoice; pendingVoice = null
         if (allowed && action != null) voiceAction(action)
@@ -156,7 +166,7 @@ class MainActivity : ComponentActivity() {
                     val previous = voiceState.session
                     voiceState = next
                     if (previous != next.session && next.session != null && next.status == "正在播报") {
-                        engine.state.url?.let { url -> browser?.loadUrl("$url&dshx-session=${Uri.encode(next.session)}") }
+                        engine.state.url?.let { url -> browser?.loadUrl(chatUrl(url, next.session)) }
                     }
                 }
                 voice.observe(listener)
@@ -234,8 +244,13 @@ class MainActivity : ComponentActivity() {
 
     private fun voiceAction(action: String) {
         if (action == "stop") { voice.stop(); return }
-        if (action in setOf("download", "download-local", "download-output")) {
-            voice.download(when (action) { "download-local" -> "local"; "download-output" -> "output"; else -> "speech" }); return
+        if (voice.state.active) return
+        when (action) {
+            "model-import" -> { modelPicker.launch(arrayOf("*/*")); return }
+            "preview" -> { voice.preview(); return }
+        }
+        if (action in setOf("download", "download-local")) {
+            voice.download(if (action == "download-local") "local" else "speech"); return
         }
         if (action == "send") { voice.start(action); return }
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED && action != "send") {
@@ -355,7 +370,7 @@ class MainActivity : ComponentActivity() {
                         return true
                     }
                 }
-                loadUrl(instance)
+                loadUrl(chatUrl(instance, voice.state.session))
             }
         }
         return browser!!.also { (it.parent as? ViewGroup)?.removeView(it) }
@@ -385,6 +400,9 @@ class MainActivity : ComponentActivity() {
     }
 
     companion object {
+        internal fun chatUrl(instance: String, session: String?): String =
+            if (session == null) instance else Uri.parse(instance).buildUpon().appendQueryParameter("dshx-session", session).build().toString()
+
         internal fun selectedFiles(data: Intent?, multiple: Boolean, canRead: (Uri) -> Boolean): Array<Uri>? {
             val clip = data?.clipData
             val files = if (clip != null) (0 until clip.itemCount).map { clip.getItemAt(it).uri ?: return null }

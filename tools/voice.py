@@ -73,19 +73,11 @@ def prepare(proxy):
         ]},
         "speech": {"version": "20240717", "files": []},
         "local": {"version": "50968a44", "files": []},
-        "output": {"version": "a0d5c6a2", "files": []},
     }
     models = [
         ("speech", "csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17", "2365baeacb507f821a0c8120fcee3d484dba7a07", "model.int8.onnx", 239233841, "c71f0ce00bec95b07744e116345e33d8cbbe08cef896382cf907bf4b51a2cd51"),
         ("speech", "csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17", "2365baeacb507f821a0c8120fcee3d484dba7a07", "tokens.txt", 315894, "f449eb28dc567533d7fa59be34e2abca8784f771850c78a47fb731a31429a1dc"),
         ("local", "unsloth/Qwen3-0.6B-GGUF", "50968a4468ef4233ed78cd7c3de230dd1d61a56b", "Qwen3-0.6B-Q4_K_M.gguf", 396705472, "ac2d97712095a558e31573f62f466a3f9d93990898b0ec79d7c974c1780d524a"),
-        ("output", "csukuangfj/vits-melo-tts-zh_en", "a0d5c6a264c0ef92d70d8661d8cc502d79627cd6", "model.int8.onnx", 53517430, "f085f5079e05f039b800aeb542f5253c26a303211b0c6465d0d9387977855a63"),
-        ("output", "csukuangfj/vits-melo-tts-zh_en", "a0d5c6a264c0ef92d70d8661d8cc502d79627cd6", "tokens.txt", 655, "d18664a7e12bd7ea1022ddaf951e534e136815016c5a809d6b64156bffb4369d"),
-        ("output", "csukuangfj/vits-melo-tts-zh_en", "a0d5c6a264c0ef92d70d8661d8cc502d79627cd6", "lexicon.txt", 6837671, "7236884b02435ac5d10cf69b4be40a61b45aa676b5300f0e412f185748fee528"),
-        ("output", "csukuangfj/vits-melo-tts-zh_en", "a0d5c6a264c0ef92d70d8661d8cc502d79627cd6", "date.fst", 59154, "eb8aa079ae3cb81d8f4404992f39d61a0cb990947512b5b8d1e54d1f6980e718"),
-        ("output", "csukuangfj/vits-melo-tts-zh_en", "a0d5c6a264c0ef92d70d8661d8cc502d79627cd6", "number.fst", 64482, "743f402181fcfebf76cc2f0546b71fa26476e626fbe4e460fb7b4c3a7a8bd5bd"),
-        ("output", "csukuangfj/vits-melo-tts-zh_en", "a0d5c6a264c0ef92d70d8661d8cc502d79627cd6", "phone.fst", 88630, "1ac2b6fa56b1442320c4de7db08353bab8963a2b57f365eebcdd3a2d3562f8d7"),
-        ("output", "csukuangfj/vits-melo-tts-zh_en", "a0d5c6a264c0ef92d70d8661d8cc502d79627cd6", "new_heteronym.fst", 21974, "ca14b2127e27baa571664e4bb791e143e7425f56a6bc29db08d74f97e6aa4e29"),
     ]
     for group, repo, revision, name, size, sha in models:
         tail = f"{repo}/resolve/{revision}/{name}"

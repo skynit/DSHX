@@ -193,7 +193,7 @@ class Engine(private val context: Context, private val worker: Executor = Execut
                 patch.writeText(File(core, "android.patch.yml").readText().replace("@CORE@", core.path))
                 val instance = UUID.randomUUID().toString()
                 tools.begin(instance)
-                val policyBridge = PolicyBridge(tools, instance, phone::execute, phone::finish, LocalModel(context)::reply) {
+                val policyBridge = PolicyBridge(tools, instance, phone::execute, phone::finish, LocalModel(context)::reply, SmallModel(context)::status) {
                     main.post {
                         if (bridge?.instance == instance && !cancelled.get()) {
                             record("原生工具权限连接中断，已请求停止 dsh；旧会话权限不会恢复。")

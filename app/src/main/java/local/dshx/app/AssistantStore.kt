@@ -210,7 +210,7 @@ class AssistantStore(filesDir: File) {
             "start" -> {
                 require(key !in calls)
                 val purpose = json.string("purpose")
-                require(purpose in listOf("conversation", "compaction", "session-title", "other"))
+                require(purpose in listOf("conversation", "compaction", "session-title", "screenshot-recognition", "other"))
                 val dispatch = when (json.opt("dispatch")) {
                     "http-request" -> "http-request"
                     "adapter-attempt", null -> "adapter-attempt"

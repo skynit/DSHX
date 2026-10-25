@@ -19,11 +19,6 @@ Qwen3-0.6B, https://huggingface.co/Qwen/Qwen3-0.6B
 llama.cpp, https://github.com/ggml-org/llama.cpp
   Commit 36cbf415f1c72c199e956c00fed0418f22ca53f2; MIT.
   See licenses/llama.cpp-LICENSE.txt. Prepared source is retained in core/cache/voice.
-MeloTTS, https://github.com/myshell-ai/MeloTTS
-  Optional Chinese/English ONNX int8 model csukuangfj/vits-melo-tts-zh_en,
-  revision a0d5c6a264c0ef92d70d8661d8cc502d79627cd6.
-  Converted repository includes the MyShell.ai MIT notice; see licenses/MeloTTS-LICENSE.txt.
-  Model, lexicon and normalization rules are independently hashed in models.json.
 pinyin-data, https://github.com/mozillazg/pinyin-data
   Commit 9e5e9bdfe8add694300e0cc93a27b803b68377f9; MIT.
   See licenses/pinyin-data-LICENSE.txt. First character pronunciation is used;
@@ -33,5 +28,8 @@ hi-mochi, https://github.com/gongpx20069/hi-mochi
   Architectural reference only; no source copied. See licenses/hi-mochi-LICENSE.txt.
 
 Native Kotlin/JNI integration and dsh plugin code are maintained in DSHX.
-Models are checked against their pinned content hashes; runtime license notices
-and reference acknowledgements do not constitute a completed release audit.
+
+Edge TTS wire protocol reference: edge-tts, https://github.com/rany2/edge-tts .
+  LGPL-3.0; see licenses/edge-tts-LICENSE.txt. Protocol adaptation is maintained in DSHX.
+Volcengine online speech synthesis: https://www.volcengine.com/docs/6561 .
+  Hosted service; no synthesis model weights are included in the APK.

@@ -11,7 +11,8 @@ DSHX 直接使用 DeepSeek 官方的 [deepseek-harness](https://github.com/deeps
 | DeepSeek dsh `0.2.1-rc.2` | 官方智能体引擎、聊天网页和插件 | [`core/package.json`](../core/package.json)、[`core/package-lock.json`](../core/package-lock.json) |
 | Termux Android 软件包 | Node、bash、rg、证书及运行库；不要求用户另装 Termux 应用 | [`core/termux.lock.json`](../core/termux.lock.json)、[`tools/core.py`](../tools/core.py) |
 | Miuix `0.8.8`、Lucide 与 Compose | 原生管理页面和图标 | [`app/build.gradle.kts`](../app/build.gradle.kts) |
-| sherpa-onnx、SenseVoice、Silero 与可选 MeloTTS | 本地唤醒、语音活动检测、识别与播报 | [`tools/voice.py`](../tools/voice.py)、[语音第三方声明](../app/src/main/assets/voice/NOTICE.txt) |
+| sherpa-onnx、SenseVoice 与 Silero | 本机唤醒、语音活动检测与识别 | [`tools/voice.py`](../tools/voice.py)、[语音第三方声明](../app/src/main/assets/voice/NOTICE.txt) |
+| Edge TTS（edge-tts 协议参考）与火山引擎 | 默认与自选在线播报 | [`VoiceOutput.kt`](../app/src/main/java/local/dshx/app/VoiceOutput.kt)、[`EdgeToken.kt`](../app/src/main/java/local/dshx/app/EdgeToken.kt)、[语音说明](voice.md) |
 | llama.cpp 与 Qwen3 0.6B | 本机短文本推理 | [`tools/voice.py`](../tools/voice.py)、[模型清单](../app/src/main/assets/voice/models.json)、[语音与小模型说明](voice.md) |
 | MiniSearch `7.2.0` | 本机知识库的关键词检索 | [`core/package.json`](../core/package.json)、[`knowledge-search.mjs`](../core/knowledge-search.mjs) |
 

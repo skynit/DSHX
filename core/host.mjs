@@ -135,7 +135,8 @@ export class PolicyHost {
       clearTimeout(pending.timer);
       pending.cleanup?.();
       this.pending.delete(message.id);
-      pending.reject(new Error(pending.phone || pending.local ? message.error || '本机处理失败，请重新开始。' : '原生会话查询被拒绝，会话可能已结束。'));
+      pending.reject(new Error(pending.phone || pending.local ? message.error ||
+        (pending.phone ? '手机操作失败，请重新观察界面。' : '本机处理失败，请重新开始。') : '原生会话查询被拒绝，会话可能已结束。'));
       return;
     }
     const state = message.state;
@@ -232,6 +233,10 @@ export class PolicyHost {
   async phone(action, args, session, signal) {
     if (!this.configured || typeof session !== 'string' || !session) throw new Error('手机操作需要当前原生会话连接。');
     return this.query('phone', { action, args, session }, signal);
+  }
+
+  async smallModel(session, signal) {
+    return this.query('small-model', { session }, signal);
   }
 
   close() { this.fail(); }

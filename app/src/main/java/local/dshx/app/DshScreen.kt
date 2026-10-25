@@ -16,6 +16,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -38,6 +40,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.res.vectorResource
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.semantics.Role
@@ -62,13 +65,17 @@ import com.composables.icons.lucide.House
 import com.composables.icons.lucide.Lucide
 import com.composables.icons.lucide.MessageSquare
 import com.composables.icons.lucide.Settings2
+import com.composables.icons.lucide.Check
+import com.composables.icons.lucide.ChevronDown
 import com.composables.icons.lucide.ChevronRight
 import com.composables.icons.lucide.Play
 import com.composables.icons.lucide.Square
 import com.composables.icons.lucide.Save
 import com.composables.icons.lucide.RotateCcw
 import com.composables.icons.lucide.Mic
+import com.composables.icons.lucide.Phone
 import com.composables.icons.lucide.Download
+import com.composables.icons.lucide.Upload
 import com.composables.icons.lucide.X
 import top.yukonga.miuix.kmp.basic.*
 import top.yukonga.miuix.kmp.theme.MiuixTheme
@@ -164,18 +171,24 @@ fun DshScreen(
                     Divider()
                     Row(Modifier.fillMaxWidth().selectableGroup().padding(horizontal = 12.dp, vertical = 4.dp),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        listOf(Triple("工作台", Lucide.House, 0), Triple("聊天", Lucide.MessageSquare, 1), Triple("设置", Lucide.Settings2, 2)).forEach { (label, icon, index) ->
+                        listOf(Triple("工作台", Lucide.House, 0), Triple("对话", Lucide.MessageSquare, 1),
+                            Triple("语音", Lucide.Phone, 3), Triple("设置", Lucide.Settings2, 2)).forEach { (label, icon, index) ->
                             val selected = tab == index && !logs
                             val background by animateColorAsState(
                                 if (selected) MiuixTheme.colorScheme.secondary else Color.Transparent,
                                 animationSpec = tween(160), label = "navigation selection")
-                            Row(Modifier.weight(1f).heightIn(min = 48.dp).clip(RoundedCornerShape(8.dp))
+                            Column(Modifier.weight(1f).heightIn(min = 48.dp).clip(RoundedCornerShape(8.dp))
                                 .background(background)
-                                .selectable(selected, role = Role.Tab, onClick = { tab = index; logs = false })
-                                .padding(horizontal = 8.dp, vertical = 8.dp),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally), verticalAlignment = Alignment.CenterVertically) {
+                                .semantics { if (index == 3) contentDescription = "语音聊天" }
+                                .selectable(selected, role = Role.Tab, onClick = {
+                                    tab = index; logs = false
+                                    if (index == 3 && running && voiceState.speechReady && !voiceState.active) onVoice("talk")
+                                    if (index == 1 && voiceState.active && !voiceState.downloading) onVoice("stop")
+                                })
+                                .padding(horizontal = 4.dp, vertical = 8.dp),
+                                verticalArrangement = Arrangement.spacedBy(4.dp, Alignment.CenterVertically), horizontalAlignment = Alignment.CenterHorizontally) {
                                 val color = if (selected) MiuixTheme.colorScheme.onSurface else MiuixTheme.colorScheme.onSurfaceVariantSummary
-                                if (LocalDensity.current.fontScale < 1.5f) Icon(icon, contentDescription = null, modifier = Modifier.size(18.dp), tint = color)
+                                Icon(icon, contentDescription = null, modifier = Modifier.size(18.dp), tint = color)
                                 Text(label, fontSize = 13.sp, color = color, fontWeight = if (selected) FontWeight.Medium else FontWeight.Normal)
                             }
                         }
@@ -184,11 +197,13 @@ fun DshScreen(
             },
         ) { padding ->
             if (tab == 1 && !logs && running && webReady && pageError == null) {
-                Column(Modifier.padding(padding).fillMaxSize()) {
-                    chat(Modifier.weight(1f).fillMaxWidth())
-                    Divider()
-                    VoicePanel(voice, voiceState, onVoice)
-                }
+                chat(Modifier.padding(padding).fillMaxSize())
+            } else if (tab == 3 && !logs) {
+                VoiceChat(Modifier.padding(padding).fillMaxSize(), voiceState, running, state.busy, onVoice, onStart,
+                    onSettings = { tab = 2 }, onChat = {
+                        if (voiceState.active && !voiceState.downloading) onVoice("stop")
+                        tab = 1
+                    })
             } else {
                 BoxWithConstraints(Modifier.padding(padding).fillMaxSize().verticalScroll(scroll)) {
                   val gutter = if (maxWidth >= 600.dp) 32.dp else 16.dp
@@ -198,7 +213,7 @@ fun DshScreen(
                   ) {
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
                         Column(verticalArrangement = Arrangement.spacedBy(4.dp), modifier = Modifier.weight(1f)) {
-                            Text(if (logs) "运行诊断" else listOf("DSHX", "聊天", "设置")[tab], fontSize = 22.sp, fontWeight = FontWeight.SemiBold,
+                            Text(if (logs) "运行诊断" else when (tab) { 0 -> "DSHX"; 1 -> "对话"; 3 -> "语音聊天"; else -> "设置" }, fontSize = 22.sp, fontWeight = FontWeight.SemiBold,
                                 modifier = Modifier.semantics { heading() })
                             if (logs) Note("最近 120 行 · 已脱敏")
                         }
@@ -265,6 +280,8 @@ fun DshScreen(
                             savedPages.SaveableStateProvider("knowledge") {
                                 KnowledgeSettings(knowledgeStore, running, state.knowledgeFiles, knowledgePicking, onKnowledge, onKnowledgeFile)
                             }
+                            Section("模型分工")
+                            SmallModelSettings(voice, voiceState, onVoice)
                             VoiceSettings(voice, voiceState, onVoice)
                             PhoneSettings(phone, phoneRevision, onPhonePermission)
                             Section("工具与权限")
@@ -326,25 +343,121 @@ fun DshScreen(
 }
 
 @Composable
-private fun VoicePanel(voice: VoiceControl, state: VoiceControl.State, action: (String) -> Unit) {
-    Column(Modifier.fillMaxWidth().background(MiuixTheme.colorScheme.surfaceVariant).padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Note(state.status)
-        state.error?.let { Text(it, fontSize = 12.sp, color = MiuixTheme.colorScheme.error) }
-        if (state.draft.isNotEmpty()) {
-            val draft = rememberTextFieldState(state.draft)
-            LaunchedEffect(state.draft) { if (draft.text.toString() != state.draft) draft.setTextAndPlaceCursorAtEnd(state.draft) }
-            LaunchedEffect(draft.text) { voice.draft(draft.text.toString()) }
-            AssistantField("语音文字", draft, 8000, state.active, 3)
+private fun VoiceChat(
+    modifier: Modifier, state: VoiceControl.State, running: Boolean, busy: Boolean, action: (String) -> Unit,
+    onStart: () -> Unit, onSettings: () -> Unit, onChat: () -> Unit,
+) {
+    val list = rememberLazyListState()
+    val scope = rememberCoroutineScope()
+    val earlier by remember { derivedStateOf { list.canScrollForward } }
+    var follow by remember { mutableStateOf(true) }
+    LaunchedEffect(list) {
+        snapshotFlow { list.isScrollInProgress to list.canScrollForward }.collect { (scrolling, earlier) ->
+            if (scrolling) follow = !earlier
         }
-        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            if (state.active) Action("停止语音", onClick = { action("stop") }, danger = true)
-            else {
-                Action("语音输入", onClick = { action("input") }, enabled = state.speechReady)
-                Action("语音对话", onClick = { action("talk") }, enabled = state.speechReady)
-                if (state.draft.isNotBlank()) Action("发送文字", onClick = { action("send") }, primary = true)
+    }
+    LaunchedEffect(state.session, state.turns.size, state.turns.lastOrNull()?.reply, state.error) {
+        if (follow) list.scrollToItem((state.turns.sumOf { if (it.reply == null) 1 else 2 } + if (state.error == null) 0 else 1)
+            .minus(1).coerceAtLeast(0))
+    }
+    BoxWithConstraints(modifier) {
+        val compact = maxHeight < 400.dp
+        val inlineControl = compact && (state.active || running && state.speechReady)
+        val gutter = if (maxWidth >= 600.dp) 32.dp else 16.dp
+        Column(Modifier.align(Alignment.TopCenter).widthIn(max = 680.dp).fillMaxSize().padding(horizontal = gutter, vertical = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(if (compact) 8.dp else 16.dp)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                VoiceButton("文字对话", Lucide.MessageSquare, onChat)
+                Box(Modifier.weight(1f).padding(horizontal = 8.dp), contentAlignment = Alignment.Center) {
+                    Text("语音聊天", fontSize = 18.sp, fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.semantics { heading() })
+                }
+                VoiceButton("语音设置", Lucide.Settings2, onSettings)
+            }
+            Box(Modifier.weight(1f).fillMaxWidth()) {
+                if (state.turns.isEmpty() && state.error == null) Column(Modifier.align(Alignment.Center).padding(16.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                    if (!compact) Icon(Lucide.Phone, contentDescription = null, modifier = Modifier.size(32.dp),
+                        tint = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+                    Text("说出你的问题", fontSize = 18.sp, fontWeight = FontWeight.Medium)
+                    Note("识别后的文字和助手回答会显示在这里。")
+                }
+                LazyColumn(Modifier.fillMaxSize(), state = list,
+                    contentPadding = PaddingValues(vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(24.dp)) {
+                    state.turns.forEach { turn ->
+                        item(key = "${turn.id}:user") { VoiceMessage("你 · 语音转文字", turn.text, true) }
+                        turn.reply?.let { reply -> item(key = "${turn.id}:assistant") { VoiceMessage("助手", reply, false) } }
+                    }
+                    state.error?.let { message ->
+                        item(key = "error") {
+                            Text(message, fontSize = 13.sp, lineHeight = 20.sp, color = MiuixTheme.colorScheme.error,
+                                modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
+                        }
+                    }
+                }
+            }
+            Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Row(Modifier.fillMaxWidth().semantics { liveRegion = LiveRegionMode.Polite },
+                    horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally), verticalAlignment = Alignment.CenterVertically) {
+                    if (state.active) InfiniteProgressIndicator(Modifier.size(16.dp))
+                    Text(state.status, fontSize = 14.sp, lineHeight = 22.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                        modifier = Modifier.weight(1f, fill = false))
+                    if (earlier) Action("回到最新", onClick = {
+                        follow = true
+                        scope.launch { list.scrollToItem((list.layoutInfo.totalItemsCount - 1).coerceAtLeast(0)) }
+                    })
+                    if (inlineControl) VoiceButton(
+                        if (state.active) { if (state.downloading) "取消下载" else "结束语音" } else "开始语音",
+                        if (state.active) ImageVector.vectorResource(R.drawable.call_end) else Lucide.Mic,
+                        { action(if (state.active) "stop" else "talk") }, primary = !state.active, danger = state.active)
+                }
+                if (!inlineControl) when {
+                    state.active -> {
+                        val label = if (state.downloading) "取消下载" else "结束语音"
+                        VoiceButton(label, ImageVector.vectorResource(R.drawable.call_end), { action("stop") },
+                            size = if (compact) 48 else 64, danger = true)
+                        if (!compact) Note(label)
+                    }
+                    !running -> {
+                        Note("先启动工作区，即可使用语音聊天。")
+                        Action(if (busy) "正在启动…" else "启动 dsh", onClick = onStart, enabled = !busy, primary = true, icon = Lucide.Play)
+                    }
+                    !state.speechReady -> {
+                        Note("首次使用需下载语音识别模型。")
+                        Action("下载语音识别模型", onClick = { action("download") }, primary = true, icon = Lucide.Download)
+                    }
+                    else -> {
+                        VoiceButton("开始语音", Lucide.Mic, { action("talk") }, size = if (compact) 48 else 64, primary = true)
+                        if (!compact) Note("开始语音")
+                    }
+                }
             }
         }
-        if (!state.speechReady) Note("先在设置中下载本地语音识别模型。")
+    }
+}
+
+@Composable
+private fun VoiceMessage(label: String, text: String, user: Boolean) {
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(label, fontSize = 12.sp, lineHeight = 18.sp, fontWeight = FontWeight.Medium,
+            color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+        SelectionContainer {
+            Text(text, fontSize = 16.sp, lineHeight = 26.sp,
+                color = if (user) MiuixTheme.colorScheme.onSurfaceVariantSummary else MiuixTheme.colorScheme.onSurface)
+        }
+    }
+}
+
+@Composable
+private fun VoiceButton(label: String, icon: ImageVector, onClick: () -> Unit, size: Int = 48, primary: Boolean = false, danger: Boolean = false) {
+    val colors = MiuixTheme.colorScheme
+    var focused by remember { mutableStateOf(false) }
+    Button(onClick = onClick, modifier = Modifier.size(size.dp).onFocusChanged { focused = it.isFocused }
+        .border(if (focused) 2.dp else 1.dp, if (focused) colors.primary else colors.outline, RoundedCornerShape((size / 2).dp)),
+        minHeight = size.dp, cornerRadius = (size / 2).dp, insideMargin = PaddingValues(0.dp),
+        colors = ButtonDefaults.buttonColors(color = if (primary) colors.secondary else colors.surfaceContainerHigh)) {
+        Icon(icon, contentDescription = label, modifier = Modifier.size(if (size > 48) 26.dp else 20.dp),
+            tint = if (danger) colors.error else if (primary) colors.primary else colors.onSurface)
     }
 }
 
@@ -352,14 +465,13 @@ private fun VoicePanel(voice: VoiceControl, state: VoiceControl.State, action: (
 private fun VoiceSettings(voice: VoiceControl, state: VoiceControl.State, action: (String) -> Unit) {
     val wake = rememberTextFieldState(voice.wakeWord)
     var mirror by remember { mutableStateOf(voice.mirror) }
-    var local by remember { mutableStateOf(voice.local) }
     var interrupt by remember { mutableStateOf(voice.interrupt) }
     var message by remember { mutableStateOf<String?>(null) }
     var saveError by remember { mutableStateOf<String?>(null) }
     val echoSupported = voice.echoSupported
 
-    Section("本地语音")
-    Note("录音在本机识别，识别后的文字发送至当前聊天模型。")
+    Section("语音")
+    Note("录音在本机识别；对话文字发送至聊天模型，回答文字发送至所选播报服务。")
     Panel {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
             Icon(Lucide.Mic, contentDescription = null, modifier = Modifier.size(18.dp), tint = MiuixTheme.colorScheme.onSurfaceVariantSummary)
@@ -397,6 +509,7 @@ private fun VoiceSettings(voice: VoiceControl, state: VoiceControl.State, action
         Spacer(Modifier.height(12.dp))
         Note(if (!state.speechReady) "先下载下方语音识别模型，即可开启唤醒。" else if (state.downloading) "模型准备期间，语音设置暂不可修改。" else if (state.active) "停止语音后可修改设置。后台监听会显示持续通知。" else "说出已保存的短语唤醒助手，后台监听会显示持续通知。")
     }
+    VoiceOutputSettings(voice, state, action)
     Panel(padding = 0) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -421,16 +534,191 @@ private fun VoiceSettings(voice: VoiceControl, state: VoiceControl.State, action
         VoiceModelRow("语音识别", "本机识别录音 · 约 229 MiB", state.speechReady, !state.active) { action("download") }
         Divider()
         VoiceModelRow("本地小模型", "参与简单任务分工 · 约 379 MiB", state.localReady, !state.active) { action("download-local") }
-        Divider()
-        VoiceModelRow("离线播报", "无系统离线中文声音时使用 · 约 58 MiB", state.outputReady, !state.active) { action("download-output") }
+
     }
     Panel(padding = 0) {
         Text("高级选项", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(16.dp).semantics { heading() })
-        SettingsSwitch("小模型分工", if (state.localReady) "让本地小模型处理简单任务，减少云端模型用量。" else "下载本地小模型后可开启。",
-            local, !state.active && state.localReady) { local = it; voice.local = it }
-        Divider()
         SettingsSwitch("播报中唤醒 · 实验功能", if (echoSupported) "播报时也可唤醒，默认关闭。依赖设备回声消除，可能误唤醒。" else "当前设备不支持回声消除，暂不可开启。",
             interrupt, !state.active && (interrupt || echoSupported)) { interrupt = it; voice.interrupt = it }
+    }
+}
+
+@Composable
+private fun SmallModelSettings(voice: VoiceControl, state: VoiceControl.State, action: (String) -> Unit) {
+    var local by remember { mutableStateOf(voice.local) }
+    var source by rememberSaveable(state.smallModel.source) { mutableStateOf(state.smallModel.source) }
+    val provider = key(state.smallModel.provider) { rememberTextFieldState(state.smallModel.provider) }
+    val model = key(state.smallModel.model) { rememberTextFieldState(state.smallModel.model) }
+    val imageProvider = key(state.smallModel.imageProvider) { rememberTextFieldState(state.smallModel.imageProvider) }
+    val imageModel = key(state.smallModel.imageModel) { rememberTextFieldState(state.smallModel.imageModel) }
+    var message by remember(source) { mutableStateOf<String?>(null) }
+    var error by remember(source) { mutableStateOf<String?>(null) }
+    val current = when (state.smallModel.source) {
+        "online" -> "在线 · ${state.smallModel.model}"
+        "custom" -> state.customModel.ifBlank { "自定义本地模型" }
+        else -> "Qwen3 0.6B · 本地"
+    }
+    val draft = SmallModel.Settings(source, provider.text.toString(), model.text.toString(), imageProvider.text.toString(), imageModel.text.toString())
+    val changed = draft != state.smallModel
+    Panel(padding = 0) {
+        SettingsSwitch("小模型分工", "用于简单语音任务和截图识别。当前：$current。",
+            local, !state.active) { local = it; voice.local = it }
+        Divider()
+        Column(Modifier.padding(16.dp)) {
+            Text("简单语音任务", fontSize = 13.sp, fontWeight = FontWeight.Medium)
+            Spacer(Modifier.height(8.dp))
+            FlowRow(Modifier.fillMaxWidth().selectableGroup(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf("default" to "默认本地", "custom" to "自定义本地", "online" to "在线模型").forEach { (value, label) ->
+                    Row(Modifier.heightIn(min = 48.dp).clip(RoundedCornerShape(8.dp))
+                        .background(if (source == value) MiuixTheme.colorScheme.secondary else Color.Transparent)
+                        .border(1.dp, if (source == value) MiuixTheme.colorScheme.primary else MiuixTheme.colorScheme.outline, RoundedCornerShape(8.dp))
+                        .selectable(source == value, enabled = !state.active, role = Role.RadioButton, onClick = { source = value })
+                        .padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text(label, fontSize = 13.sp, color = if (state.active) MiuixTheme.colorScheme.onSurfaceVariantSummary else MiuixTheme.colorScheme.onSurface)
+                    }
+                }
+            }
+            Spacer(Modifier.height(16.dp))
+            when (source) {
+                "online" -> {
+                    Note("先在聊天设置中添加服务地址和密钥，再填写该服务的标识与模型名称。简单任务的上下文会发送给此服务。")
+                    Spacer(Modifier.height(12.dp))
+                    AssistantField("服务标识", provider, 256, state.active, 1, "已配置服务的标识")
+                    AssistantField("模型名称", model, 256, state.active, 2, "服务提供的模型名称")
+                }
+                "custom" -> {
+                    Note(state.customModel.ifBlank { "尚未导入本地模型。" })
+                    Spacer(Modifier.height(8.dp))
+                    Note("导入带对话模板的 GGUF 文件，模型在手机本地运行。")
+                    Spacer(Modifier.height(12.dp))
+                    Action(if (state.customModel.isBlank()) "导入模型" else "更换模型", { action("model-import") }, enabled = !state.active, icon = Lucide.Upload)
+                    Spacer(Modifier.height(12.dp))
+                }
+                else -> {
+                    Note(if (state.localReady) "Qwen3 0.6B 已下载，在手机本地运行。" else "在下方“模型资源”中下载本地小模型后可处理简单语音任务。")
+                    Spacer(Modifier.height(12.dp))
+                }
+            }
+            Text("截图识别", fontSize = 13.sp, fontWeight = FontWeight.Medium)
+            Spacer(Modifier.height(8.dp))
+            Note("可单独指定支持图片的模型；两项留空时沿用上方模型。识别结果交给主模型继续处理。")
+            Spacer(Modifier.height(12.dp))
+            AssistantField("截图服务标识", imageProvider, 256, state.active, 1, "留空沿用上方服务")
+            AssistantField("截图模型名称", imageModel, 256, state.active, 2, "支持图片输入的模型")
+            Note("当前导入的 GGUF 与默认本地模型仅支持文字；未配置看图模型时，截图由支持图片的当前聊天模型处理。")
+            Spacer(Modifier.height(12.dp))
+            Action("保存小模型", {
+                try {
+                    voice.saveSmallModel(draft)
+                    error = null; message = "已保存，下次任务生效。"
+                } catch (failure: Exception) { message = null; error = failure.message ?: "保存失败。" }
+            }, enabled = !state.active && changed && (source != "custom" || state.customModel.isNotBlank()), icon = Lucide.Save)
+            val feedback = error ?: state.error ?: message ?: if (state.downloading) state.status else null
+            if (feedback != null) {
+                Spacer(Modifier.height(8.dp))
+                Text(feedback, fontSize = 12.sp, lineHeight = 18.sp,
+                    color = if (error != null || state.error != null) MiuixTheme.colorScheme.error else LocalStatusColor.current,
+                    modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
+            }
+            Spacer(Modifier.height(12.dp))
+            Note("复杂任务仍使用当前聊天模型。在线小模型的实际费用由所选服务决定。")
+        }
+    }
+}
+
+@Composable
+private fun VoiceOutputSettings(voice: VoiceControl, state: VoiceControl.State, action: (String) -> Unit) {
+    var provider by rememberSaveable { mutableStateOf(state.output.provider) }
+    var auth by rememberSaveable { mutableStateOf(state.output.auth) }
+    val apiKey = rememberTextFieldState(state.output.apiKey)
+    val edgeVoice = rememberTextFieldState(state.output.edgeVoice)
+    val appId = rememberTextFieldState(state.output.appId)
+    val accessKey = rememberTextFieldState(state.output.accessKey)
+    val resource = rememberTextFieldState(state.output.resource)
+    val volcVoice = rememberTextFieldState(state.output.volcVoice)
+    var message by remember { mutableStateOf<String?>(null) }
+    var error by remember { mutableStateOf<String?>(null) }
+    val draft = VoiceOutput.Settings(provider, edgeVoice.text.toString().trim(), appId.text.toString().trim(),
+        accessKey.text.toString().trim(), resource.text.toString().trim(), volcVoice.text.toString().trim(), auth, apiKey.text.toString().trim())
+    val changed = draft != state.output
+    Panel {
+        Text("语音播报", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.semantics { heading() })
+        Spacer(Modifier.height(12.dp))
+        Column(Modifier.selectableGroup(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            VoiceChoice("Edge TTS", "默认使用 · 联网播报，无需密钥或下载模型", provider == "edge", !state.active) { provider = "edge"; message = null; error = null }
+            VoiceChoice("火山引擎", "使用自己的语音服务凭据与音色", provider == "volc", !state.active) { provider = "volc"; message = null; error = null }
+        }
+        Spacer(Modifier.height(16.dp))
+        if (provider == "edge") {
+            Text("常用音色", fontSize = 13.sp, fontWeight = FontWeight.Medium)
+            Spacer(Modifier.height(8.dp))
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf("晓晓 · 女声" to "zh-CN-XiaoxiaoNeural", "云希 · 男声" to "zh-CN-YunxiNeural", "曉臻 · 台湾女声" to "zh-TW-HsiaoChenNeural").forEach { (label, value) ->
+                    Action(label, onClick = { edgeVoice.setTextAndPlaceCursorAtEnd(value) }, enabled = !state.active)
+                }
+            }
+            Spacer(Modifier.height(12.dp))
+            AssistantField("Edge 音色", edgeVoice, 120, state.active, 1)
+        } else {
+            Column(Modifier.selectableGroup(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                VoiceChoice("API Key", "新版控制台的 API 密钥", auth == "key", !state.active) { auth = "key" }
+                VoiceChoice("App ID 与 Access Token", "已有应用的凭据", auth == "token", !state.active) { auth = "token" }
+            }
+            Spacer(Modifier.height(16.dp))
+            if (auth == "key") AssistantField("API Key", apiKey, 500, state.active, 1, secret = true)
+            else {
+                AssistantField("App ID", appId, 200, state.active, 1)
+                AssistantField("Access Token", accessKey, 500, state.active, 1, secret = true)
+            }
+            AssistantField("音色", volcVoice, 160, state.active, 2)
+            AssistantField("资源标识", resource, 160, state.active, 1)
+            Note("凭据来自火山引擎语音控制台，需开通对应音色与资源。")
+            Spacer(Modifier.height(12.dp))
+        }
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Action("保存播报设置", onClick = {
+                runCatching { voice.saveOutput(draft) }
+                    .onSuccess { message = "播报设置已保存"; error = null }
+                    .onFailure { error = it.message ?: "保存失败，请重试。"; message = null }
+            }, enabled = !state.active && changed, primary = true, icon = Lucide.Save)
+            Action("试听音色", onClick = { action("preview") }, enabled = !state.active && !changed, icon = Lucide.Play)
+            if (state.active) Action("停止", onClick = { action("stop") }, icon = Lucide.Square)
+        }
+        Spacer(Modifier.height(8.dp))
+        Note(if (changed) "请先保存修改，再试听。" else "回答文字会发送至所选播报服务；服务不可用时保留文字回答。")
+        if (state.active || state.status == "试听已结束" || state.error != null) {
+            Spacer(Modifier.height(8.dp))
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (state.active) InfiniteProgressIndicator(Modifier.size(16.dp))
+                Text(state.error ?: state.status, fontSize = 13.sp, lineHeight = 20.sp,
+                    color = if (state.error != null) MiuixTheme.colorScheme.error else MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                    modifier = Modifier.weight(1f).semantics { liveRegion = LiveRegionMode.Polite })
+            }
+        }
+        (error ?: message)?.let {
+            Spacer(Modifier.height(8.dp))
+            Text(it, fontSize = 13.sp, lineHeight = 20.sp, color = if (error != null) MiuixTheme.colorScheme.error else LocalStatusColor.current,
+                modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
+        }
+    }
+}
+
+@Composable
+private fun VoiceChoice(title: String, summary: String, selected: Boolean, enabled: Boolean, onClick: () -> Unit) {
+    val colors = MiuixTheme.colorScheme
+    Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp))
+        .background(if (selected) colors.secondary else Color.Transparent)
+        .border(1.dp, if (selected) colors.primary else colors.outline, RoundedCornerShape(8.dp))
+        .selectable(selected = selected, enabled = enabled, role = Role.RadioButton, onClick = onClick)
+        .heightIn(min = 64.dp).padding(12.dp), verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(title, fontSize = 14.sp, lineHeight = 21.sp, fontWeight = FontWeight.Medium,
+                color = if (enabled) colors.onSurface else colors.onSurfaceVariantSummary)
+            Note(summary)
+        }
+        if (selected) Icon(Lucide.Check, contentDescription = "已选择", modifier = Modifier.size(18.dp),
+            tint = if (enabled) colors.primary else colors.onSurfaceVariantSummary)
     }
 }
 

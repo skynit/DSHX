@@ -24,6 +24,7 @@ app/src/main/assets/core-info.json
 app/libs/*.aar
 app/.cxx/
 app/src/main/assets/voice/wake/
+app/src/main/assets/voice/clean/
 
 # python
 __pycache__/
