@@ -27,6 +27,7 @@
         android:allowBackup="false"
         android:label="DSHX"
         android:icon="@drawable/icon"
+        android:roundIcon="@drawable/icon"
         android:theme="@android:style/Theme.Material.Light.NoActionBar"
         android:usesCleartextTraffic="true"
         android:supportsRtl="true">
