@@ -36,7 +36,7 @@ class VoiceOutput(private val context: Context, private val interrupted: () -> U
     data class Settings(
         val provider: String = "edge", val edgeVoice: String = "zh-CN-XiaoxiaoNeural",
         val appId: String = "", val accessKey: String = "",
-        val resource: String = "seed-tts-1.0", val volcVoice: String = VOLC_VOICE,
+        val resource: String = VOLC_RESOURCE, val volcVoice: String = VOLC_VOICE,
         val auth: String = "key", val apiKey: String = "",
     ) {
         internal fun checked(): Settings {
@@ -246,7 +246,8 @@ class VoiceOutput(private val context: Context, private val interrupted: () -> U
     override fun close() { closed.set(true); stop() }
 
     companion object {
-        const val VOLC_VOICE = "zh_female_wanwanxiaohe_moon_bigtts"
+        const val VOLC_RESOURCE = "seed-tts-2.0"
+        const val VOLC_VOICE = "zh_female_xiaohe_uranus_bigtts"
         private const val EDGE_URL = "https://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1"
         private const val VOLC_URL = "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
         private const val EDGE_TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4"
@@ -259,7 +260,7 @@ class VoiceOutput(private val context: Context, private val interrupted: () -> U
             val p = context.getSharedPreferences("voice-output", Context.MODE_PRIVATE)
             return Settings(p.getString("provider", "edge") ?: "edge", p.getString("edgeVoice", "zh-CN-XiaoxiaoNeural") ?: "zh-CN-XiaoxiaoNeural",
                 p.getString("appId", "").orEmpty(), p.getString("accessKey", "").orEmpty(),
-                p.getString("resource", "seed-tts-1.0") ?: "seed-tts-1.0", p.getString("volcVoice", VOLC_VOICE) ?: VOLC_VOICE,
+                p.getString("resource", VOLC_RESOURCE) ?: VOLC_RESOURCE, p.getString("volcVoice", VOLC_VOICE) ?: VOLC_VOICE,
                 p.getString("auth", "key") ?: "key", p.getString("apiKey", "").orEmpty())
         }
 

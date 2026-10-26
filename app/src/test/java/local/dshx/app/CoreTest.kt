@@ -836,8 +836,12 @@ class CoreTest {
             val initial = VoiceOutput.settings(context)
             assertEquals("edge", initial.provider)
             assertEquals("zh-CN-XiaoxiaoNeural", initial.edgeVoice)
-            assertEquals("zh_female_wanwanxiaohe_moon_bigtts", initial.volcVoice)
+            assertEquals("seed-tts-2.0", initial.resource)
+            assertEquals("zh_female_xiaohe_uranus_bigtts", initial.volcVoice)
             VoiceOutput(context).use { it.prepare { false } }
+            val previous = initial.copy(resource = "seed-tts-1.0", volcVoice = "zh_female_wanwanxiaohe_moon_bigtts")
+            VoiceOutput.save(context, previous)
+            assertEquals(previous, VoiceOutput.settings(context))
             val volc = initial.copy(provider = "volc", auth = "token", appId = "app-123", accessKey = "secret-value")
             VoiceOutput.save(context, volc)
             assertEquals(volc, VoiceOutput.settings(context))
@@ -934,11 +938,11 @@ class CoreTest {
                 val request = server.takeRequest(2, TimeUnit.SECONDS)!!
                 assertEquals("test-app", request.getHeader("X-Api-App-Id"))
                 assertEquals("test-access", request.getHeader("X-Api-Access-Key"))
-                assertEquals("seed-tts-1.0", request.getHeader("X-Api-Resource-Id"))
+                assertEquals("seed-tts-2.0", request.getHeader("X-Api-Resource-Id"))
                 assertNotNull(request.getHeader("X-Api-Request-Id"))
                 val body = JSONObject(request.body.readUtf8()).getJSONObject("req_params")
                 assertEquals("火山你好", body.getString("text"))
-                assertEquals("zh_female_wanwanxiaohe_moon_bigtts", body.getString("speaker"))
+                assertEquals("zh_female_xiaohe_uranus_bigtts", body.getString("speaker"))
                 assertEquals("mp3", body.getJSONObject("audio_params").getString("format"))
             }
         } finally { context.getSharedPreferences("voice-output", 0).edit().clear().commit() }
