@@ -1269,11 +1269,12 @@ internal fun Action(
 ) {
     val colors = MiuixTheme.colorScheme
     var focused by remember { mutableStateOf(false) }
-    Button(onClick = onClick, modifier = modifier.onFocusChanged { focused = it.isFocused }
+    Button(onClick = onClick, modifier = modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp)
+        .padding(vertical = 6.dp).onFocusChanged { focused = it.isFocused }
         .border(if (focused) 2.dp else 1.dp,
             if (focused) colors.primary else if (primary) Color.Transparent else colors.outline, RoundedCornerShape(8.dp)),
-        enabled = enabled, minHeight = 48.dp, cornerRadius = 8.dp,
-        insideMargin = PaddingValues(horizontal = 16.dp, vertical = 10.dp),
+        enabled = enabled, minHeight = 36.dp, cornerRadius = 8.dp,
+        insideMargin = PaddingValues(horizontal = 16.dp, vertical = 4.dp),
         colors = if (primary) ButtonDefaults.buttonColorsPrimary() else ButtonDefaults.buttonColors(
             color = if (danger) colors.error.copy(alpha = 0.08f) else colors.surfaceContainerHigh,
             disabledColor = colors.secondary,
