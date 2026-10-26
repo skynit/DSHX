@@ -56,6 +56,48 @@ class MainActivity : ComponentActivity() {
     }
     private val assistantStore by lazy { AssistantStore(filesDir) }
     private val memoryStore by lazy { MemoryStore(filesDir) }
+    private val libraryStore by lazy { LibraryStore(filesDir) }
+    private var libraryRevision by mutableIntStateOf(0)
+    private var libraryBusy by mutableStateOf(false)
+    private var libraryMessage by mutableStateOf<String?>(null)
+    private var librarySelecting = false
+    private var libraryExportId: String? = null
+    private val libraryPicker = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        librarySelecting = false
+        if (uris.isEmpty()) libraryBusy = false
+        else kotlin.concurrent.thread(name = "dsh-library-upload", isDaemon = true) {
+            var completed = 0
+            val errors = mutableListOf<String>()
+            for (uri in uris) try {
+                val name = contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
+                    if (it.moveToFirst()) it.getString(0) else null
+                } ?: "未命名文件"
+                (contentResolver.openInputStream(uri) ?: error("无法读取所选文件。" )).use { libraryStore.upload(name, it) }
+                completed++
+            } catch (error: Exception) { errors += error.message ?: "文件上传失败。" }
+            runOnUiThread {
+                libraryBusy = false; libraryRevision++
+                libraryMessage = "已上传 $completed 个文件。" + errors.distinct().joinToString("；")
+            }
+        }
+    }
+    private val libraryExport = registerForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
+        librarySelecting = false
+        val id = libraryExportId; libraryExportId = null
+        if (uri == null || id == null) libraryBusy = false
+        else kotlin.concurrent.thread(name = "dsh-library-export", isDaemon = true) {
+            val result = runCatching {
+                libraryStore.file(id).inputStream().use { input ->
+                    (contentResolver.openOutputStream(uri, "wt") ?: error("无法写入所选位置。" )).use { input.copyTo(it) }
+                }
+            }
+            if (result.isFailure) runCatching { android.provider.DocumentsContract.deleteDocument(contentResolver, uri) }
+            runOnUiThread {
+                libraryBusy = false
+                libraryMessage = result.fold({ "原件已导出。" }, { it.message ?: "导出失败，请重试。" })
+            }
+        }
+    }
     private var browser: WebView? = null
     private var browserInstance: String? = null
     private var pageError by mutableStateOf<String?>(null)
@@ -103,7 +145,11 @@ class MainActivity : ComponentActivity() {
                                 if (cursor.moveToFirst()) cursor.getString(0) else null
                             }
                         }.getOrNull() ?: if (action == "restore") "知识归档.gz" else "资料.txt"
-                        input.copy(title = title)
+                        if (action == "import") input.copy(title = title, open = {
+                            val original = input.open().use { libraryStore.upload(title, it) }
+                            runOnUiThread { libraryRevision++ }
+                            libraryStore.file(original.id).inputStream()
+                        }) else input.copy(title = title)
                     }
                     if (!engine.knowledgeFiles(action, pending.getJSONObject("data"), named))
                         runOnUiThread { Toast.makeText(this, "已有知识文件正在处理，请稍后重试。", Toast.LENGTH_LONG).show() }
@@ -154,6 +200,9 @@ class MainActivity : ComponentActivity() {
         backupPicking = savedInstanceState?.getBoolean("backupPicking") ?: false
         knowledgePicking = savedInstanceState?.getBoolean("knowledgePicking") ?: false
         knowledgePick = savedInstanceState?.getString("knowledgePick")
+        libraryExportId = savedInstanceState?.getString("libraryExportId")
+        libraryBusy = savedInstanceState?.getBoolean("libraryPicking") ?: false
+        librarySelecting = libraryBusy
         val preferences = getSharedPreferences("appearance", MODE_PRIVATE)
         val info = assets.open("core-info.json").bufferedReader().use { JSONObject(it.readText()) }
         val bundle = BundleInfo(info.getString("dsh"), info.getString("node"), info.getString("abi"), info.getLong("unpackedSize"))
@@ -192,6 +241,8 @@ class MainActivity : ComponentActivity() {
                 memoryStore = memoryStore, onMemory = engine::memory,
                 knowledgeStore = engine.knowledgeStore, onKnowledge = engine::knowledge,
                 knowledgePicking = knowledgePicking, onKnowledgeFile = ::knowledgeFile,
+                libraryStore = libraryStore, libraryRevision = libraryRevision, libraryBusy = libraryBusy,
+                libraryMessage = libraryMessage, onLibraryFile = ::libraryFile,
                 backupPicking = backupPicking, onBackup = ::backupAction,
                 phone = engine.phone, phoneRevision = phoneRevision,
                 voice = voice, voiceState = voiceState, onVoice = ::voiceAction,
@@ -207,6 +258,16 @@ class MainActivity : ComponentActivity() {
             Toast.makeText(this, "请先启动 dsh，再管理知识文件。", Toast.LENGTH_LONG).show()
             return
         }
+        if (action == "library") {
+            try {
+                val id = data.getString("fileId")
+                val input = KnowledgeStore.Input(libraryStore.file(id).name, { libraryStore.file(id).inputStream() })
+                engine.knowledgeFiles("import", JSONObject().put("collectionId", data.getString("collectionId")), listOf(input))
+            } catch (error: Exception) {
+                Toast.makeText(this, error.message ?: "无法读取文件，请刷新后重试。", Toast.LENGTH_LONG).show()
+            }
+            return
+        }
         knowledgePick = JSONObject().put("action", action).put("data", data).toString()
         knowledgePicking = true
         try {
@@ -217,6 +278,22 @@ class MainActivity : ComponentActivity() {
             knowledgePicking = false
             knowledgePick = null
             Toast.makeText(this, "无法打开系统文件选择器，请重试。", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun libraryFile(action: String, id: String?) {
+        if (libraryBusy) return
+        libraryBusy = true; librarySelecting = true; libraryMessage = null
+        try {
+            if (action == "upload") libraryPicker.launch(arrayOf("*/*"))
+            else {
+                val item = requireNotNull(id)
+                libraryExportId = item
+                libraryExport.launch(libraryStore.file(item).name)
+            }
+        } catch (error: Exception) {
+            libraryBusy = false; librarySelecting = false; libraryExportId = null
+            libraryMessage = error.message ?: "无法打开系统文件选择器。"
         }
     }
 
@@ -239,6 +316,8 @@ class MainActivity : ComponentActivity() {
         outState.putBoolean("backupPicking", backupPicking)
         outState.putBoolean("knowledgePicking", knowledgePicking)
         outState.putString("knowledgePick", knowledgePick)
+        outState.putString("libraryExportId", libraryExportId)
+        outState.putBoolean("libraryPicking", librarySelecting)
         super.onSaveInstanceState(outState)
     }
 

@@ -13,6 +13,8 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.layout.*
@@ -75,6 +77,10 @@ import com.composables.icons.lucide.RotateCcw
 import com.composables.icons.lucide.Mic
 import com.composables.icons.lucide.Phone
 import com.composables.icons.lucide.Download
+import com.composables.icons.lucide.Plus
+import com.composables.icons.lucide.BookOpen
+import com.composables.icons.lucide.FileText
+import com.composables.icons.lucide.Brain
 import com.composables.icons.lucide.Upload
 import com.composables.icons.lucide.X
 import top.yukonga.miuix.kmp.basic.*
@@ -135,6 +141,8 @@ fun DshScreen(
     memoryStore: MemoryStore, onMemory: (String, org.json.JSONObject) -> org.json.JSONObject,
     knowledgeStore: KnowledgeStore, onKnowledge: (String, org.json.JSONObject) -> org.json.JSONObject,
     knowledgePicking: Boolean, onKnowledgeFile: (String, org.json.JSONObject) -> Unit,
+    libraryStore: LibraryStore, libraryRevision: Int, libraryBusy: Boolean,
+    libraryMessage: String?, onLibraryFile: (String, String?) -> Unit,
     backupPicking: Boolean, onBackup: (Boolean) -> Unit,
     phone: PhoneControl, phoneRevision: Int, onPhonePermission: (String) -> Unit,
     voice: VoiceControl, voiceState: VoiceControl.State, onVoice: (String) -> Unit,
@@ -142,6 +150,7 @@ fun DshScreen(
 ) {
     var tab by rememberSaveable { mutableIntStateOf(0) }
     var logs by rememberSaveable { mutableStateOf(false) }
+    var library by rememberSaveable { mutableStateOf(false) }
     var logText by remember { mutableStateOf("") }
     val scroll = remember(tab, logs) { ScrollState(0) }
     val savedPages = rememberSaveableStateHolder()
@@ -162,12 +171,12 @@ fun DshScreen(
         onDispose { view.viewTreeObserver.removeOnGlobalLayoutListener(listener) }
     }
     fun openLogs() { logText = diagnostics(); logs = true }
-    BackHandler(logs || tab != 0) { if (logs) logs = false else tab = 0 }
+    BackHandler(library || logs || tab != 0) { if (library) library = false else if (logs) logs = false else tab = 0 }
     AppTheme(theme) {
         Scaffold(
             contentWindowInsets = WindowInsets(0, 0, 0, 0),
             bottomBar = {
-                if (!(tab in 1..2 && !logs && keyboardOpen)) Column(Modifier.background(MiuixTheme.colorScheme.surfaceVariant)) {
+                if (!library && !(tab in 1..2 && !logs && keyboardOpen)) Column(Modifier.background(MiuixTheme.colorScheme.surfaceVariant)) {
                     Divider()
                     Row(Modifier.fillMaxWidth().selectableGroup().padding(horizontal = 12.dp, vertical = 4.dp),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -196,7 +205,11 @@ fun DshScreen(
                 }
             },
         ) { padding ->
-            if (tab == 1 && !logs && running && webReady && pageError == null) {
+            if (library) {
+                LibraryScreen(Modifier.padding(padding).fillMaxSize(), { library = false }, running, state.busy, onStart,
+                    memoryStore, onMemory, knowledgeStore, state.knowledgeFiles, knowledgePicking, onKnowledge, onKnowledgeFile,
+                    libraryStore, libraryRevision, libraryBusy, libraryMessage, onLibraryFile)
+            } else if (tab == 1 && !logs && running && webReady && pageError == null) {
                 chat(Modifier.padding(padding).fillMaxSize())
             } else if (tab == 3 && !logs) {
                 VoiceChat(Modifier.padding(padding).fillMaxSize(), voiceState, running, state.busy, onVoice, onStart,
@@ -254,6 +267,8 @@ fun DshScreen(
                             Panel(padding = 0) {
                                 LinkRow("模型与会话", if (running) "配置模型、继续对话" else "启动后可用", onClick = { tab = 1 })
                                 Divider()
+                                LinkRow("知识库", "资料、记忆、文件与技能", onClick = { library = true })
+                                Divider()
                                 LinkRow("运行诊断", "查看本机日志", onClick = ::openLogs)
                             }
                             Section("这台设备")
@@ -275,11 +290,11 @@ fun DshScreen(
                             Action("返回工作台", onClick = { tab = 0 })
                         }
                         else -> {
-                            savedPages.SaveableStateProvider("assistant") { AssistantSettings(assistantStore) }
-                            savedPages.SaveableStateProvider("memory") { MemorySettings(memoryStore, running, onMemory) }
-                            savedPages.SaveableStateProvider("knowledge") {
-                                KnowledgeSettings(knowledgeStore, running, state.knowledgeFiles, knowledgePicking, onKnowledge, onKnowledgeFile)
+                            Section("知识与资料")
+                            Panel(padding = 0) {
+                                LinkRow("知识库", "统一管理资料、记忆、上传文件和技能", onClick = { library = true })
                             }
+                            savedPages.SaveableStateProvider("assistant") { AssistantSettings(assistantStore) }
                             Section("模型分工")
                             SmallModelSettings(voice, voiceState, onVoice)
                             VoiceSettings(voice, voiceState, onVoice)
@@ -786,12 +801,12 @@ private fun VoiceModelRow(title: String, summary: String, ready: Boolean, enable
 }
 
 @Composable
-private fun MemorySettings(store: MemoryStore, running: Boolean, call: (String, org.json.JSONObject) -> org.json.JSONObject) {
+internal fun MemorySettings(store: MemoryStore, running: Boolean, visible: Boolean, call: (String, org.json.JSONObject) -> org.json.JSONObject) {
     var saved by remember { mutableStateOf<MemoryStore.Settings?>(null) }
     var status by remember { mutableStateOf<MemoryStore.Status?>(null) }
     var rows by remember { mutableStateOf<List<MemoryStore.Entry>?>(null) }
     var listRevision by remember { mutableStateOf<Long?>(null) }
-    var managing by remember { mutableStateOf(false) }
+    var options by remember { mutableStateOf(false) }
     var editing by remember { mutableStateOf(false) }
     var current by remember { mutableStateOf<MemoryStore.Entry?>(null) }
     var editRevision by remember { mutableStateOf(0L) }
@@ -803,6 +818,7 @@ private fun MemorySettings(store: MemoryStore, running: Boolean, call: (String, 
     val content = rememberTextFieldState()
     val expiry = rememberTextFieldState()
     val search = rememberTextFieldState()
+    var filter by rememberSaveable { mutableStateOf("all") }
     var confirmation by remember { mutableStateOf<String?>(null) }
     var loading by remember { mutableStateOf(false) }
     var message by remember { mutableStateOf<String?>(null) }
@@ -823,11 +839,9 @@ private fun MemorySettings(store: MemoryStore, running: Boolean, call: (String, 
         listRevision = null
         if (running) {
             accept(runInterruptible(Dispatchers.IO) { call("status", org.json.JSONObject()) })
-            if (managing) {
-                val (entries, revision) = MemoryStore.entries(runInterruptible(Dispatchers.IO) { call("list", org.json.JSONObject()) })
-                rows = entries
-                listRevision = revision
-            }
+            val (entries, revision) = MemoryStore.entries(runInterruptible(Dispatchers.IO) { call("list", org.json.JSONObject()) })
+            rows = entries
+            listRevision = revision
         } else saved = runInterruptible(Dispatchers.IO) { store.readSettings() }
     }
     fun request(action: String? = null, data: org.json.JSONObject = org.json.JSONObject(), done: (() -> Unit)? = null) {
@@ -874,12 +888,6 @@ private fun MemorySettings(store: MemoryStore, running: Boolean, call: (String, 
         rows = null
         listRevision = null
         message = "已取消等待。操作可能已经保存，请重新读取确认实际结果。"
-    }
-    fun closeManager() {
-        if (loading) cancel()
-        managing = false
-        editing = false
-        confirmation = null
     }
     fun fill(entry: MemoryStore.Entry?, revision: Long) {
         current = entry
@@ -936,7 +944,7 @@ private fun MemorySettings(store: MemoryStore, running: Boolean, call: (String, 
         task?.cancelAndJoin()
         loading = false
         confirmation = null
-        if (!running) { editing = false; managing = false }
+        if (!running) editing = false
         request()
     }
     val available = running && status?.ready == true && !loading
@@ -958,57 +966,61 @@ private fun MemorySettings(store: MemoryStore, running: Boolean, call: (String, 
         if (loading) Action("取消等待", onClick = ::cancel)
         else if (failure != null || saved == null) Action("重新读取", onClick = { request() })
     }
-    Section("长期记忆")
-    Panel(padding = 0) {
-        SettingsSwitch("长期记忆", "保存于本机，开启后可在新会话使用；关闭后仍可管理已有记忆。",
-            saved?.enabled ?: false, available, if (saved == null) "状态未知" else null) { enabled ->
-            saved?.let { change(it.copy(enabled = enabled)) }
-        }
-        Divider()
-        SettingsSwitch("自动整理", "调用当前配置的模型。使用云端模型时，参与整理的对话片段会发送至该模型。",
-            saved?.autoSave ?: false, available && (saved?.autoSave == true || saved?.enabled == true),
-            if (saved == null) "状态未知" else null) { enabled ->
-            if (enabled) confirmation = "auto" else saved?.let { change(it.copy(autoSave = false)) }
-        }
-        Divider()
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            feedback()
-            if (saved?.enabled == true && saved?.autoSave == true && status?.autoReady == false) Note("自动整理模型尚未就绪；本地记忆管理仍可使用。")
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Action("管理记忆", onClick = { managing = true; request() }, enabled = available)
-                Action("刷新状态", onClick = { request() }, enabled = !loading)
+    if (options && visible) MemoryDialog("记忆设置", { options = false }) {
+        Panel(padding = 0) {
+            SettingsSwitch("长期记忆", "保存于本机，开启后可在新会话使用；关闭后仍可管理已有记忆。",
+                saved?.enabled ?: false, available, if (saved == null) "状态未知" else null) { enabled ->
+                saved?.let { change(it.copy(enabled = enabled)) }
             }
-            Note("记忆保存在本机，不含独立记忆备份或跨设备同步；会话备份仅包含会话与附件。卸载应用或清除应用数据会删除本地记忆。")
+            Divider()
+            SettingsSwitch("自动整理", "调用当前配置的模型。使用云端模型时，参与整理的对话片段会发送至该模型。",
+                saved?.autoSave ?: false, available && (saved?.autoSave == true || saved?.enabled == true),
+                if (saved == null) "状态未知" else null) { enabled ->
+                if (enabled) confirmation = "auto" else saved?.let { change(it.copy(autoSave = false)) }
+            }
+            Divider()
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                feedback()
+                if (saved?.enabled == true && saved?.autoSave == true && status?.autoReady == false) Note("自动整理模型尚未就绪；本地记忆管理仍可使用。")
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Action("刷新状态", onClick = { request() }, enabled = !loading)
+                    Action("清空记忆", onClick = { confirmation = "clear" }, enabled = available && listRevision != null, danger = true)
+                }
+                Note("记忆保存在本机，不含独立记忆备份或跨设备同步；会话备份仅包含会话与附件。卸载应用或清除应用数据会删除本地记忆。")
+            }
         }
     }
-
-    if (managing && !editing) MemoryDialog("管理记忆", ::closeManager, scroll = false) {
+    Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        LibraryBar("长期记忆", status?.let { "${it.count} 条记忆 · ${it.pending} 条待确认" }) {
+            Action("新增", onClick = { listRevision?.let { fill(null, it) } }, enabled = available && listRevision != null, primary = true, icon = Lucide.Plus)
+            LibraryIcon(Lucide.Settings2, "记忆设置", { options = true })
+        }
+        LibrarySearch(search, "搜索记忆")
+        LibraryFilters(listOf("all" to "全部记忆", "pending" to "待确认"), filter) { filter = it }
         val query = search.text.toString().trim()
-        val filtered = rows?.filter { query.isEmpty() || it.summary.contains(query, true) || it.content.contains(query, true) ||
-            it.key.contains(query, true) || it.scopeText.contains(query, true) }
+        val filtered = rows?.filter { (filter != "pending" || it.state == "pending") && (query.isEmpty() || it.summary.contains(query, true) || it.content.contains(query, true) ||
+            it.key.contains(query, true) || it.scopeText.contains(query, true)) }
         androidx.compose.foundation.lazy.LazyColumn(Modifier.weight(1f).fillMaxWidth(),
             verticalArrangement = Arrangement.spacedBy(8.dp)) {
             item(key = "filter") {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    feedback()
-                    AssistantField("筛选记忆", search, 160, false, 1, "搜索摘要、正文或工作区")
+                    if (loading || failure != null || message != null || status?.ready == false) feedback()
+                    else if (saved?.enabled == false) Note("未用于对话，可在记忆设置中开启。")
                 }
             }
-            if (filtered != null && filtered.isEmpty()) item { Note(if (query.isBlank()) "还没有记忆，可新增一条。" else "没有匹配的记忆。") }
+            if (filtered != null && filtered.isEmpty()) item {
+                LibraryEmpty(Lucide.Brain, if (filter == "pending") "没有待确认记忆" else if (query.isNotBlank()) "没有匹配的记忆" else "记住对你有用的事",
+                    if (filter == "pending") "新的记忆候选会出现在这里。" else if (query.isNotBlank()) "换个关键词试试。" else "保存偏好、事实与经验，让后续对话更了解你。")
+            }
             items(filtered?.size ?: 0, key = { filtered!![it].id }) { index ->
                 val entry = filtered!![index]
-                Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp))
-                    .clickable(enabled = available, role = Role.Button, onClick = { read(entry) })
-                    .heightIn(min = 64.dp).padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text(entry.summary, fontSize = 14.sp, lineHeight = 21.sp, fontWeight = FontWeight.Medium)
-                    Note("${entry.typeText} · ${entry.scopeText}")
-                    Note(when {
-                        entry.state == "pending" -> "待确认 · 确认后才会用于对话"
+                LibraryRow(Lucide.Brain, entry.summary, "${entry.typeText} · ${entry.scopeText}",
+                    when {
+                        entry.state == "pending" -> "待确认 · 确认后用于对话"
                         entry.expiresAt?.let { it <= System.currentTimeMillis() } == true -> "已过期"
-                        entry.locked -> "已确认 · 自动整理不会覆盖"
-                        else -> "已保存"
-                    })
-                }
+                        entry.locked -> "已确认"
+                        else -> null
+                    }, available) { read(entry) }
                 Divider()
             }
             status?.jobs?.forEach { job ->
@@ -1027,15 +1039,8 @@ private fun MemorySettings(store: MemoryStore, running: Boolean, call: (String, 
                 }
             }
         }
-        Divider()
-        FlowRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
-            verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Action("新增", onClick = { listRevision?.let { fill(null, it) } }, enabled = available && listRevision != null, primary = true)
-            Action("刷新", onClick = { request() }, enabled = !loading)
-            Action("清空", onClick = { confirmation = "clear" }, enabled = available && listRevision != null, danger = true)
-        }
     }
-    if (managing && editing) MemoryDialog(if (current == null) "新增记忆" else if (current?.state == "pending") "确认记忆候选" else "编辑记忆", {
+    if (editing && visible) MemoryDialog(if (current == null) "新增记忆" else if (current?.state == "pending") "确认记忆候选" else "编辑记忆", {
         if (loading) cancel()
         editing = false
     }) {
@@ -1064,7 +1069,7 @@ private fun MemorySettings(store: MemoryStore, running: Boolean, call: (String, 
         }
         feedback()
     }
-    confirmation?.let { action ->
+    confirmation?.takeIf { visible }?.let { action ->
         MemoryDialog(when (action) { "auto" -> "开启自动整理"; "remove" -> "删除这条记忆"; else -> "清空全部记忆" }, { confirmation = null }) {
             Note(when (action) {
                 "auto" -> "开启后，将使用当前已配置模型整理新对话。若使用云端模型，参与整理的对话片段会发送给该模型。"
@@ -1090,7 +1095,7 @@ private fun memoryTime(value: Long): String = java.time.Instant.ofEpochMilli(val
     .format(java.time.format.DateTimeFormatter.ofPattern("uuuu-MM-dd HH:mm"))
 
 @Composable
-private fun MemoryChoice(title: String, options: List<Pair<String, String>>, selected: String, enabled: Boolean, change: (String) -> Unit) {
+internal fun MemoryChoice(title: String, options: List<Pair<String, String>>, selected: String, enabled: Boolean, change: (String) -> Unit) {
     Text(title, fontSize = 13.sp, fontWeight = FontWeight.Medium)
     FlowRow(Modifier.fillMaxWidth().selectableGroup(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         options.forEach { (value, label) ->
@@ -1106,7 +1111,7 @@ private fun MemoryChoice(title: String, options: List<Pair<String, String>>, sel
 }
 
 @Composable
-private fun MemoryDialog(title: String, close: () -> Unit, scroll: Boolean = true, content: @Composable ColumnScope.() -> Unit) {
+internal fun MemoryDialog(title: String, close: () -> Unit, scroll: Boolean = true, content: @Composable ColumnScope.() -> Unit) {
     androidx.compose.ui.window.Dialog(onDismissRequest = close,
         properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false)) {
         val window = (LocalView.current.parent as? androidx.compose.ui.window.DialogWindowProvider)?.window
@@ -1213,7 +1218,7 @@ private fun AssistantSettings(store: AssistantStore) {
 }
 
 @Composable
-private fun AssistantField(label: String, state: TextFieldState, limit: Int, disabled: Boolean, lines: Int, hint: String = "", secret: Boolean = false, codePoints: Boolean = false) {
+internal fun AssistantField(label: String, state: TextFieldState, limit: Int, disabled: Boolean, lines: Int, hint: String = "", secret: Boolean = false, codePoints: Boolean = false) {
     var focused by remember { mutableStateOf(false) }
     val value = state.text.toString().trim()
     val size = if (codePoints) value.codePointCount(0, value.length) else value.length
@@ -1252,13 +1257,13 @@ private fun AssistantField(label: String, state: TextFieldState, limit: Int, dis
 }
 
 @Composable
-private fun Panel(padding: Int = 16, content: @Composable ColumnScope.() -> Unit) {
+internal fun Panel(padding: Int = 16, content: @Composable ColumnScope.() -> Unit) {
     Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(MiuixTheme.colorScheme.surfaceVariant)
         .border(1.dp, MiuixTheme.colorScheme.outline, RoundedCornerShape(10.dp)).padding(padding.dp), content = content)
 }
 
 @Composable
-private fun Action(
+internal fun Action(
     text: String, onClick: () -> Unit, modifier: Modifier = Modifier, enabled: Boolean = true,
     primary: Boolean = false, icon: ImageVector? = null, danger: Boolean = false,
 ) {
@@ -1297,14 +1302,14 @@ private fun LinkRow(title: String, summary: String, onClick: () -> Unit) {
 }
 
 @Composable
-private fun Note(text: String) = Text(text, fontSize = 12.sp, lineHeight = 18.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+internal fun Note(text: String) = Text(text, fontSize = 12.sp, lineHeight = 18.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
 
 @Composable
 private fun Section(text: String) = Text(text, modifier = Modifier.padding(top = 8.dp).semantics { heading() },
     fontSize = 12.sp, fontWeight = FontWeight.Medium, color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
 
 @Composable
-private fun Divider() = Spacer(Modifier.fillMaxWidth().height(1.dp).background(MiuixTheme.colorScheme.dividerLine))
+internal fun Divider() = Spacer(Modifier.fillMaxWidth().height(1.dp).background(MiuixTheme.colorScheme.dividerLine))
 
 @Composable
 private fun Info(label: String, value: String) {
@@ -1316,13 +1321,12 @@ private fun Info(label: String, value: String) {
 
 /** 延续现有记忆弹层和主题，原生仅保留编辑草稿与已经校验的状态。 */
 @Composable
-private fun KnowledgeSettings(store: KnowledgeStore, running: Boolean, transfer: KnowledgeStore.Transfer, picking: Boolean,
+internal fun KnowledgeSettings(store: KnowledgeStore, running: Boolean, visible: Boolean, transfer: KnowledgeStore.Transfer, picking: Boolean,
                               call: (String, org.json.JSONObject) -> org.json.JSONObject,
                               file: (String, org.json.JSONObject) -> Unit) {
     var status by remember { mutableStateOf<KnowledgeStore.Status?>(null) }
     var catalog by remember { mutableStateOf<KnowledgeStore.Catalog?>(null) }
-    var managing by rememberSaveable { mutableStateOf(false) }
-    var page by rememberSaveable { mutableStateOf("list") }
+    var page by remember { mutableStateOf("list") }
     var selected by rememberSaveable { mutableStateOf("") }
     var current by remember { mutableStateOf<KnowledgeStore.Source?>(null) }
     var original by remember { mutableStateOf("") }
@@ -1400,19 +1404,17 @@ private fun KnowledgeSettings(store: KnowledgeStore, running: Boolean, transfer:
             foundJob = next.jobs.firstOrNull { it.id == previous.id } ?: if (next.raw.optJSONObject("job")?.optString("id") == previous.id)
                 KnowledgeStore.job(next.raw.getJSONObject("job")) else previous
         }
-        if (managing) {
-            catalog = runInterruptible(Dispatchers.IO) { KnowledgeStore.loadCatalog(call) }
-            if (selected.isNotBlank() && catalog?.collections?.none { it.id == selected } == true) selected = ""
-            if (page == "detail") current?.let { previous ->
-                val latest = catalog?.sources?.firstOrNull { it.id == previous.id && it.state != "deleted" }
-                if (latest == null || latest.version != previous.version || latest.revision != previous.revision) {
-                    current = null
-                    original = ""
-                    nextOffset = null
-                    page = "list"
-                    searchResults = null
-                    message = if (latest == null) "资料已删除，请查看最新目录。" else "资料已更新，请重新打开查看最新原文。"
-                }
+        catalog = runInterruptible(Dispatchers.IO) { KnowledgeStore.loadCatalog(call) }
+        if (selected.isNotBlank() && catalog?.collections?.none { it.id == selected } == true) selected = ""
+        if (page == "detail") current?.let { previous ->
+            val latest = catalog?.sources?.firstOrNull { it.id == previous.id && it.state != "deleted" }
+            if (latest == null || latest.version != previous.version || latest.revision != previous.revision) {
+                current = null
+                original = ""
+                nextOffset = null
+                page = "list"
+                searchResults = null
+                message = if (latest == null) "资料已删除，请查看最新目录。" else "资料已更新，请重新打开查看最新原文。"
             }
         }
     }
@@ -1466,13 +1468,7 @@ private fun KnowledgeSettings(store: KnowledgeStore, running: Boolean, transfer:
             } finally { loading = false }
         }
     }
-    fun close() {
-        retainDraft.value.invoke()
-        task?.cancel()
-        managing = false
-        confirmation = null
-        message = "已停止等待；已受理任务继续执行，可重新打开查看。"
-    }
+
     fun read(source: KnowledgeStore.Source, append: Boolean = false) {
         if (!append) {
             current = source; original = ""; nextOffset = null; page = "detail"
@@ -1570,8 +1566,8 @@ private fun KnowledgeSettings(store: KnowledgeStore, running: Boolean, transfer:
     LaunchedEffect(running, foreground) {
         if (running && foreground) request() else { status = null; catalog = null; task?.cancel() }
     }
-    LaunchedEffect(managing, foreground, running, transfer.revision) {
-        if (managing && foreground && running) {
+    LaunchedEffect(foreground, running, visible, transfer.revision) {
+        if (foreground && running && visible) {
             if (!loading) request()
             while (true) {
                 kotlinx.coroutines.delay(6000)
@@ -1590,6 +1586,8 @@ private fun KnowledgeSettings(store: KnowledgeStore, running: Boolean, transfer:
         if (transfer.message.isNotBlank()) Text(transfer.message, fontSize = 13.sp, lineHeight = 20.sp,
             color = if (transfer.error) MiuixTheme.colorScheme.error else MiuixTheme.colorScheme.onSurfaceVariantSummary)
         if (picking) Note("请选择知识文件或保存位置。")
+        if (running && !loading && (failure != null || status?.ready != true)) Action("重新读取", onClick = { request() })
+        if (loading) Action("停止等待", onClick = { task?.cancel(); message = "已停止等待，请刷新核实实际结果。" })
         if (pendingAction != null && pendingData != null) {
             val pending = org.json.JSONObject(pendingData!!)
             Note("待核实操作：${pending.getString("operationId")}")
@@ -1603,44 +1601,41 @@ private fun KnowledgeSettings(store: KnowledgeStore, running: Boolean, transfer:
         }
     }
 
-    Section("知识库")
-    Panel(padding = 0) {
-        SettingsSwitch("用于对话", "原文保存在本机；关闭后仍可管理资料，长期记忆使用独立开关。",
-            status?.enabled ?: false, available, if (!running) "先启动 dsh" else if (status == null) "状态未知" else null) { enabled ->
-            status?.let { request("settings", KnowledgeStore.change(it.settingsRevision).put("settings", org.json.JSONObject().put("enabled", enabled))) }
-        }
-        Divider()
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Note(status?.let { "${it.raw.optJSONObject("counts")?.optInt("collections", it.collections.size) ?: it.collections.size} 个集合 · ${it.raw.optJSONObject("counts")?.optInt("sources", it.sources.size) ?: it.sources.size} 份资料" } ?: if (running) "知识状态尚未读取。" else "启动后可浏览、搜索与管理本机资料。")
-            feedback()
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Action("管理知识", onClick = { managing = true; page = "list"; request() }, enabled = running, icon = Lucide.MessageSquare)
-                Action("刷新状态", onClick = { request() }, enabled = running && !loading)
-            }
-            Note("知识归档不含长期记忆、会话和模型密钥。")
+    fun searchDocuments() {
+        if (!available || query.text.isBlank()) return
+        val data = org.json.JSONObject().put("query", query.text.toString().trim()).put("limit", 6).put("kind", "document")
+        collections.firstOrNull { it.id == selected }?.let { data.put("withinRef", "kb:collection:${it.id}:r${it.revision}") }
+        request("search", data) { result ->
+            searchResults = KnowledgeStore.search(result)
+            searchMode = if (result.getString("mode") == "hybrid") "关键词与语义检索" else "关键词检索"
+            result.optString("degradedReason").takeIf { it.isNotBlank() }?.let { message = it }
         }
     }
-    if (managing) MemoryDialog(when (page) { "detail" -> "资料详情"; "reference" -> "搜索原文"; "edit" -> if (draftSource == null) "粘贴新资料" else "编辑资料";
-        "collections" -> "集合管理"; "tasks" -> "知识任务"; "settings" -> "知识设置"; else -> "管理知识" }, ::close, scroll = false) {
+    Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        if (page == "list") {
+            LibraryBar("资料目录", status?.let { "${it.raw.optJSONObject("counts")?.optInt("sources", sources.size) ?: sources.size} 份资料" }) {
+                Action("添加", onClick = { page = "add" }, enabled = available, primary = true, icon = Lucide.Plus)
+                LibraryIcon(Lucide.Settings2, "资料管理", { page = "manage" }, running && !loading)
+            }
+            LibrarySearch(query, "搜索资料正文", ::searchDocuments)
+            if (collections.isNotEmpty()) LibraryFilters(listOf("" to "全部资料") + collections.map { it.id to it.title }, selected) {
+                selected = it; searchResults = null
+            }
+        } else {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Action("返回", onClick = { page = "list" }, enabled = !loading)
+                Text(when (page) { "add" -> "添加资料"; "manage" -> "资料管理"; "collections" -> "集合管理";
+                    "tasks" -> "处理任务"; "settings" -> "检索设置"; "detail" -> "资料详情"; "edit" -> "编辑资料"; else -> "查看原文" },
+                    fontSize = 16.sp, fontWeight = FontWeight.Medium)
+            }
+        }
+        BackHandler(visible && page != "list") { page = "list" }
         Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(remember(page) { ScrollState(0) }), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             feedback()
-            if (page != "list") Action("返回目录", onClick = { task?.cancel(); page = "list"; request() }, enabled = !loading)
             when (page) {
                 "list" -> {
-                    MemoryChoice("集合", listOf("" to "全部") + collections.map { it.id to "${it.title} · ${it.scopeText}" }, selected, !loading) { selected = it; searchResults = null }
-                    AssistantField("手动搜索", query, 1000, loading, 2, "搜索本机文档和有效记忆")
-                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Action("搜索", onClick = {
-                            val data = org.json.JSONObject().put("query", query.text.toString().trim()).put("limit", 6).put("kind", "all")
-                            collections.firstOrNull { it.id == selected }?.let { data.put("withinRef", "kb:collection:${it.id}:r${it.revision}") }
-                            request("search", data) { result ->
-                                searchResults = KnowledgeStore.search(result)
-                                searchMode = if (result.getString("mode") == "hybrid") "关键词与语义检索" else "关键词检索"
-                                result.optString("degradedReason").takeIf { it.isNotBlank() }?.let { message = it }
-                            }
-                        }, enabled = available && query.text.isNotBlank(), primary = true)
-                        Action("清除搜索", onClick = { searchResults = null }, enabled = !loading)
-                    }
+                    if (searchResults != null) Action("返回全部资料", onClick = { searchResults = null; query.setTextAndPlaceCursorAtEnd("") }, enabled = !loading)
+                    if (hasDraft) Action("继续编辑草稿", onClick = { page = "edit" }, enabled = !loading)
                     val matches = searchResults
                     if (matches != null) {
                         Note("$searchMode · ${matches.size} 条结果")
@@ -1660,31 +1655,60 @@ private fun KnowledgeSettings(store: KnowledgeStore, running: Boolean, transfer:
                         if (matches.isEmpty()) Note("没有匹配内容，可换一个关键词。")
                     } else {
                         val rows = sources.filter { it.state != "deleted" && (selected.isBlank() || it.collectionId == selected) }
-                        if (rows.isEmpty()) Note("还没有资料，可导入文件或粘贴文本。")
+                        if (rows.isEmpty() && running && !loading && failure == null) LibraryEmpty(Lucide.BookOpen,
+                            if (selected.isBlank()) "建立你的资料库" else "这个集合还没有资料",
+                            "把常用文档放在这里，随时搜索和用于对话。") {
+                            if (collections.isEmpty()) Action("创建第一个集合", onClick = { page = "collections" }, enabled = available, icon = Lucide.Plus)
+                            else Action("导入资料", onClick = { page = "add" }, enabled = available, icon = Lucide.Upload)
+                        }
                         rows.forEach { source ->
-                            Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).clickable(enabled = available, role = Role.Button) { read(source) }
-                                .heightIn(min = 64.dp).padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                Text(source.title, fontSize = 15.sp, lineHeight = 22.sp, fontWeight = FontWeight.Medium)
-                                Note("${source.bytes} 字节 · 版本 ${source.version} · ${collections.firstOrNull { it.id == source.collectionId }?.title ?: "集合不可用"}")
-                                if (source.state == "unavailable") Note("原文不可用，可替换或删除")
-                            }
+                            LibraryRow(Lucide.FileText, source.title,
+                                "${collections.firstOrNull { it.id == source.collectionId }?.title ?: "未分类"} · ${source.format.uppercase()} · ${fileSize(source.bytes)}",
+                                if (source.state == "unavailable") "原文不可用，可替换或删除" else null, available) { read(source) }
                             Divider()
                         }
                     }
+                }
+                "add" -> {
+                    Note("选择集合后导入文件或粘贴文本。支持 Markdown 和 TXT，单份最多 2 MiB。")
+                    MemoryChoice("目标集合", collections.map { it.id to it.title }, selected, available) { selected = it }
+                    if (collections.isEmpty()) {
+                        Note("先创建一个集合，用来归类资料。")
+                        Action("创建集合", onClick = { page = "collections" }, enabled = available)
+                    }
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Action("多文件导入", onClick = { file("import", org.json.JSONObject().put("collectionId", selected)) }, enabled = available && selected.isNotBlank(), icon = Lucide.Download)
+                        Action("导入文件", onClick = { file("import", org.json.JSONObject().put("collectionId", selected)) }, enabled = available && selected.isNotBlank(), primary = true, icon = Lucide.Upload)
                         Action("粘贴文本", onClick = { edit(null) }, enabled = available && selected.isNotBlank())
                     }
-                    if (selected.isBlank()) Note("导入前先选择目标集合。")
                     if (hasDraft) Action("继续编辑草稿", onClick = { page = "edit" }, enabled = !loading)
+                }
+                "manage" -> {
+                    Panel(padding = 0) {
+                        SettingsSwitch("用于对话", "原文保存在本机；关闭后仍可管理资料，长期记忆使用独立开关。",
+                            status?.enabled ?: false, available, if (!running) "先启动 dsh" else if (status == null) "状态未知" else null) { enabled ->
+                            status?.let { request("settings", KnowledgeStore.change(it.settingsRevision).put("settings", org.json.JSONObject().put("enabled", enabled))) }
+                        }
+                        Divider()
+                        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Note(status?.let { "${it.raw.optJSONObject("counts")?.optInt("collections", it.collections.size) ?: it.collections.size} 个集合 · ${it.raw.optJSONObject("counts")?.optInt("sources", it.sources.size) ?: it.sources.size} 份资料" } ?: if (running) "知识状态尚未读取。" else "启动后可浏览、搜索与管理本机资料。")
+                            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Action("刷新状态", onClick = { request() }, enabled = running && !loading)
+                            }
+                            Note("知识归档不含长期记忆、会话和模型密钥。")
+                        }
+                    }
+                    LinkRow("集合管理", "创建、命名和整理资料集合", onClick = { page = "collections" })
+                    Divider()
+                    LinkRow("处理任务", "查看导入、重建和归档结果", onClick = { page = "tasks"; request() })
+                    Divider()
+                    LinkRow("检索设置", "配置语义检索和集合摘要", onClick = { page = "settings" })
+                    Divider()
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Action("集合管理", onClick = { page = "collections" }, enabled = available)
-                        Action("任务", onClick = { page = "tasks"; request() }, enabled = running && !loading)
-                        Action("设置", onClick = { page = "settings" }, enabled = available)
-                        Action("生成知识归档", onClick = { confirmation = "export" }, enabled = available, icon = Lucide.Save)
-                        Action("恢复知识归档", onClick = { confirmation = "restore" }, enabled = available, icon = Lucide.RotateCcw)
+                        Action("导出资料", onClick = { confirmation = "export" }, enabled = available, icon = Lucide.Save)
+                        Action("恢复资料", onClick = { confirmation = "restore" }, enabled = available, icon = Lucide.RotateCcw)
                     }
                 }
+
                 "reference" -> reference?.let { value ->
                     Text(value.title, fontSize = 18.sp, fontWeight = FontWeight.Medium)
                     SelectionContainer { Text(value.text, fontSize = 14.sp, lineHeight = 22.sp) }
@@ -1781,7 +1805,7 @@ private fun KnowledgeSettings(store: KnowledgeStore, running: Boolean, transfer:
                         }
                         Divider()
                     }
-                    Note("关闭此窗口只停止等待和刷新；取消只停止尚未完成的部分，已经生效的操作不会回退。")
+                    Note("离开知识库只停止等待和刷新；取消只停止尚未完成的部分，已经生效的操作不会回退。")
                 }
                 "settings" -> KnowledgeOptions(store, status, available) { revision, settings, done ->
                     request("settings", KnowledgeStore.change(revision).put("settings", settings), done)
@@ -1789,14 +1813,8 @@ private fun KnowledgeSettings(store: KnowledgeStore, running: Boolean, transfer:
             }
             Spacer(Modifier.height(16.dp))
         }
-        Divider()
-        FlowRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            if (loading) Action("停止等待", onClick = { task?.cancel(); message = "已停止等待，请刷新核实实际结果。" })
-            Action("刷新", onClick = { request() }, enabled = running && !loading)
-            Action("关闭", onClick = ::close)
-        }
     }
-    confirmation?.let { action ->
+    confirmation?.takeIf { visible }?.let { action ->
         MemoryDialog(when (action) { "draftDiscard" -> "放弃草稿"; "remove" -> "删除资料"; "collectionRemove" -> "删除空集合"; "rebuild" -> "确认重建"; "export" -> "导出知识库"; else -> "合并恢复知识库" }, { confirmation = null }) {
             Note(when (action) {
                 "draftDiscard" -> "放弃尚未提交的编辑内容，正式资料不变。"

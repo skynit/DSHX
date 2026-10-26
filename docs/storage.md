@@ -13,6 +13,7 @@ files/
 ├── android.patch.yml              # 本次运行使用的固定适配配置
 ├── .trust-pending                 # 实际故障后的检查标记，正常时可不存在
 ├── home/.dsh/                     # dsh 用户配置、凭据与数据根目录
+│   ├── skills/                    # 用户技能指令与辅助资源
 │   └── storages/
 │       ├── sessions/              # 官方引擎持久化会话日志
 │       ├── attachments/           # 官方引擎管理的附件
@@ -26,7 +27,8 @@ files/
 │           ├── staging/           # Node 加工及发布前暂存
 │           └── exports/           # 等待系统保存的知识归档
 ├── assistant/                     # 助手人设与模型、动作账本
-├── workspace/                     # 默认任务目录
+├── library/files/<编号>/           # 知识库保留的上传原件，不包含在知识归档中
+├── workspace/                     # 默认任务目录；.dsh/skills 与 .agents/skills 可存放工作区技能
 └── voice/                         # 本地语音与文本模型
     ├── models/                    # 清单下载并校验完成的模型
     └── custom-model/              # 用户导入的小模型及摘要清单

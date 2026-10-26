@@ -3500,4 +3500,91 @@ class CoreTest {
         KnowledgeStore.request("settings", settings)
         assertEquals("active-index", previous.getJSONObject("active").getString("generation"))
     }
+
+    @Test @Config(sdk = [26, 34]) fun libraryUploadsKeepSameNamesSeparateAndPreserveChatAttachments() {
+        val store = LibraryStore(folder.root)
+        val first = store.upload("会议.md", "第一份".byteInputStream())
+        val second = store.upload("C:\\documents\\会议.md", "第二份".byteInputStream())
+        assertNotEquals(first.id, second.id)
+        assertEquals("会议.md", first.name)
+        assertEquals("会议.md", second.name)
+        assertEquals("第一份", store.file(first.id).readText())
+        assertEquals("第二份", store.file(second.id).readText())
+        val hash = "a".repeat(64)
+        val attachment = File(folder.root, "home/.dsh/storages/attachments/v1/files/aa/$hash/历史.txt")
+            .apply { parentFile!!.mkdirs(); writeText("历史会话仍引用此附件") }
+        val rows = store.files()
+        assertEquals(3, rows.size)
+        val chat = rows.single { it.source == "聊天附件" }
+        assertEquals(attachment, store.file(chat.id))
+        assertThrows(IllegalArgumentException::class.java) { store.remove(chat) }
+        assertTrue(attachment.exists())
+        store.remove(first)
+        assertEquals(2, store.files().size)
+        assertEquals("第二份", store.file(second.id).readText())
+    }
+
+    @Test fun libraryRejectsTraversalLinksAndCleansInterruptedUploads() {
+        val store = LibraryStore(folder.root)
+        val outside = folder.newFile("outside.txt").apply { writeText("保留") }
+        val uploads = File(folder.root, "library/files").apply { mkdirs() }
+        Files.createSymbolicLink(File(uploads, "linked.txt").toPath(), outside.toPath())
+        assertTrue(store.files().isEmpty())
+        assertThrows(IllegalArgumentException::class.java) { store.file("upload:../../outside.txt") }
+        assertThrows(IllegalArgumentException::class.java) { store.file("upload:linked.txt") }
+        val broken = object : java.io.InputStream() {
+            override fun read(): Int = throw java.io.IOException("读取中断")
+        }
+        assertThrows(java.io.IOException::class.java) { store.upload("失败.txt", broken) }
+        assertEquals(listOf("linked.txt"), uploads.list()!!.toList())
+        assertEquals("保留", outside.readText())
+    }
+
+    @Test fun librarySkillsUseRealEngineRootsKeepResourcesAndRejectStaleEdits() {
+        val store = LibraryStore(folder.root)
+        val text = "---\nname: meeting-notes\ndescription: 整理会议\n---\n\n按要点整理。"
+        val entry = store.saveSkill("meeting-notes", text)
+        assertEquals(File(folder.root, "home/.dsh/skills/meeting-notes/SKILL.md"), store.file(entry.id))
+        val resource = File(store.file(entry.id).parentFile, "template.txt").apply { writeText("保留资源") }
+        assertEquals(listOf(entry.id), store.skills().map { it.id })
+        val old = store.readSkill(entry)
+        store.saveSkill("meeting-notes", text + "\n补充结论。", old)
+        assertThrows(IllegalArgumentException::class.java) { store.saveSkill("meeting-notes", text, old) }
+        assertThrows(IllegalArgumentException::class.java) { store.remove(entry, old) }
+        assertTrue(store.file(entry.id).readText().endsWith("补充结论。"))
+        val latest = store.readSkill(entry)
+        store.remove(entry, latest)
+        assertTrue(store.skills().isEmpty())
+        assertEquals("保留资源", resource.readText())
+        val shared = File(folder.root, "home/.agents/skills/shared.md").apply { parentFile!!.mkdirs(); writeText(text) }
+        val project = File(folder.root, "workspace/.dsh/skills/local/SKILL.md").apply { parentFile!!.mkdirs(); writeText(text) }
+        assertEquals(setOf(shared, project), store.skills().map { store.file(it.id) }.toSet())
+    }
+
+    @Test fun librarySkillValidationNeverReplacesExistingFilesOnFailure() {
+        val store = LibraryStore(folder.root)
+        val text = "---\nname: read-notes\ndescription: 阅读笔记\n---\n\n正文"
+        val entry = store.saveSkill("read-notes", text)
+        val saved = store.readSkill(entry)
+        assertThrows(IllegalArgumentException::class.java) { store.saveSkill("read-notes", text) }
+        assertThrows(IllegalArgumentException::class.java) { store.saveSkill("../escape", text) }
+        assertThrows(IllegalArgumentException::class.java) { store.saveSkill("read-notes", "去掉元数据", saved) }
+        assertThrows(IllegalArgumentException::class.java) {
+            store.saveSkill("read-notes", "---\nname: read-notes\n---\n没有说明", saved)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            store.saveSkill("read-notes", "---\nname: \ndescription: 阅读笔记\n---\n正文", saved)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            store.saveSkill("read-notes", "---\nname: read-notes\ndescription: \n---\n正文", saved)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            store.saveSkill("read-notes", text + "大".repeat(LibraryStore.MAX_SKILL), saved)
+        }
+        assertEquals(text, store.readSkill(entry).text)
+        assertTrue(store.file(entry.id).parentFile!!.list()!!.none { it.endsWith(".tmp") })
+        val short = "---\nname: a\ndescription: 读\n---\n正文"
+        assertEquals(short, store.readSkill(store.saveSkill("a", short)).text)
+    }
+
 }
