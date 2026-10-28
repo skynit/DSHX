@@ -10,6 +10,7 @@ export class PolicyHost {
     this.pending = new Map();
     this.memoryCalls = new Map();
     this.knowledgeCalls = new Map();
+    this.voiceCalls = new Map();
     this.sequence = 0;
     this.revision = -1;
   }
@@ -106,21 +107,33 @@ export class PolicyHost {
       if (!this.connected || !/^[a-zA-Z0-9-]{1,80}$/.test(message.voice) || typeof message.action !== 'string') {
         throw new Error('原生语音请求无效。');
       }
+      if (this.voiceCalls.has(message.voice) || this.voiceCalls.size >= 32) throw new Error('原生语音请求过多或重复。');
+      const call = { voice: this.voice, data: message.data ?? {}, started: false, finished: false };
+      this.voiceCalls.set(message.voice, call);
       Promise.resolve().then(() => {
-        if (!this.voice) throw Object.assign(new Error('语音会话尚未就绪。'), { code: 'VOICE_NOT_READY' });
-        return this.voice(message.action, message.data ?? {});
-      }).then(result => this.send({ voice: message.voice, ok: true, result }),
-        error => {
-          // Keep diagnostic frames, never provider error text or request/response bodies.
-          console.warn('Android voice request failed:', error?.name ?? 'Error',
-            typeof error?.code === 'string' && /^[A-Za-z0-9/_-]{1,80}$/.test(error.code) ? error.code : '',
-            typeof error?.stack === 'string' ? error.stack.split('\n').slice(1, 5).join('\n') : '');
-          const detail = error?.code === 'VOICE_NOT_READY' ? '语音会话尚未就绪，请稍后重试。'
-            : error?.code === 'LOCAL_MEMORY_CONTEXT' ? '当前任务所需的记忆背景与上下文无法完整交给本地模型，不会自动转用云端模型。'
-            : error?.code === 'VOICE_MEMORY' ? '当前可用内存不足，本地模型暂不加载。请关闭其他占用内存的应用后重试。'
-            : '语音会话请求失败，请检查模型配置或重新开始。';
-          this.send({ voice: message.voice, ok: false, error: detail });
+        if (this.failure) throw this.failure;
+        if (!call.voice) throw Object.assign(new Error('语音会话尚未就绪。'), { code: 'VOICE_NOT_READY' });
+        call.started = message.action === 'prompt';
+        return call.voice(message.action, call.data, event => {
+          if (this.failure || call.finished) return;
+          if (!this.send({ voice: message.voice, event })) throw this.failure;
         });
+      }).then(result => {
+        call.finished = true;
+        this.send({ voice: message.voice, ok: true, result });
+      }).catch(error => {
+        call.finished = true;
+        if (this.failure) return;
+        // Keep diagnostic frames, never provider error text or request/response bodies.
+        console.warn('Android voice request failed:', error?.name ?? 'Error',
+          typeof error?.code === 'string' && /^[A-Za-z0-9/_-]{1,80}$/.test(error.code) ? error.code : '',
+          typeof error?.stack === 'string' ? error.stack.split('\n').slice(1, 5).join('\n') : '');
+        const detail = error?.code === 'VOICE_NOT_READY' ? '语音会话尚未就绪，请稍后重试。'
+          : error?.code === 'LOCAL_MEMORY_CONTEXT' ? '当前任务所需的记忆背景与上下文无法完整交给本地模型，不会自动转用云端模型。'
+          : error?.code === 'VOICE_MEMORY' ? '当前可用内存不足，本地模型暂不加载。请关闭其他占用内存的应用后重试。'
+          : '语音会话请求失败，请检查模型配置或重新开始。';
+        this.send({ voice: message.voice, ok: false, error: detail });
+      }).finally(() => this.voiceCalls.delete(message.voice));
       return;
     }
     if (!Number.isSafeInteger(message.id) || message.id < 0 || typeof message.ok !== 'boolean') {
@@ -185,13 +198,24 @@ export class PolicyHost {
   }
 
   send(value) {
-    if (!this.failure) this.socket.write(JSON.stringify(value) + '\n', error => { if (error) this.fail(); });
+    if (this.failure) return false;
+    try {
+      // write 返回 false 只是要求等待排空，数据已经入队；同步异常和异步错误才表示发送失败。
+      this.socket.write(JSON.stringify(value) + '\n', error => { if (error) this.fail(); });
+    } catch { this.fail(); }
+    return !this.failure;
   }
 
   fail() {
     if (this.failure) return;
     this.failure = new Error('原生工具权限连接中断，当前调用已拒绝；请停止并重新启动工作区。');
     this.connected = false;
+    for (const call of this.voiceCalls.values()) {
+      if (!call.started || call.finished) continue;
+      call.finished = true;
+      Promise.resolve().then(() => call.voice('cancel', { interaction: call.data.interaction })).catch(() => {});
+    }
+    this.voiceCalls.clear();
     for (const controller of this.memoryCalls.values()) controller.abort();
     this.memoryCalls.clear();
     this.stopMemory?.();

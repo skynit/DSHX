@@ -131,6 +131,7 @@ export function localAdapter(Base, host = policyHost) {
 /** Native voice submits ordinary user messages; the official loop owns history and tools. */
 export function voiceSession(ctx) {
   let active;
+  const waiting = new Set();
   function restore(run) {
     if (!run.selection || run.restored) return;
     run.restored = true;
@@ -143,14 +144,34 @@ export function voiceSession(ctx) {
       if (message.source?.rpcId === run.request) run.agent.inbox.remove(message.id);
     }
   }
-  const cancel = (interaction) => {
-    const run = active;
-    if (!run || interaction && interaction !== run.interaction) return;
+  function stop(run, error) {
+    if (active !== run || run.cancelled) return;
     run.cancelled = true;
     removePending(run);
     restore(run);
+    run.reject(error);
     if (run.entered && !run.finished) run.agent.cancel({ kind: 'user' }, { keepInbox: true });
-    run.reject(new Error('语音对话已取消。'));
+  }
+  function publish(run, text) {
+    if (!text || !run.onEvent || run.cancelled || active !== run) return;
+    text = [...text].slice(0, 16000 - run.streamedLength).join('');
+    if (!text) return;
+    run.streamedText += text;
+    run.streamedLength += [...text].length;
+    try {
+      Promise.resolve(run.onEvent({ session: run.session, text })).catch(error => stop(run, error));
+    } catch (error) { stop(run, error); }
+  }
+  const cancel = (interaction) => {
+    for (const pending of waiting) {
+      if (interaction && interaction !== pending.interaction) continue;
+      pending.cancelled = true;
+      pending.wake.resolve();
+    }
+    const run = active;
+    if (!run || interaction && interaction !== run.interaction) return;
+    stop(run, new Error('语音对话已取消。'));
+    return run.done.promise;
   };
   const claimed = ctx.on('agent/inbox/claimed', ({ agent, message, turn }) => {
     const run = active;
@@ -184,6 +205,32 @@ export function voiceSession(ctx) {
       run.reject(new Error('会话已收到新的输入，语音播报已停止。'));
     }
   });
+  const request = ctx.on('agent/request', ({ agent, turn, signal }, next) => {
+    const run = active;
+    if (run?.agent === agent && run.entered && run.turn === turn) run.signal = signal;
+    return next();
+  });
+  const stream = ctx.on('agent/assistant-stream', ({ agent, frame }) => {
+    const run = active;
+    if (!run || run.agent !== agent || !run.entered || run.cancelled || run.finished || run.signal?.aborted) return;
+    if (frame.type === 'start') {
+      run.attempt = frame.turn === run.turn ? { id: frame.attemptId, index: -1, text: '', length: 0 } : undefined;
+      return;
+    }
+    if (!run.attempt || run.attempt.id !== frame.attemptId) return;
+    if (frame.type === 'end') { run.attempt = undefined; return; }
+    if (frame.type !== 'chunk' || frame.index <= run.attempt.index) return;
+    run.attempt.index = frame.index;
+    const chunk = frame.chunk;
+    // 只转发正式文本通道；思考、工具参数及整块快照不能作为可播报增量。
+    if (chunk.type !== 'text-delta' || typeof chunk.text !== 'string' || !chunk.text || !run.onEvent) return;
+    const text = [...chunk.text].slice(0, Math.max(0, Math.min(4000 - run.attempt.length, 12000 - run.streamedLength))).join('');
+    if (!text) return;
+    // 实时增量最多累计 12000 码点，给结束时确认的最终回答预留 4000。
+    run.attempt.text += text;
+    run.attempt.length += [...text].length;
+    publish(run, text);
+  });
   const event = ctx.on('session/event', (session, entry) => {
     const run = active;
     if (!run || run.session !== session.id) return;
@@ -200,10 +247,12 @@ export function voiceSession(ctx) {
       }
     }
     if (run.cancelled) return;
-    if (run.entered && entry.type === 'assistant/message' && !entry.data.interrupted) {
+    if (run.entered && entry.type === 'assistant/message' && !entry.data.interrupted &&
+        (entry.data.turn === undefined || entry.data.turn === run.turn)) {
       const message = entry.data.message;
       if (!message.content.some(part => part.type === 'tool-call')) {
         run.text = message.content.filter(part => part.type === 'text').map(part => part.text).join('\n');
+        run.answerStreamed = run.attempt?.text ?? '';
       }
     }
     if (run.entered && entry.type === 'turn/end' && entry.data.turn === run.turn) {
@@ -214,8 +263,13 @@ export function voiceSession(ctx) {
         return run.reject(Object.assign(new Error('本轮已停止或失败，不再自动播报。'), memory ? { code: 'VOICE_MEMORY' } : {}));
       }
       if (!run.text) return run.reject(new Error('本轮没有可播报的回答。'));
+      const text = [...run.text].slice(0, 4000).join('');
+      // 快照或无 text-delta 的回答在这里补齐；只补已发前缀的后缀，不能整篇重读。
+      if (text.startsWith(run.answerStreamed)) publish(run, text.slice(run.answerStreamed.length));
+      if (run.cancelled) return;
       const local = typeof session.requestHeader === 'function' ? session.requestHeader()?.config.provider === route.provider : run.local;
-      run.resolve({ session: session.id, text: [...run.text].slice(0, 4000).join(''), local });
+      run.resolve({ session: session.id, text, local,
+        ...(run.onEvent ? { streamedText: run.streamedText } : {}) });
     }
   });
   // Scoped instructions can enter after inbox claim. Recheck at the adapter
@@ -244,10 +298,19 @@ export function voiceSession(ctx) {
     return { kind: 'retry' };
   });
   return {
-    async call(action, data) {
-      if (action === 'cancel') { cancel(data.interaction); return { cancelled: true }; }
+    async call(action, data, onEvent) {
+      if (action === 'cancel') { await cancel(data.interaction); return { cancelled: true }; }
       if (action !== 'prompt') throw new Error('不支持的语音会话操作。');
+      if (active?.cancelled) {
+        const pending = { interaction: data.interaction, cancelled: false, wake: Promise.withResolvers() };
+        waiting.add(pending);
+        try {
+          while (active?.cancelled && !pending.cancelled) await Promise.race([active.done.promise, pending.wake.promise]);
+          if (pending.cancelled) throw new Error('语音对话已取消。');
+        } finally { waiting.delete(pending); }
+      }
       if (active) throw new Error('上一轮语音对话尚未结束。');
+      if (onEvent !== undefined && typeof onEvent !== 'function') throw new Error('语音事件回调无效。');
       if (typeof data.interaction !== 'string' || !/^[a-zA-Z0-9-]{1,80}$/.test(data.interaction)) throw new Error('语音轮次无效。');
       if (typeof data.text !== 'string' || !data.text.trim() || Buffer.byteLength(data.text) > 16000) throw new Error('语音文字为空或过长。');
       const selected = data.smallModel ?? route;
@@ -262,11 +325,15 @@ export function voiceSession(ctx) {
       reply.catch(() => {});
       const run = { request: randomUUID(), interaction: data.interaction, session: data.session, resolve, reject, input: data.text.trim(),
         route: target, local: split && target.provider === route.provider, online: split && target.provider !== route.provider,
-        entered: false, cancelled: false, text: '' };
+        entered: false, cancelled: false, text: '', answerStreamed: '', onEvent, streamedText: '', streamedLength: 0,
+        done: Promise.withResolvers() };
       active = run;
       const timer = setTimeout(() => cancel(run.interaction), 170000);
       try {
         if (!run.session) run.session = (await ctx.sessionController.create({})).sessionId;
+        if (run.cancelled) throw new Error('语音对话已取消。');
+        if (typeof run.session !== 'string' || !/^[A-Za-z0-9._:-]{1,128}$/.test(run.session)) throw new Error('语音会话编号无效。');
+        await run.onEvent?.({ session: run.session, text: '' });
         if (run.cancelled) throw new Error('语音对话已取消。');
         const agent = await ctx.sessionController.commands.resolveAgent(run.session);
         run.agent = agent;
@@ -277,12 +344,21 @@ export function voiceSession(ctx) {
         }, { kind: 'user', rpcId: run.request, clientTimeZone: 'Asia/Shanghai' });
         if (run.cancelled) { removePending(run); throw new Error('语音对话已取消。'); }
         return await reply;
+      } catch (error) {
+        stop(run, error);
+        throw error;
       } finally {
         clearTimeout(timer); run.retry?.(); restore(run);
-        if (active === run) active = undefined;
+        try {
+          // 取消回执等待本次清理和运行器停稳，避免下一轮抢入仍在收尾的 agent。
+          if (run.cancelled && run.entered && !run.finished) await run.agent.whenIdle?.();
+        } finally {
+          if (active === run) active = undefined;
+          run.done.resolve();
+        }
       }
     },
-    close() { cancel(); retry(); event(); claimed(); },
+    close() { cancel(); retry(); event(); stream(); request(); claimed(); },
   };
 }
 

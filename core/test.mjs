@@ -3116,7 +3116,7 @@ test('voice local input keeps model replies checkpoints and instructions without
 test('voice local routing uses the real loop history restores selection and separates accounting', async () => {
   const { Context } = await load('@deepseek-ai/cordis');
   const { default: SystemPrompt } = await load('@deepseek-ai/dsh-system-prompt');
-  const { default: Tools } = await load('@deepseek-ai/dsh-tools');
+  const { default: Tools, defineTool } = await load('@deepseek-ai/dsh-tools');
   const { default: LlmRuntime, LlmAdapter, createUserMessage } = await load('@deepseek-ai/dsh-llm');
   const { default: Agents, installModelSelection } = await load('@deepseek-ai/dsh-agent');
   const { default: Sessions } = await load('@deepseek-ai/dsh-session');
@@ -3134,6 +3134,7 @@ test('voice local routing uses the real loop history restores selection and sepa
   let remote = 0;
   let local = 0;
   let remoteText = '远程任务回答';
+  let toolsLeft = 0;
   let remoteInput;
   const events = [];
   const original = { provider: 'fixture', model: 'remote' };
@@ -3141,7 +3142,15 @@ test('voice local routing uses the real loop history restores selection and sepa
   class Remote extends LlmAdapter {
     async *stream(options) {
       remote++; remoteInput = options.messages;
-      yield { type: 'text-delta', index: 0, text: remoteText };
+      yield { type: 'reasoning-delta', index: 0, text: '不能播报的思考' };
+      if (toolsLeft-- > 0) {
+        yield { type: 'text-delta', index: 1, text: '我先检查。' };
+        yield { type: 'tool-call-delta', index: 2, id: 'voice-tool', name: 'read', argumentsDelta: '{"private":"工具参数"}' };
+        yield { type: 'finish', reason: { kind: 'tool-calls' } };
+        return;
+      }
+      yield { type: 'text-delta', index: 1, text: remoteText.slice(0, 2) };
+      yield { type: 'text-delta', index: 1, text: remoteText.slice(2) };
       yield { type: 'finish', reason: { kind: 'stop' } };
     }
   }
@@ -3184,11 +3193,14 @@ test('voice local routing uses the real loop history restores selection and sepa
     await agent.whenIdle();
     assert.equal(missing.local, false);
     assert.equal(local, 0); assert.equal(remote, 1);
-    const result = await voice.call('prompt', { interaction: 'first', text: '你好', local: true });
+    const localEvents = [];
+    const result = await voice.call('prompt', { interaction: 'first', text: '你好', local: true }, event => localEvents.push(event));
     await agent.whenIdle();
     assert.equal(result.text, '你好，我是小橙。');
     assert.equal(result.session, agent.session.id);
     assert.equal(result.local, true);
+    assert.deepEqual(localEvents, ['', result.text].map(text => ({ session: agent.session.id, text })));
+    assert.equal(result.streamedText, result.text);
     assert.equal(local, 1); assert.equal(remote, 1);
     assert.equal(selection.current, original, 'restore even after the API consumed our temporary selection');
     assert.ok(events.some(event => event.type === 'model/selection' && event.data.provider === original.provider),
@@ -3207,8 +3219,16 @@ test('voice local routing uses the real loop history restores selection and sepa
     await agent.whenIdle();
     assert.equal(local, 2);
     remoteText = '完整回答'.repeat(500);
-    const followup = await voice.call('prompt', { interaction: 'second', session: agent.session.id, text: '搜索文件', local: true });
+    const streamed = [], from = events.length;
+    const followup = await voice.call('prompt', { interaction: 'second', session: agent.session.id, text: '搜索文件', local: true }, event => {
+      assert.equal(events.slice(from).some(entry => entry.type === 'assistant/message'), false,
+        '真实运行器必须在完整助手消息提交前发布片段');
+      streamed.push(event);
+    });
     await agent.whenIdle();
+    assert.deepEqual(streamed, ['', remoteText.slice(0, 2), remoteText.slice(2)].map(text => ({ session: agent.session.id, text })));
+    assert.equal(followup.text, remoteText);
+    assert.equal(followup.streamedText, streamed.map(event => event.text).join(''));
     assert.equal(followup.local, false); assert.equal(remote, 2);
     assert.equal(agent.session.requestHeader().config.provider, 'fixture');
     const ledger = (await readFile(join(dir, 'local-usage.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
@@ -3251,6 +3271,29 @@ test('voice local routing uses the real loop history restores selection and sepa
       assert.equal(attempts.at(-1).outcome, 'failed');
       assert.equal(attempts.at(-1).usage, null);
     } finally { stopInject(); }
+    let toolCalls = 0;
+    // Android 只向模型开放已适配的工具名；复用 read，执行体仍是无文件操作的测试函数。
+    ctx.tools.register(defineTool({
+      name: 'read', description: '语音增量测试工具', parameters: { private: { type: 'string' } },
+      output: { schema: { type: 'object', additionalProperties: true }, render: () => [] },
+      execute: async args => { assert.equal(args.private, '工具参数'); toolCalls++; return { ok: true }; },
+    }));
+    assert.ok(ctx.tools.schemas(agent).some(tool => tool.name === 'read'), '测试工具必须通过平台策略并出现在模型可见列表中');
+    toolsLeft = 1; remoteText = '检查结果正常。';
+    const steps = [];
+    const toolStart = events.length;
+    const toolAnswer = await voice.call('prompt', { interaction: 'tool-turn', session: agent.session.id, text: '搜索文件' },
+      event => steps.push(event));
+    await agent.whenIdle();
+    const results = events.slice(toolStart).filter(event => event.type === 'tool/result');
+    assert.equal(results.length, 1);
+    assert.notEqual(results[0].data.isError, true, JSON.stringify(results[0].data));
+    assert.equal(toolCalls, 1);
+    assert.equal(toolAnswer.text, remoteText, '最终正式回答保留现有最后一条无工具消息的语义');
+    assert.equal(toolAnswer.streamedText, '我先检查。' + remoteText);
+    assert.equal(toolAnswer.streamedText, steps.map(event => event.text).join(''), '实际推送记录必须跨步骤累加');
+    assert.equal(toolAnswer.text.startsWith(toolAnswer.streamedText), false, '存在前导说明时接收端不能补读整篇');
+    assert.doesNotMatch(toolAnswer.streamedText, /思考|工具参数|private/);
   } finally {
     voice?.close(); disposeSelection?.(); await ctx.fiber.dispose();
     if (previous === undefined) delete process.env.DSHX_ASSISTANT_DIR; else process.env.DSHX_ASSISTANT_DIR = previous;
@@ -3330,6 +3373,320 @@ for (const target of [{ provider: 'dshx-local', model: 'custom' }, { provider: '
   });
 }
 
+test('voice host sends incremental frames before one final response and discards late callbacks', async t => {
+  const host = new PolicyHost(), frames = [], reply = Promise.withResolvers();
+  let publish;
+  host.connected = true;
+  host.socket = { write(value) { frames.push(JSON.parse(value)); return false; }, destroy() {} };
+  t.after(() => host.close());
+  host.voice = async (action, data, onEvent) => {
+    assert.equal(action, 'prompt'); assert.equal(data.interaction, 'stream');
+    publish = onEvent;
+    onEvent({ session: 'session', text: '第一段' });
+    onEvent({ session: 'session', text: '第二段🙂' });
+    return reply.promise;
+  };
+  host.receive({ voice: 'request-1', action: 'prompt', data: { interaction: 'stream', text: '你好' } });
+  await waitFor(() => frames.length === 2, '语音增量必须先于最终结果到达');
+  assert.deepEqual(frames, ['第一段', '第二段🙂'].map(text => ({ voice: 'request-1', event: { session: 'session', text } })));
+  assert.equal(host.failure, undefined, 'write 返回 false 不能误判为连接失败');
+  assert.throws(() => host.receive({ voice: 'request-1', action: 'prompt' }), /重复/);
+  const result = { session: 'session', text: '第一段第二段🙂', local: false };
+  reply.resolve(result);
+  await waitFor(() => host.voiceCalls.size === 0, '最终结果后必须清理请求');
+  assert.deepEqual(frames[2], { voice: 'request-1', ok: true, result });
+  publish({ session: 'session', text: '已完成后到达' });
+  assert.equal(frames.length, 3);
+  host.voice = async () => { throw new Error('private provider body'); };
+  host.receive({ voice: 'request-error', action: 'prompt' });
+  await waitFor(() => frames.length === 4, '缺少失败终帧');
+  assert.equal(frames[3].ok, false);
+  assert.doesNotMatch(JSON.stringify(frames[3]), /private|provider body/);
+  host.voice = async action => { assert.equal(action, 'cancel'); return { cancelled: true }; };
+  host.receive({ voice: 'request-cancel', action: 'cancel', data: { interaction: 'stream' } });
+  await waitFor(() => frames.length === 5, '缺少取消回执');
+  assert.deepEqual(frames[4], { voice: 'request-cancel', ok: true, result: { cancelled: true } });
+});
+
+test('voice host cleans up real voice runs on synchronous asynchronous send failure and disconnect', async t => {
+  for (const mode of ['throw', 'callback', 'disconnect', 'final-throw', 'final-callback']) {
+    await t.test(mode, async () => {
+      const f = await voiceStreamFixture(), host = new PolicyHost(), frames = [];
+      host.connected = true; host.voice = f.voice.call;
+      let writeResult, destroyed = 0;
+      host.socket = { write(value, callback) {
+        const frame = JSON.parse(value);
+        if (mode === 'throw' && frame.event?.text || mode === 'final-throw' && frame.ok) throw new Error('socket write failed');
+        writeResult = callback; frames.push(frame); return true;
+      }, destroy() { destroyed++; } };
+      try {
+        host.receive({ voice: 'send-failure', action: 'prompt', data: {
+          session: f.session.id, interaction: 'stream', text: '你好', local: true,
+        } });
+        await f.admitted.promise;
+        f.start(); f.chunk({ type: 'text-delta', index: 0, text: '第一段' });
+        const final = mode.startsWith('final-');
+        if (final) {
+          f.end();
+          await waitFor(() => host.voiceCalls.size === 0, '发送终帧后必须释放请求');
+          if (mode === 'final-callback') writeResult(new Error('final write failed'));
+        }
+        if (mode === 'callback') writeResult(new Error('async write failed'));
+        if (mode === 'disconnect') host.close();
+        await waitFor(() => host.failure && (final || f.cancellations() === 1), '发送失败或断连必须清理当前语音轮次');
+        assert.equal(f.cancellations(), final ? 0 : 1, '发送已完成结果失败时不能取消后续工作');
+        assert.equal(host.connected, false);
+        assert.ok(host.failure); assert.equal(host.voiceCalls.size, 0);
+        assert.equal(f.selection.current, f.original);
+        assert.equal(destroyed, 1);
+        const count = frames.length;
+        f.chunk({ type: 'text-delta', index: 0, text: '迟到片段' }, 1);
+        f.end(); await delay(0);
+        assert.equal(frames.length, count, '连接失败后不能发送增量或成功终帧');
+      } finally { host.close(); f.voice.close(); }
+    });
+  }
+});
+
+async function voiceStreamFixture() {
+  const { voiceSession } = await import(pathToFileURL(join(core, 'voice.mjs')));
+  const handlers = new Map(), admitted = Promise.withResolvers();
+  const signal = new AbortController(), session = { id: 'stream-session' };
+  const original = { provider: 'original', model: 'one' }, selection = { current: original };
+  let cancellations = 0;
+  const agent = { status: 'idle', session, inbox: { nextTurn: [], nextStep: [], hasPending: false,
+    remove(id) { this.nextTurn = this.nextTurn.filter(message => message.id !== id); } },
+    cancel() { cancellations++; signal.abort(); } };
+  const emit = (name, ...args) => handlers.get(name)?.(...args);
+  const voice = voiceSession({
+    on(name, handler) { handlers.set(name, handler); return () => handlers.delete(name); },
+    sessionController: {
+      agents: { selectionFor: () => selection, selectForNextRequest(_agent, value) { selection.current = value; } },
+      commands: {
+        resolveAgent: async () => agent,
+        prompt: async (request, source) => {
+          emit('agent/inbox/claimed', { agent, message: { role: 'user', content: request.content, source }, turn: 7 });
+          emit('agent/request', { agent, turn: 7, signal: signal.signal }, () => {});
+          admitted.resolve(source);
+        },
+      },
+    },
+  });
+  const frame = (value, who = agent) => emit('agent/assistant-stream', { agent: who, frame: value });
+  const start = (id = 'attempt-1', turn = 7) => frame({ type: 'start', attemptId: id, revision: 1, turn, step: 1 });
+  const chunk = (value, index = 0, id = 'attempt-1') => frame({ type: 'chunk', attemptId: id, revision: index + 2, index, time: Date.now(), chunk: value });
+  const end = (reason = { kind: 'completed' }, text = '最终回答') => {
+    emit('session/event', session, { type: 'assistant/message', data: { turn: 7, message: { content: [{ type: 'text', text }] } } });
+    emit('session/event', session, { type: 'turn/end', data: { turn: 7, reason } });
+  };
+  return { voice, handlers, admitted, agent, session, signal, original, selection, emit, frame, start, chunk, end,
+    cancellations: () => cancellations,
+    prompt: (onEvent, interaction = 'stream') => voice.call('prompt', { session: session.id, interaction, text: '你好', local: true }, onEvent) };
+}
+
+test('voice incremental output filters real stream frames by agent turn attempt and text channel', async () => {
+  const f = await voiceStreamFixture(), events = [];
+  try {
+    const result = f.prompt(event => events.push(event));
+    await f.admitted.promise;
+    const text = { type: 'text-delta', index: 0, text: '你好🙂' };
+    f.chunk(text); // 没有本轮 start 的片段不能进入播报。
+    f.start('other-turn', 8); f.chunk(text, 0, 'other-turn');
+    f.frame({ type: 'start', attemptId: 'other-agent', turn: 7 }, { ...f.agent });
+    f.chunk(text, 0, 'other-agent');
+    f.start();
+    f.chunk({ type: 'reasoning-delta', index: 0, text: '思考' }, 0);
+    f.chunk({ type: 'tool-call-delta', index: 1, id: 'tool', argumentsDelta: '{"secret":1}' }, 1);
+    f.chunk({ type: 'block-end', index: 1, block: { type: 'text', text: '整块快照' } }, 2);
+    f.chunk({ type: 'text-delta', index: 2, text: '' }, 3);
+    f.chunk(text, 4); f.chunk(text, 4);
+    assert.deepEqual(events, ['', '你好🙂'].map(text => ({ session: f.session.id, text })));
+    f.frame({ type: 'end', attemptId: 'attempt-1', index: 5, outcome: { kind: 'committed' } });
+    f.chunk(text, 5);
+    f.start('attempt-2'); f.chunk(text, 6); f.chunk({ ...text, text: '，继续' }, 0, 'attempt-2');
+    f.end({ kind: 'completed' }, '最终回答'.repeat(1500));
+    f.chunk(text, 1, 'attempt-2');
+    assert.deepEqual(await result, { session: f.session.id, text: '最终回答'.repeat(1500).slice(0, 4000), local: true,
+      streamedText: '你好🙂，继续' });
+    assert.deepEqual(events.map(event => event.text), ['', '你好🙂', '，继续']);
+    assert.equal(f.selection.current, f.original);
+  } finally { f.voice.close(); }
+  assert.equal(f.handlers.size, 0);
+});
+
+test('voice incremental output stops on cancellation failure takeover abort and callback errors', async t => {
+  for (const mode of ['cancel', 'failure', 'takeover', 'abort', 'callback', 'async-callback', 'close']) {
+    await t.test(mode, async () => {
+      const f = await voiceStreamFixture(), events = [];
+      const result = f.prompt(event => {
+        if (!event.text) return;
+        events.push(event);
+        if (mode === 'callback') throw new Error('回调失败');
+        if (mode === 'async-callback') return Promise.reject(new Error('回调失败'));
+      });
+      result.catch(() => {});
+      try {
+        await f.admitted.promise;
+        f.start(); f.chunk({ type: 'text-delta', index: 0, text: '首段' });
+        if (mode === 'cancel') {
+          await f.voice.call('cancel', { interaction: 'old' });
+          assert.equal(f.cancellations(), 0);
+          await f.voice.call('cancel', { interaction: 'stream' });
+        } else if (mode === 'failure') f.end({ kind: 'error' });
+        else if (mode === 'takeover') f.emit('agent/inbox/claimed', { agent: f.agent, message: { source: { kind: 'user', rpcId: 'typed' } }, turn: 8 });
+        else if (mode === 'abort') f.signal.abort();
+        else if (mode === 'close') f.voice.close();
+        if (mode === 'async-callback') await Promise.resolve();
+        f.chunk({ type: 'text-delta', index: 0, text: '迟到片段' }, 1);
+        if (mode === 'abort') f.end({ kind: 'cancelled' });
+        await assert.rejects(result);
+        assert.deepEqual(events.map(event => event.text), ['首段']);
+        assert.equal(f.selection.current, f.original);
+        assert.equal(f.cancellations(), ['cancel', 'callback', 'async-callback', 'close'].includes(mode) ? 1 : 0);
+      } finally { f.voice.close(); }
+    });
+  }
+});
+
+test('voice incremental output keeps the Unicode speech limit and optional callback compatibility', async () => {
+  const f = await voiceStreamFixture(), events = [], text = '🙂'.repeat(4001);
+  try {
+    const first = f.prompt(event => events.push(event));
+    await f.admitted.promise; f.start();
+    f.chunk({ type: 'text-delta', index: 0, text });
+    f.chunk({ type: 'text-delta', index: 0, text: '超过播报范围' }, 1);
+    f.end({ kind: 'completed' }, text);
+    const result = await first;
+    assert.equal(events.length, 2); assert.equal([...events[1].text].length, 4000);
+    assert.equal(result.text, events[1].text); assert.equal(result.streamedText, result.text);
+    const second = f.prompt();
+    await waitFor(() => f.selection.current !== f.original, '下一轮未进入执行');
+    f.start('next-attempt'); f.chunk({ type: 'text-delta', index: 0, text: '未注册回调' }, 0, 'next-attempt');
+    f.end();
+    assert.deepEqual(await second, { session: f.session.id, text: '最终回答', local: true });
+    assert.equal(events.length, 2, '上一轮回调不能接收下一轮文字');
+  } finally { f.voice.close(); }
+});
+
+test('voice incremental output supplements a missing final suffix and preserves the final step budget', async t => {
+  for (const mode of ['snapshot', 'partial', 'tools']) {
+    await t.test(mode, async () => {
+      const f = await voiceStreamFixture(), events = [], answer = '最终回答🙂';
+      const result = f.prompt(event => events.push(event));
+      try {
+        await f.admitted.promise; f.start();
+        if (mode === 'partial') f.chunk({ type: 'text-delta', index: 0, text: '最终' });
+        if (mode === 'tools') {
+          f.chunk({ type: 'text-delta', index: 0, text: '前'.repeat(5000) });
+          f.frame({ type: 'end', attemptId: 'attempt-1', index: 1, outcome: { kind: 'committed' } });
+          f.start('final-step');
+          f.chunk({ type: 'text-delta', index: 0, text: answer }, 0, 'final-step');
+        }
+        f.end({ kind: 'completed' }, answer);
+        const final = await result;
+        assert.equal(final.text, answer);
+        assert.equal(final.streamedText, events.map(event => event.text).join(''));
+        assert.equal(final.streamedText, (mode === 'tools' ? '前'.repeat(4000) : '') + answer);
+        assert.ok(events.every(event => [...event.text].length <= 4000));
+        assert.equal(events.filter(event => event.text === answer).length, mode === 'partial' ? 0 : 1,
+          '最终回答已发出时不能整篇重播');
+      } finally { f.voice.close(); }
+    });
+  }
+});
+
+test('voice incremental output bounds a whole tool turn at 16000 and reserves the final 4000', async () => {
+  const f = await voiceStreamFixture(), events = [], answer = '🙂'.repeat(4000);
+  const result = f.prompt(event => events.push(event));
+  try {
+    await f.admitted.promise;
+    for (let index = 0; index < 6; index++) {
+      const id = `tool-${index}`;
+      f.start(id); f.chunk({ type: 'text-delta', index: 0, text: '前'.repeat(5000) }, 0, id);
+      f.frame({ type: 'end', attemptId: id, index: 1, outcome: { kind: 'committed' } });
+    }
+    assert.equal([...events.map(event => event.text).join('')].length, 12000);
+    f.start('final'); f.chunk({ type: 'text-delta', index: 0, text: answer }, 0, 'final');
+    assert.equal(events.length, 4, '达到实时限额时等待最终确认后再发送预留文字');
+    f.end({ kind: 'completed' }, answer);
+    const final = await result;
+    assert.equal([...final.streamedText].length, 16000);
+    assert.equal(final.streamedText, events.map(event => event.text).join(''));
+    assert.equal(final.streamedText, '前'.repeat(12000) + answer);
+    assert.equal(final.text, answer);
+    assert.ok(events.every(event => [...event.text].length <= 4000));
+  } finally { f.voice.close(); }
+});
+
+test('voice ready event preserves a newly created session before model admission and cancellation', async () => {
+  const { voiceSession } = await import(pathToFileURL(join(core, 'voice.mjs')));
+  const created = Promise.withResolvers(), resolved = Promise.withResolvers(), events = [];
+  let prompts = 0;
+  const voice = voiceSession({
+    on() { return () => {}; },
+    sessionController: {
+      create: () => created.promise,
+      commands: { resolveAgent: () => resolved.promise, prompt: () => { prompts++; } },
+    },
+  });
+  const result = voice.call('prompt', { interaction: 'new-session', text: '你好' }, event => events.push(event));
+  result.catch(() => {});
+  try {
+    assert.deepEqual(events, []);
+    created.resolve({ sessionId: 'new-session:1.a_b' });
+    await waitFor(() => events.length === 1, '模型准备前必须发布会话编号');
+    assert.deepEqual(events, [{ session: 'new-session:1.a_b', text: '' }]);
+    let acknowledged = false;
+    const cancellation = voice.call('cancel', { interaction: 'new-session' }).then(value => { acknowledged = true; return value; });
+    await Promise.resolve();
+    assert.equal(acknowledged, false, '取消回执必须等待正在进行的准备工作清理');
+    resolved.resolve({ inbox: { nextTurn: [], nextStep: [] } });
+    await cancellation; await assert.rejects(result, /取消/);
+    assert.equal(prompts, 0);
+    assert.equal(events.length, 1);
+  } finally { created.resolve({ sessionId: 'unused' }); resolved.resolve({}); voice.close(); }
+});
+
+test('voice cancellation admits an interrupting prompt received before cancel acknowledgement after the old agent is idle', async () => {
+  const f = await voiceStreamFixture(), idle = Promise.withResolvers();
+  f.agent.whenIdle = () => idle.promise;
+  const result = f.prompt(); result.catch(() => {});
+  try {
+    await f.admitted.promise;
+    await assert.rejects(f.prompt(undefined, 'busy'), /上一轮语音对话尚未结束/, '正常执行中的轮次仍拒绝并发输入');
+    let acknowledged = false;
+    const cancellation = f.voice.call('cancel', { interaction: 'stream' }).then(value => { acknowledged = true; return value; });
+    const next = f.prompt(undefined, 'next');
+    await Promise.resolve();
+    assert.equal(f.cancellations(), 1); assert.equal(acknowledged, false);
+    assert.equal(f.selection.current, f.original, '旧运行器未空闲时新 prompt 必须等待');
+    idle.resolve();
+    assert.deepEqual(await cancellation, { cancelled: true });
+    await assert.rejects(result, /取消/);
+    await waitFor(() => f.selection.current !== f.original, '取消回执之后新轮次应能进入执行');
+    f.end();
+    assert.equal((await next).text, '最终回答');
+  } finally { idle.resolve(); f.voice.close(); }
+});
+
+test('voice cancellation stops a waiting interruption before it can enter the old agent', async () => {
+  const f = await voiceStreamFixture(), idle = Promise.withResolvers();
+  f.agent.whenIdle = () => idle.promise;
+  const first = f.prompt(); first.catch(() => {});
+  try {
+    await f.admitted.promise;
+    const stopped = f.voice.call('cancel', { interaction: 'stream' });
+    const skipped = f.prompt(undefined, 'skipped'); skipped.catch(() => {});
+    await f.voice.call('cancel', { interaction: 'skipped' });
+    await assert.rejects(skipped, /取消/);
+    const latest = f.prompt(undefined, 'latest');
+    idle.resolve(); await stopped; await assert.rejects(first, /取消/);
+    await waitFor(() => f.selection.current !== f.original, '最后一个问题必须在旧轮次收尾后进入执行');
+    f.end(); assert.equal((await latest).text, '最终回答');
+    assert.equal(f.cancellations(), 1, '取消等待中的问题不能重复取消运行器');
+  } finally { idle.resolve(); f.voice.close(); }
+});
+
 test('voice cancellation removes only its pending message and cannot cancel another running task', async () => {
   const { voiceSession } = await import(pathToFileURL(join(core, 'voice.mjs')));
   const handlers = new Map();
@@ -3357,8 +3714,9 @@ test('voice cancellation removes only its pending message and cannot cancel anot
     agent.status = 'running'; agent.inbox.nextTurn = pending.slice();
     await voice.call('cancel', { interaction: 'old-round' });
     assert.equal(cancellations, 0);
-    await voice.call('cancel', { interaction: 'cancel-own' });
+    const cancelled = voice.call('cancel', { interaction: 'cancel-own' });
     admission.resolve();
+    await cancelled;
     await assert.rejects(call, /取消/);
     assert.equal(cancellations, 0, 'the admitted typed task belongs to someone else');
     assert.deepEqual(agent.inbox.nextTurn.map(message => message.id), ['typed']);
@@ -3393,7 +3751,7 @@ test(`voice temporary model selection ${target.model} respects user switches and
           const fallback = signal => handlers.get('agent/request-error')({ agent, provider: 'dshx-local',
             failure: { code: 'LOCAL_CONTEXT' }, signal }, () => 'unhandled');
           if (cancel) {
-            await voice.call('cancel', { interaction: 'cancel-context' });
+            void voice.call('cancel', { interaction: 'cancel-context' });
             assert.equal(fallback(new AbortController().signal), 'unhandled', 'cancelled turns cannot retry');
             return;
           }
