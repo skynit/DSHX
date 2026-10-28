@@ -5,6 +5,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import java.lang.ref.WeakReference
 import java.util.UUID
 
@@ -18,6 +19,18 @@ internal class PhoneWindow(context: Context, private val stopPhone: () -> Unit) 
     var detail = "正在打开操作小窗"
         private set
     var count = 0
+        private set
+    enum class Status(val label: String, val detail: String) {
+        Running("执行中", "执行中"),
+        Returned("已返回", "已返回，待下一步"),
+        Failed("未成功", "未成功，等待处理"),
+        Unknown("待确认", "结果未知，需重查"),
+    }
+    data class Step(val number: Int, val action: String, val startedAt: Long,
+                    val status: Status = Status.Running, val duration: Long = 0) {
+        fun elapsed(): Long = if (status == Status.Running) (SystemClock.elapsedRealtime() - startedAt).coerceAtLeast(0) else duration
+    }
+    var history: List<Step> = emptyList()
         private set
     private val main = Handler(Looper.getMainLooper())
     private val owners = linkedMapOf<String, () -> Boolean>()
@@ -47,10 +60,12 @@ internal class PhoneWindow(context: Context, private val stopPhone: () -> Unit) 
             id = UUID.randomUUID().toString()
             ready = false
             count = 0
+            history = emptyList()
         }
         owners[session] = valid
         count++
         title = label(method)
+        history = (history + Step(count, title.removePrefix("正在"), SystemClock.elapsedRealtime())).takeLast(3)
         detail = "第 $count 次手机调用 · 执行中"
         page.get()?.render()
         main.removeCallbacks(watch)
@@ -82,11 +97,14 @@ internal class PhoneWindow(context: Context, private val stopPhone: () -> Unit) 
 
     fun result(value: org.json.JSONObject) {
         if (current !== this) return
-        detail = when {
-            value.optBoolean("ok") -> "本次调用已返回 · 等待助手下一步"
-            value.optString("execution_state") == "unknown" -> "动作结果未知 · 需要重新观察"
-            else -> "本次调用未成功 · 等待助手处理"
+        val last = history.lastOrNull()?.takeIf { it.status == Status.Running } ?: return
+        val status = when {
+            value.optBoolean("ok") -> Status.Returned
+            value.optString("execution_state") == "unknown" -> Status.Unknown
+            else -> Status.Failed
         }
+        history = history.dropLast(1) + last.copy(status = status, duration = last.elapsed())
+        detail = status.detail
         page.get()?.render()
     }
 

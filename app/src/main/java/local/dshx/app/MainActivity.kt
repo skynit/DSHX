@@ -40,6 +40,9 @@ class MainActivity : ComponentActivity() {
     @Volatile private var chatScrollLeft = false
     @Volatile private var chatScrollRight = false
     private var phoneRevision by mutableIntStateOf(0)
+    private var startup by mutableStateOf(true)
+    private var accessibilityNotice by mutableStateOf(false)
+    private var accessibilityHandled = false
     private val engine get() = (application as DshApp).engine
     private val voice get() = (application as DshApp).voice
     private var pendingVoice: String? = null
@@ -201,6 +204,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        startup = savedInstanceState?.getBoolean("startup", true) ?: true
+        accessibilityHandled = savedInstanceState?.getBoolean("accessibilityHandled") ?: false
         backupPicking = savedInstanceState?.getBoolean("backupPicking") ?: false
         knowledgePicking = savedInstanceState?.getBoolean("knowledgePicking") ?: false
         knowledgePick = savedInstanceState?.getString("knowledgePick")
@@ -237,7 +242,7 @@ class MainActivity : ComponentActivity() {
                 state = state, bundle = bundle, webVersion = WebView.getCurrentWebViewPackage()?.versionName,
                 theme = theme,
                 onTheme = { value -> theme = value; preferences.edit().putString("theme", value).apply() },
-                onStart = { startForegroundService(Intent(this, EngineService::class.java)) },
+                onStart = ::startEngine,
                 onStop = { startService(Intent(this, EngineService::class.java).setAction("stop")) },
                 diagnostics = engine::diagnostics, pageError = pageError,
                 onReload = { pageError = null; browser?.reload() },
@@ -251,6 +256,9 @@ class MainActivity : ComponentActivity() {
                 phone = engine.phone, phoneRevision = phoneRevision,
                 voice = voice, voiceState = voiceState, onVoice = ::voiceAction,
                 onPhonePermission = ::phonePermission,
+                startup = startup, onStartupFinished = { startup = false },
+                accessibilityNotice = accessibilityNotice,
+                onAccessibilityDismiss = { accessibilityHandled = true; accessibilityNotice = false },
                 chat = { modifier, current ->
                     DisposableEffect(current) {
                         chatVisible = current
@@ -265,6 +273,12 @@ class MainActivity : ComponentActivity() {
                 },
             )
         }
+        if (!engine.active && !engine.state.busy && (savedInstanceState == null || engine.state.phase == "未启动")) startEngine()
+    }
+
+    private fun startEngine() {
+        try { startForegroundService(Intent(this, EngineService::class.java)) }
+        catch (_: RuntimeException) { Toast.makeText(this, "无法启动 dsh，请在工作台重试。", Toast.LENGTH_LONG).show() }
     }
 
     private fun knowledgeFile(action: String, data: JSONObject) {
@@ -328,6 +342,8 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBoolean("startup", startup)
+        outState.putBoolean("accessibilityHandled", accessibilityHandled)
         outState.putBoolean("backupPicking", backupPicking)
         outState.putBoolean("knowledgePicking", knowledgePicking)
         outState.putString("knowledgePick", knowledgePick)
@@ -365,12 +381,18 @@ class MainActivity : ComponentActivity() {
         engine.phone.resume()
         engine.phone.device.attach(this)
         phoneRevision++
+        accessibilityNotice = !accessibilityHandled && !engine.phone.accessibilityEnabled()
     }
     override fun onPause() { engine.phone.device.detach(this); super.onPause() }
 
     private fun phonePermission(action: String) {
         try {
             when (action) {
+                "accessibility" -> {
+                    startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                    accessibilityHandled = true
+                    accessibilityNotice = false
+                }
                 "location" -> phonePermissions.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION))
                 "torch" -> phonePermissions.launch(arrayOf(Manifest.permission.CAMERA))
                 "steps" -> if (Build.VERSION.SDK_INT >= 29) phonePermissions.launch(arrayOf(Manifest.permission.ACTIVITY_RECOGNITION))

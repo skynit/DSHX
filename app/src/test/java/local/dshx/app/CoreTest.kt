@@ -65,6 +65,75 @@ import kotlinx.coroutines.withTimeout
 class CoreTest {
     @get:Rule val folder = TemporaryFolder()
 
+    @Test fun startupStartsTheEngineServiceOnceAndDoesNotRestartOnRecreation() {
+        val app = RuntimeEnvironment.getApplication()
+        val shadow = shadowOf(app)
+        while (shadow.nextStartedService != null) { /* 清除其他初始化留下的请求。 */ }
+        val page = Robolectric.buildActivity(MainActivity::class.java).create()
+        val saved = Bundle()
+        try {
+            assertEquals(EngineService::class.java.name, shadow.nextStartedService?.component?.className)
+            assertNull(shadow.nextStartedService)
+            ReflectionHelpers.callInstanceMethod<Unit>(page.get(), "setStartup",
+                ReflectionHelpers.ClassParameter.from(Boolean::class.javaPrimitiveType, false))
+            ReflectionHelpers.setField((app as DshApp).engine, "state", EngineState(phase = "已停止"))
+            page.saveInstanceState(saved)
+        } finally { page.destroy() }
+        val recreated = Robolectric.buildActivity(MainActivity::class.java).create(saved)
+        try {
+            assertNull(shadow.nextStartedService)
+            assertFalse(saved.getBoolean("startup", true))
+        } finally { recreated.destroy() }
+    }
+
+    @Test fun restoredPageStartsTheEngineWhenTheApplicationProcessWasLost() {
+        val app = RuntimeEnvironment.getApplication()
+        val shadow = shadowOf(app)
+        while (shadow.nextStartedService != null) { }
+        val page = Robolectric.buildActivity(MainActivity::class.java).create(Bundle())
+        try {
+            assertEquals(EngineService::class.java.name, shadow.nextStartedService?.component?.className)
+            assertNull(shadow.nextStartedService)
+        } finally { page.destroy() }
+    }
+
+    @Test fun accessibilityAuthorizationMatchesOurServiceEvenBeforeItConnects() {
+        val context = RuntimeEnvironment.getApplication()
+        val control = PhoneControl(context)
+        val resolver = context.contentResolver
+        val own = android.content.ComponentName(context, PhoneService::class.java)
+        android.provider.Settings.Secure.putInt(resolver, android.provider.Settings.Secure.ACCESSIBILITY_ENABLED, 1)
+        android.provider.Settings.Secure.putString(resolver, android.provider.Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
+            "another.app/.Reader:invalid:${own.flattenToShortString()}")
+        assertNull(PhoneService.current)
+        assertTrue(control.accessibilityEnabled())
+        android.provider.Settings.Secure.putString(resolver, android.provider.Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
+            own.flattenToString())
+        assertTrue(control.accessibilityEnabled())
+        android.provider.Settings.Secure.putInt(resolver, android.provider.Settings.Secure.ACCESSIBILITY_ENABLED, 0)
+        assertFalse(control.accessibilityEnabled())
+        android.provider.Settings.Secure.putInt(resolver, android.provider.Settings.Secure.ACCESSIBILITY_ENABLED, 1)
+        android.provider.Settings.Secure.putString(resolver, android.provider.Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
+            "another.app/.Reader")
+        assertFalse(control.accessibilityEnabled())
+        android.provider.Settings.Secure.putString(resolver, android.provider.Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES, null)
+        assertFalse(control.accessibilityEnabled())
+    }
+
+    @Test fun accessibilityNoticeChecksOnReturnAndSettingsUseTheSystemPage() {
+        val page = Robolectric.buildActivity(MainActivity::class.java).create().start().resume()
+        val activity = page.get()
+        try {
+            assertTrue(ReflectionHelpers.callInstanceMethod<Boolean>(activity, "getAccessibilityNotice"))
+            ReflectionHelpers.callInstanceMethod<Unit>(activity, "phonePermission",
+                ReflectionHelpers.ClassParameter.from(String::class.java, "accessibility"))
+            assertEquals(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS, shadowOf(activity).nextStartedActivity.action)
+            assertFalse(ReflectionHelpers.callInstanceMethod<Boolean>(activity, "getAccessibilityNotice"))
+            page.pause().resume()
+            assertFalse(ReflectionHelpers.callInstanceMethod<Boolean>(activity, "getAccessibilityNotice"))
+        } finally { page.pause().stop().destroy() }
+    }
+
     @Test fun settingsDetailsReturnToOverviewBeforeLeavingSettings() {
         val details = listOf(AppPage.Assistant, AppPage.VoiceOptions, AppPage.Tasks, AppPage.Permissions, AppPage.Backup)
         details.forEach { page ->
@@ -3499,17 +3568,55 @@ class CoreTest {
             shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(300))
             assertEquals(1, calls.get())
             window.result(PhoneControl.success())
-            assertTrue(window.detail.contains("等待助手下一步"))
+            assertTrue(window.detail.contains("待下一步"))
+            assertEquals(PhoneWindow.Status.Returned, window.history.single().status)
+            assertTrue(window.history.single().duration >= 300)
             window.show("child", "input", { true }) { calls.incrementAndGet() }
             assertEquals(2, calls.get())
             assertEquals(2, window.count)
             assertEquals("正在输入文字", window.title)
+            assertEquals(listOf("读取当前界面", "输入文字"), window.history.map { it.action })
+            assertEquals(PhoneWindow.Status.Running, window.history.last().status)
             assertNull("同一任务不能反复打开页面", shadowOf(context).nextStartedActivity)
             window.finish("unrelated")
             window.finish("root")
             assertSame(window, PhoneWindow.current)
             window.finish("child")
             assertNull(PhoneWindow.current)
+        } finally { window.close(); controller.destroy() }
+    }
+
+    @Test @LooperMode(LooperMode.Mode.PAUSED)
+    fun phoneWindowKeepsThreeRealStepsAndSeparatesReturnedFailedAndUnknownResults() {
+        val context = RuntimeEnvironment.getApplication()
+        shadowOf(context.packageManager).setSystemFeature(android.content.pm.PackageManager.FEATURE_PICTURE_IN_PICTURE, true)
+        val controller = phoneService()
+        val window = PhoneWindow(context) { }
+        try {
+            window.show("root", "device", { true }) { }
+            window.entered()
+            shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(500))
+            window.result(PhoneControl.success())
+            val duration = window.history.single().duration
+            shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(1000))
+            assertEquals(duration, window.history.single().elapsed())
+            window.show("root", "apps", { true }) { }
+            window.result(PhoneControl.failure("unavailable", "不得在小窗显示的参数正文"))
+            window.show("root", "tap", { true }) { }
+            window.result(PhoneControl.failure("timeout", "不得在小窗显示的界面正文").put("execution_state", "unknown"))
+            assertEquals(listOf(PhoneWindow.Status.Returned, PhoneWindow.Status.Failed, PhoneWindow.Status.Unknown), window.history.map { it.status })
+            assertTrue(window.detail.contains("需重查"))
+            window.result(PhoneControl.success())
+            assertEquals(PhoneWindow.Status.Unknown, window.history.last().status)
+            window.show("root", "observe", { true }) { }
+            assertEquals(4, window.count)
+            assertEquals(listOf(2, 3, 4), window.history.map { it.number })
+            assertFalse(window.history.toString().contains("正文"))
+            window.close()
+            window.show("next", "open", { true }) { }
+            assertEquals(1, window.count)
+            assertEquals("打开应用", window.history.single().action)
+            assertEquals(PhoneWindow.Status.Running, window.history.single().status)
         } finally { window.close(); controller.destroy() }
     }
 

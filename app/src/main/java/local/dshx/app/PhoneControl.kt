@@ -2,7 +2,9 @@ package local.dshx.app
 
 import android.app.KeyguardManager
 import android.content.Context
+import android.content.ComponentName
 import android.content.Intent
+import android.provider.Settings
 import android.content.pm.ApplicationInfo
 import java.util.Locale
 import android.os.Build
@@ -26,6 +28,14 @@ class PhoneControl(context: Context) {
     fun finish(session: String) { main.post { window.finish(session) } }
 
     fun enabled(): Boolean = settings.getBoolean("enabled", true)
+
+    /** 检查系统授权，不把服务尚在连接误判为未授权，也不把其他应用的授权算作本应用。 */
+    fun accessibilityEnabled(): Boolean {
+        if (Settings.Secure.getInt(context.contentResolver, Settings.Secure.ACCESSIBILITY_ENABLED, 0) != 1) return false
+        val service = ComponentName(context, PhoneService::class.java)
+        return Settings.Secure.getString(context.contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES)
+            .orEmpty().split(':').any { ComponentName.unflattenFromString(it) == service }
+    }
 
     /** 回到应用时恢复默认允许；小窗中的停止仍会立即取消操作，系统授权另行检查。 */
     fun resume() {

@@ -113,15 +113,16 @@ internal val LocalStatusColor = staticCompositionLocalOf { Color(0xFF23845F) }
 @Composable
 private fun AppTheme(theme: String, content: @Composable () -> Unit) {
     val dark = theme == "dark" || theme == "system" && isSystemInDarkTheme()
-    val background = if (dark) Color(0xFF171917) else Color(0xFFF7F7F5)
-    val surface = if (dark) Color(0xFF202320) else Color(0xFFFCFCFB)
-    val text = if (dark) Color(0xFFECEFEB) else Color(0xFF202220)
-    val muted = if (dark) Color(0xFFA6ACA5) else Color(0xFF6D726D)
-    val border = if (dark) Color(0xFF363B36) else Color(0xFFE4E5E2)
-    val primary = if (dark) Color(0xFF78A7EF) else Color(0xFF2F6CC4)
-    val input = if (dark) Color(0xFF252925) else Color.White
-    val selected = if (dark) Color(0xFF2A2E2A) else Color(0xFFF0F1EF)
-    val danger = if (dark) Color(0xFFE3848A) else Color(0xFFB33D48)
+    val palette = remember(dark) { AppColors(dark) }
+    val background = Color(palette.background)
+    val surface = Color(palette.surface)
+    val text = Color(palette.text)
+    val muted = Color(palette.muted)
+    val border = Color(palette.border)
+    val primary = Color(palette.primary)
+    val input = Color(palette.input)
+    val selected = Color(palette.selected)
+    val danger = Color(palette.danger)
     val colors = if (dark) darkColorScheme() else lightColorScheme()
     val view = LocalView.current
     @Suppress("DEPRECATION")
@@ -132,7 +133,7 @@ private fun AppTheme(theme: String, content: @Composable () -> Unit) {
             decorView.systemUiVisibility = if (dark) 0 else View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
         }
     }
-    CompositionLocalProvider(LocalStatusColor provides if (dark) Color(0xFF63B58B) else Color(0xFF23845F)) {
+    CompositionLocalProvider(LocalStatusColor provides Color(palette.success)) {
         MiuixTheme(colors = colors.copy(
             primary = primary, onPrimary = if (dark) Color(0xFF172336) else Color.White,
             surface = background, onSurface = text, surfaceVariant = surface,
@@ -165,6 +166,8 @@ fun DshScreen(
     voice: VoiceControl, voiceState: VoiceControl.State, onVoice: (String) -> Unit,
     chat: @Composable (Modifier, Boolean) -> Unit,
     canSwipeChat: (Int) -> Boolean = { true },
+    startup: Boolean = false, onStartupFinished: () -> Unit = {},
+    accessibilityNotice: Boolean = false, onAccessibilityDismiss: () -> Unit = {},
 ) {
     var tab by rememberSaveable { mutableIntStateOf(0) }
     var settingsPage by rememberSaveable { mutableStateOf(AppPage.Settings) }
@@ -226,6 +229,19 @@ fun DshScreen(
     }
     BackHandler(library || logs) { goBack() }
     AppTheme(theme) {
+        if (startup) {
+            StartupScreen(state, onStartupFinished)
+            return@AppTheme
+        }
+        if (accessibilityNotice) MemoryDialog("开启无障碍服务", onAccessibilityDismiss) {
+            Text("允许 DSHX 读取屏幕内容、执行点击和滑动。请在系统设置中开启「DSHX 手机操作」。",
+                fontSize = 14.sp, lineHeight = 22.sp, color = MiuixTheme.colorScheme.onSurface)
+            Note("暂不开启也可以继续对话，手机操作功能将不可用。")
+            Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Action("去开启", { onPhonePermission("accessibility") }, Modifier.fillMaxWidth(), primary = true)
+                Action("稍后", onAccessibilityDismiss, Modifier.fillMaxWidth())
+            }
+        }
         Scaffold(
             modifier = Modifier.clipToBounds(),
             contentWindowInsets = WindowInsets(0, 0, 0, 0),
@@ -959,7 +975,8 @@ internal fun MemoryDialog(title: String, close: () -> Unit, scroll: Boolean = tr
                 .border(1.dp, MiuixTheme.colorScheme.outline, RoundedCornerShape(10.dp)).padding(16.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text(title, fontSize = 18.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f).semantics { heading() })
+                    Text(title, fontSize = 18.sp, fontWeight = FontWeight.SemiBold, color = MiuixTheme.colorScheme.onSurface,
+                        modifier = Modifier.weight(1f).semantics { heading() })
                     LibraryIcon(Lucide.X, "关闭", close)
                 }
                 if (scroll) Column(Modifier.weight(1f, fill = false).verticalScroll(remember { ScrollState(0) }),

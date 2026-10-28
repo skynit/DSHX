@@ -24,6 +24,9 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 /** 沿用现有控件的短反馈；位移与尺寸使用无回弹弹簧，避免数据和表单晃动。 */
 internal object AppMotion {
+    val startupEnter = tween<Float>(durationMillis = 320)
+    val startupSweep = tween<Float>(durationMillis = 640)
+    const val startupWaitMillis = 1600L
     val color = tween<Color>(durationMillis = 160)
     val fade = tween<Float>(durationMillis = 160)
     val size = spring<IntSize>(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMedium)
