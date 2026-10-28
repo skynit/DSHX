@@ -12,6 +12,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Process
 import android.view.ViewGroup
+import android.view.MotionEvent
 import android.webkit.ValueCallback
 import android.webkit.CookieManager
 import android.webkit.WebChromeClient
@@ -35,6 +36,9 @@ import org.json.JSONObject
 import java.net.URI
 
 class MainActivity : ComponentActivity() {
+    @Volatile private var chatVisible = false
+    @Volatile private var chatScrollLeft = false
+    @Volatile private var chatScrollRight = false
     private var phoneRevision by mutableIntStateOf(0)
     private val engine get() = (application as DshApp).engine
     private val voice get() = (application as DshApp).voice
@@ -247,7 +251,18 @@ class MainActivity : ComponentActivity() {
                 phone = engine.phone, phoneRevision = phoneRevision,
                 voice = voice, voiceState = voiceState, onVoice = ::voiceAction,
                 onPhonePermission = ::phonePermission,
-                chat = { modifier -> state.url?.let { instance -> AndroidView(modifier = modifier, factory = { webView(instance) }) } }
+                chat = { modifier, current ->
+                    DisposableEffect(current) {
+                        chatVisible = current
+                        onDispose { chatVisible = false }
+                    }
+                    state.url?.let { instance -> AndroidView(modifier = modifier, factory = { webView(instance) }) }
+                },
+                canSwipeChat = { direction ->
+                    val scrolls = if (direction > 0) chatScrollLeft else chatScrollRight
+                    !scrolls && browser?.canScrollHorizontally(-direction) != true &&
+                        browser?.hitTestResult?.type != WebView.HitTestResult.EDIT_TEXT_TYPE
+                },
             )
         }
     }
@@ -388,13 +403,28 @@ class MainActivity : ComponentActivity() {
                 settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
                 settings.setSupportMultipleWindows(false)
                 CookieManager.getInstance().setAcceptThirdPartyCookies(this, false)
+                setOnTouchListener { _, event ->
+                    if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+                        chatScrollLeft = false
+                        chatScrollRight = false
+                    }
+                    false
+                }
                 addJavascriptInterface(object {
-                    @JavascriptInterface fun selected(session: String) {
+                    @JavascriptInterface fun scrolls(left: Boolean, right: Boolean) {
+                        if (browser === this@apply && browserInstance == instance) {
+                            chatScrollLeft = left
+                            chatScrollRight = right
+                        }
+                    }
+                    @JavascriptInterface fun selected(session: String): Boolean {
+                        if (!chatVisible) return false
                         runOnUiThread {
-                            if (browser === this@apply && browserInstance == instance && engine.state.url == instance && sameOrigin(instance, url.orEmpty())) {
+                            if (chatVisible && browser === this@apply && browserInstance == instance && engine.state.url == instance && sameOrigin(instance, url.orEmpty())) {
                                 voice.select(session.ifBlank { null })
                             }
                         }
+                        return true
                     }
                 }, "DshxVoice")
                 webChromeClient = object : WebChromeClient() {
@@ -432,11 +462,26 @@ class MainActivity : ComponentActivity() {
                                 style.id = 'dshx-chat-layout';
                                 style.textContent = ${JSONObject.quote(css)};
                                 document.head.append(style);
+                                document.addEventListener('touchstart', event => {
+                                    let left = false, right = false;
+                                    for (let element = event.target; element instanceof Element; element = element.parentElement) {
+                                        if (element.matches('input, textarea, [contenteditable="true"]')) {
+                                            left = right = true;
+                                            break;
+                                        }
+                                        const overflow = getComputedStyle(element).overflowX;
+                                        if (/(auto|scroll)/.test(overflow) && element.scrollWidth > element.clientWidth + 1) {
+                                            left ||= element.scrollLeft > 1;
+                                            right ||= element.scrollLeft + element.clientWidth < element.scrollWidth - 1;
+                                        }
+                                    }
+                                    window.DshxVoice.scrolls(left, right);
+                                }, { capture: true, passive: true });
                                 let selected;
                                 const syncVoice = () => {
                                     try {
                                         const session = JSON.parse(localStorage.getItem('dsh.sessions.current') || '{}').sessionId || '';
-                                        if (selected !== session) { selected = session; window.DshxVoice.selected(session); }
+                                        if (selected !== session && window.DshxVoice.selected(session)) selected = session;
                                     } catch {}
                                 };
                                 syncVoice(); setInterval(syncVoice, 500);

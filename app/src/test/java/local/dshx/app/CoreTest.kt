@@ -65,6 +65,199 @@ import kotlinx.coroutines.withTimeout
 class CoreTest {
     @get:Rule val folder = TemporaryFolder()
 
+    @Test fun settingsDetailsReturnToOverviewBeforeLeavingSettings() {
+        val details = listOf(AppPage.Assistant, AppPage.VoiceOptions, AppPage.Tasks, AppPage.Permissions, AppPage.Backup)
+        details.forEach { page ->
+            assertTrue(page.settings)
+            assertEquals(AppPage.Settings, page.previous)
+            assertEquals(AppPage.Home, page.previous.previous)
+        }
+        assertTrue(AppPage.Settings.settings)
+        assertFalse(AppPage.Chat.settings)
+        assertEquals(AppPage.Home, AppPage.Chat.previous)
+    }
+
+    @Test fun backGestureUsesDistanceSpeedAndReleaseDirection() {
+        assertFalse(BackGesture.completes(0.2f, 0f))
+        assertTrue(BackGesture.completes(0.4f, 0f))
+        assertTrue(BackGesture.completes(0.08f, 1.2f))
+        assertFalse(BackGesture.completes(0.01f, 1.2f))
+        assertFalse(BackGesture.completes(0.8f, -1.2f))
+        assertTrue(BackGesture.completes(0.3f, 0.5f))
+    }
+
+    @Test fun backGestureChoosesAdjacentPagesWithoutWrappingAtEitherEnd() {
+        assertEquals(1, BackGesture.next(0, -1f, 4))
+        assertEquals(2, BackGesture.next(1, -1f, 4))
+        assertEquals(3, BackGesture.next(2, -1f, 4))
+        assertEquals(2, BackGesture.next(3, 1f, 4))
+        assertEquals(1, BackGesture.next(2, 1f, 4))
+        assertEquals(0, BackGesture.next(1, 1f, 4))
+        assertNull(BackGesture.next(0, 1f, 4))
+        assertNull(BackGesture.next(3, -1f, 4))
+        assertNull(BackGesture.next(-1, -1f, 4))
+    }
+
+    @Test fun backGesturePageDragUsesLessTravelButStillCancelsShortAndReverseDrags() {
+        assertEquals(0.33f, BackGesture.distance(200f, 1000f, true), 0.0001f)
+        assertEquals(0.2f, BackGesture.distance(200f, 1000f, false), 0.0001f)
+        assertTrue(BackGesture.completes(0.18f, 0f, paging = true))
+        assertFalse(BackGesture.completes(0.18f, 0f))
+        assertFalse(BackGesture.completes(0.1f, 0f, paging = true))
+        assertTrue(BackGesture.completes(0.04f, 0.55f, paging = true))
+        assertFalse(BackGesture.completes(0.7f, -0.55f, paging = true))
+    }
+
+    @Test fun backGestureKeepsPagePreviewSeparateFromBackAndInvalidatesOldOwners() {
+        val gesture = BackGesture()
+        gesture.begin(-1f, target = 2)
+        val first = gesture.owner
+        gesture.move(0.4f)
+        assertEquals(0f, gesture.backProgress)
+        assertEquals(2, gesture.target)
+        assertTrue(gesture.owns(first))
+        assertFalse(gesture.begin(1f))
+        assertTrue(gesture.begin(1f, target = 2))
+        assertFalse(gesture.owns(first))
+        assertEquals(-1f, gesture.direction)
+        assertEquals(0.4f, gesture.progress)
+        gesture.reset()
+        assertEquals(-1, gesture.target)
+        gesture.begin(1f)
+        gesture.move(0.2f)
+        assertEquals(0.2f, gesture.backProgress)
+    }
+
+    @Test fun backGestureReservesSystemEdgesAndIgnoresBodyAndOutOfBounds() {
+        assertEquals(1f, BackGesture.edge(8f, 400f, 32f, 0f, 0f))
+        assertEquals(-1f, BackGesture.edge(392f, 400f, 32f, 0f, 0f))
+        assertEquals(0f, BackGesture.edge(200f, 400f, 32f, 0f, 0f))
+        assertEquals(0f, BackGesture.edge(8f, 400f, 32f, 24f, 24f))
+        assertEquals(1f, BackGesture.edge(30f, 400f, 32f, 24f, 24f))
+        assertEquals(-1f, BackGesture.edge(370f, 400f, 32f, 24f, 24f))
+        assertEquals(0f, BackGesture.edge(-1f, 400f, 32f, 0f, 0f))
+        assertEquals(0f, BackGesture.edge(401f, 400f, 32f, 0f, 0f))
+    }
+
+    @Test fun backGestureRequiresAnInwardHorizontalIntentBeforeTakingOwnership() {
+        assertFalse(BackGesture.recognizes(7f, 0f, 1f, 8f))
+        assertFalse(BackGesture.recognizes(15f, 20f, 1f, 8f))
+        assertFalse(BackGesture.recognizes(20f, 18f, 1f, 8f))
+        assertFalse(BackGesture.recognizes(-30f, 0f, 1f, 8f))
+        assertTrue(BackGesture.recognizes(30f, 8f, 1f, 8f))
+        assertTrue(BackGesture.recognizes(-30f, 8f, -1f, 8f))
+    }
+
+    @Test fun backGestureRetakesVisibleProgressAndKeepsItsOwnerUntilReset() {
+        val gesture = BackGesture()
+        assertTrue(gesture.begin(1f))
+        gesture.move(0.42f)
+        assertTrue(gesture.begin(-1f))
+        assertEquals(0.42f, gesture.progress)
+        assertEquals(1f, gesture.direction)
+        assertFalse(gesture.begin(1f, system = true))
+        gesture.move(2f)
+        assertEquals(1f, gesture.progress)
+        gesture.move(-0.1f)
+        assertEquals(0f, gesture.progress)
+        gesture.reset()
+        assertFalse(gesture.active)
+        assertTrue(gesture.begin(-1f, system = true))
+        assertEquals(-1f, gesture.direction)
+        gesture.reset()
+    }
+
+    @Test fun backGestureCommitsOnceAndCancellationAndDisposalNeverNavigate() = runBlocking {
+        var time = 0L
+        val clock = object : androidx.compose.runtime.MonotonicFrameClock {
+            override suspend fun <R> withFrameNanos(onFrame: (Long) -> R): R {
+                kotlinx.coroutines.yield()
+                time += 16_000_000L
+                return onFrame(time)
+            }
+        }
+        val disabled = object : androidx.compose.ui.MotionDurationScale { override val scaleFactor = 0f }
+        kotlinx.coroutines.withContext(clock + disabled) {
+            val gesture = BackGesture()
+            var commits = 0
+            gesture.begin(1f)
+            gesture.move(0.6f)
+            gesture.finish(this, true) { commits++ }!!.join()
+            assertEquals(1, commits)
+            assertFalse(gesture.active)
+            assertEquals(0f, gesture.progress)
+            assertNull(gesture.finish(this, true) { commits++ })
+            assertEquals(1, commits)
+
+            gesture.begin(1f)
+            gesture.move(0.7f)
+            gesture.finish(this, false) { commits++ }!!.join()
+            assertEquals(1, commits)
+            assertFalse(gesture.active)
+            assertEquals(0f, gesture.progress)
+
+            gesture.begin(1f)
+            gesture.move(0.7f)
+            val pending = gesture.finish(this, true) { commits++ }!!
+            gesture.reset()
+            pending.join()
+            assertEquals(1, commits)
+            assertFalse(gesture.active)
+
+            gesture.begin(1f)
+            gesture.move(0.45f)
+            val interrupted = gesture.finish(this, true) { commits++ }!!
+            assertTrue(gesture.begin(1f))
+            interrupted.join()
+            assertEquals(0.45f, gesture.progress)
+            gesture.move(0.1f)
+            gesture.finish(this, false) { commits++ }!!.join()
+            assertEquals(1, commits)
+            assertEquals(0f, gesture.progress)
+
+            gesture.begin(1f)
+            gesture.move(0.3f)
+            val appReturn = gesture.finish(this, false) { commits++ }!!
+            assertTrue(gesture.begin(1f, system = true))
+            appReturn.join()
+            assertEquals(0.3f, gesture.progress)
+            gesture.finish(this, true) { commits++ }!!.join()
+            assertEquals(2, commits)
+        }
+    }
+
+    @Test fun backGestureSettlesSmoothlyFromBothBoundariesWithOutwardVelocity() = runBlocking {
+        var time = 0L
+        val clock = object : androidx.compose.runtime.MonotonicFrameClock {
+            override suspend fun <R> withFrameNanos(onFrame: (Long) -> R): R {
+                kotlinx.coroutines.yield()
+                time += 16_000_000L
+                return onFrame(time)
+            }
+        }
+        kotlinx.coroutines.withContext(clock) {
+            val gesture = BackGesture()
+            var commits = 0
+            gesture.begin(1f)
+            gesture.move(0.9999f)
+            val cancel = gesture.finish(this, false, 4f) { commits++ }!!
+            kotlinx.coroutines.yield()
+            assertTrue(gesture.active)
+            cancel.join()
+            assertEquals(0, commits)
+            assertEquals(0f, gesture.progress)
+
+            gesture.begin(1f)
+            gesture.move(0.0001f)
+            val complete = gesture.finish(this, true, -4f) { commits++ }!!
+            kotlinx.coroutines.yield()
+            assertTrue(gesture.active)
+            complete.join()
+            assertEquals(1, commits)
+            assertEquals(0f, gesture.progress)
+        }
+    }
+
     private fun localMemorySnapshot(enabled: Boolean = true, autoSave: Boolean = false, revision: Long = 7): JSONObject =
         JSONObject().put("unit", JSONObject().put("name", "memory").put("version", 1))
             .put("global", JSONObject().put("version", 1).put("revision", revision).put("epoch", 2)

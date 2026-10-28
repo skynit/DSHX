@@ -1,6 +1,8 @@
 package local.dshx.app
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.Crossfade
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -31,6 +33,7 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.dp
@@ -41,7 +44,10 @@ import kotlinx.coroutines.runInterruptible
 import org.json.JSONObject
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.Icon
+import top.yukonga.miuix.kmp.basic.Button
+import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.theme.MiuixTheme
+import top.yukonga.miuix.kmp.utils.MiuixIndication
 import com.composables.icons.lucide.Lucide
 import com.composables.icons.lucide.ArrowLeft
 import com.composables.icons.lucide.ArrowRight
@@ -60,6 +66,7 @@ internal fun LibraryScreen(
     knowledge: KnowledgeStore, transfer: KnowledgeStore.Transfer, picking: Boolean,
     onKnowledge: (String, JSONObject) -> JSONObject, onKnowledgeFile: (String, JSONObject) -> Unit,
     store: LibraryStore, revision: Int, busy: Boolean, message: String?, file: (String, String?) -> Unit,
+    visible: Boolean = true,
 ) {
     var tab by rememberSaveable { mutableStateOf("documents") }
     val pages = rememberSaveableStateHolder()
@@ -75,7 +82,7 @@ internal fun LibraryScreen(
             listOf("documents" to "资料", "memory" to "记忆", "files" to "文件", "skills" to "技能").forEach { (id, title) ->
                 val selected = tab == id
                 Column(Modifier.weight(1f).clip(RoundedCornerShape(6.dp))
-                    .background(if (selected) colors.secondary else Color.Transparent)
+                    .selectionBackground(selected)
                     .selectable(selected, role = Role.Tab, onClick = { tab = id })
                     .heightIn(min = 48.dp).padding(horizontal = 4.dp, vertical = 8.dp),
                     horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -94,12 +101,14 @@ internal fun LibraryScreen(
                 Action("启动", onClick = start, enabled = !starting)
             }
         }
-        Box(Modifier.widthIn(max = 680.dp).fillMaxWidth().weight(1f)) {
-            pages.SaveableStateProvider(tab) {
-                when (tab) {
-                    "documents" -> KnowledgeSettings(knowledge, running, true, transfer, picking, onKnowledge, onKnowledgeFile)
-                    "memory" -> MemorySettings(memory, running, true, onMemory)
-                    else -> LibraryFiles(store, tab == "skills", true, revision, busy, message, file, running, transfer, onKnowledge, onKnowledgeFile)
+        Crossfade(targetState = tab, modifier = Modifier.widthIn(max = 680.dp).fillMaxWidth().weight(1f),
+            animationSpec = AppMotion.fade, label = "library page") { shownTab ->
+            pages.SaveableStateProvider(shownTab) {
+                val active = visible && shownTab == tab
+                when (shownTab) {
+                    "documents" -> KnowledgeSettings(knowledge, running, active, transfer, picking, onKnowledge, onKnowledgeFile)
+                    "memory" -> MemorySettings(memory, running, active, onMemory)
+                    else -> LibraryFiles(store, shownTab == "skills", active, revision, busy, message, file, running, transfer, onKnowledge, onKnowledgeFile)
                 }
             }
         }
@@ -107,14 +116,22 @@ internal fun LibraryScreen(
 }
 
 @Composable
-internal fun LibraryIcon(icon: ImageVector, label: String, onClick: () -> Unit, enabled: Boolean = true) {
+internal fun LibraryIcon(icon: ImageVector, label: String, onClick: () -> Unit, enabled: Boolean = true, iconSize: Int = 20) {
     val colors = MiuixTheme.colorScheme
     var focused by remember { mutableStateOf(false) }
-    Box(Modifier.size(48.dp).onFocusChanged { focused = it.isFocused }.clip(RoundedCornerShape(8.dp))
-        .border(if (focused) 2.dp else 0.dp, if (focused) colors.primary else Color.Transparent, RoundedCornerShape(8.dp))
-        .clickable(enabled = enabled, role = Role.Button, onClick = onClick), contentAlignment = Alignment.Center) {
-        Icon(icon, contentDescription = label, modifier = Modifier.size(20.dp),
-            tint = if (enabled) colors.onSurface else colors.onSurfaceVariantSummary)
+    val tint by animateColorAsState(if (enabled) colors.onSurface else colors.onSurfaceVariantSummary,
+        animationSpec = AppMotion.color, label = "icon button content")
+    val outline by animateColorAsState(if (focused && enabled) colors.primary else Color.Transparent,
+        animationSpec = AppMotion.color, label = "icon button focus")
+    Button(onClick = onClick, enabled = enabled,
+        modifier = Modifier.size(48.dp).semantics { role = Role.Button }.onFocusChanged { focused = it.isFocused }
+            .border(2.dp, outline, RoundedCornerShape(8.dp)),
+        minWidth = 48.dp, minHeight = 48.dp, cornerRadius = 8.dp, insideMargin = PaddingValues(0.dp),
+        indication = remember(tint) { MiuixIndication(tint) },
+        colors = ButtonDefaults.buttonColors(color = Color.Transparent, disabledColor = Color.Transparent,
+            contentColor = tint, disabledContentColor = tint)) {
+        Icon(icon, contentDescription = label, modifier = Modifier.size(iconSize.dp),
+            tint = tint)
     }
 }
 
@@ -170,7 +187,7 @@ internal fun LibraryFilters(options: List<Pair<String, String>>, selected: Strin
     val colors = MiuixTheme.colorScheme
     Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).selectableGroup(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
         options.forEach { (id, title) ->
-            Box(Modifier.clip(RoundedCornerShape(6.dp)).background(if (selected == id) colors.secondary else Color.Transparent)
+            Box(Modifier.clip(RoundedCornerShape(6.dp)).selectionBackground(selected == id)
                 .selectable(id == selected, role = Role.RadioButton, onClick = { select(id) })
                 .heightIn(min = 48.dp).padding(horizontal = 12.dp, vertical = 8.dp), contentAlignment = Alignment.Center) {
                 Text(title, fontSize = 13.sp, color = if (selected == id) colors.onSurface else colors.onSurfaceVariantSummary,
@@ -293,9 +310,11 @@ private fun LibraryFiles(
             }
             items(filtered.size, key = { filtered[it].id }) { index ->
                 val entry = filtered[index]
-                LibraryRow(if (skills) Lucide.Sparkles else Lucide.FileText, entry.name,
-                    "${entry.source} · ${fileSize(entry.bytes)}", enabled = available) { open(entry) }
-                Divider()
+                Column(Modifier.animateItem(fadeInSpec = AppMotion.fade, placementSpec = AppMotion.placement, fadeOutSpec = AppMotion.fade)) {
+                    LibraryRow(if (skills) Lucide.Sparkles else Lucide.FileText, entry.name,
+                        "${entry.source} · ${fileSize(entry.bytes)}", enabled = available) { open(entry) }
+                    Divider()
+                }
             }
             item { Spacer(Modifier.height(16.dp)) }
         }
