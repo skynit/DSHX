@@ -39,8 +39,9 @@ class Engine(private val context: Context, private val worker: Executor = Execut
     fun observe(listener: (EngineState) -> Unit) { listeners.add(listener); listener(state) }
     fun remove(listener: (EngineState) -> Unit) { listeners.remove(listener) }
     fun diagnostics(): String = synchronized(logs) { logs.joinToString("\n") }
-    fun voice(action: String, data: org.json.JSONObject = org.json.JSONObject()): org.json.JSONObject =
-        (bridge ?: throw IllegalStateException("请先启动 dsh，再使用语音对话。" )).voice(action, data)
+    fun voice(action: String, data: org.json.JSONObject = org.json.JSONObject(),
+              onEvent: ((org.json.JSONObject) -> Unit)? = null): org.json.JSONObject =
+        (bridge ?: throw IllegalStateException("请先启动 dsh，再使用语音对话。" )).voice(action, data, onEvent)
 
     /** 管理动作经现有认证连接发送；调用方中断线程时会向 Node 取消对应请求。 */
     fun memory(action: String, data: org.json.JSONObject = org.json.JSONObject()): org.json.JSONObject =

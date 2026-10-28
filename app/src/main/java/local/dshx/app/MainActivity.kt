@@ -323,13 +323,19 @@ class MainActivity : ComponentActivity() {
 
     private fun voiceAction(action: String) {
         if (action == "stop") { voice.stop(); return }
+        if (action == "interrupt") { voice.interruptAnswer(); return }
         if (voice.state.active) return
         when (action) {
             "model-import" -> { modelPicker.launch(arrayOf("*/*")); return }
             "preview" -> { voice.preview(); return }
+            "speech-settings" -> {
+                val settings = Intent(Settings.ACTION_VOICE_INPUT_SETTINGS)
+                startActivity(if (settings.resolveActivity(packageManager) != null) settings else Intent(Settings.ACTION_SETTINGS))
+                return
+            }
         }
-        if (action in setOf("download", "download-local")) {
-            voice.download(if (action == "download-local") "local" else "speech"); return
+        if (action == "download-local") {
+            voice.download(); return
         }
         if (action == "send") { voice.start(action); return }
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED && action != "send") {
@@ -340,6 +346,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        voice.refreshSpeech()
         engine.phone.resume()
         engine.phone.device.attach(this)
         phoneRevision++

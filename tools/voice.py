@@ -13,7 +13,6 @@ CACHE = ROOT / "core/cache/voice"
 ASSETS = ROOT / "app/src/main/assets/voice"
 RUNTIME_SHA = "9b2a290b8c7f31bd0aba35abb4628e87fe8d0eb71796a98aa12f3acd089ceaed"
 WAKE_SHA = "68447f4fbc67e70eee3a93961f36e81e98f47aef73ce7e7ca00885c6cd3616a6"
-VAD_SHA = "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6"
 LLAMA_COMMIT = "36cbf415f1c72c199e956c00fed0418f22ca53f2"
 LLAMA_SHA = "5c76b0b9ec2c948f0355bc99d968f13681341342c75ca32bd562a6a23d6f9929"
 PINYIN_COMMIT = "9e5e9bdfe8add694300e0cc93a27b803b68377f9"
@@ -47,7 +46,6 @@ def prepare(proxy):
     runtime.parent.mkdir(exist_ok=True)
     fetch("https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.2/sherpa-onnx-static-link-onnxruntime-1.13.2.aar", runtime, RUNTIME_SHA, proxy)
     archive = fetch("https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20.tar.bz2", CACHE / "wake.tar.bz2", WAKE_SHA, proxy)
-    vad = fetch("https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx", CACHE / "silero_vad.onnx", VAD_SHA, proxy)
     wake = ASSETS / "wake"
     wake.mkdir(exist_ok=True)
     names = {
@@ -63,7 +61,7 @@ def prepare(proxy):
                 raise ValueError("Model archive entry is not a regular file")
             with source.extractfile(member) as data, (wake / name).open("wb") as output:
                 shutil.copyfileobj(data, output)
-    shutil.copy2(vad, wake / "silero_vad.onnx")
+    (wake / "silero_vad.onnx").unlink(missing_ok=True)
     pinyin = fetch("https://raw.githubusercontent.com/mozillazg/pinyin-data/" + PINYIN_COMMIT + "/pinyin.txt", CACHE / "pinyin-data-pinyin.txt", PINYIN_SHA, proxy)
     shutil.copy2(pinyin, wake / "pinyin.txt")
     catalog = {
@@ -71,12 +69,9 @@ def prepare(proxy):
             {"name": path.name, "bytes": path.stat().st_size, "sha256": digest(path), "asset": "voice/wake/" + path.name}
             for path in sorted(wake.iterdir()) if path.is_file()
         ]},
-        "speech": {"version": "20240717", "files": []},
         "local": {"version": "50968a44", "files": []},
     }
     models = [
-        ("speech", "csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17", "2365baeacb507f821a0c8120fcee3d484dba7a07", "model.int8.onnx", 239233841, "c71f0ce00bec95b07744e116345e33d8cbbe08cef896382cf907bf4b51a2cd51"),
-        ("speech", "csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17", "2365baeacb507f821a0c8120fcee3d484dba7a07", "tokens.txt", 315894, "f449eb28dc567533d7fa59be34e2abca8784f771850c78a47fb731a31429a1dc"),
         ("local", "unsloth/Qwen3-0.6B-GGUF", "50968a4468ef4233ed78cd7c3de230dd1d61a56b", "Qwen3-0.6B-Q4_K_M.gguf", 396705472, "ac2d97712095a558e31573f62f466a3f9d93990898b0ec79d7c974c1780d524a"),
     ]
     for group, repo, revision, name, size, sha in models:

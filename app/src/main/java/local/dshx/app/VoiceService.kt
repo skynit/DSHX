@@ -78,7 +78,7 @@ class VoiceService : Service() {
         val open = PendingIntent.getActivity(this, 2, Intent(this, MainActivity::class.java), flags)
         val stop = PendingIntent.getService(this, 3, Intent(this, VoiceService::class.java).setAction("stop"), flags)
         return Notification.Builder(this, "voice").setSmallIcon(android.R.drawable.ic_btn_speak_now)
-            .setContentTitle("DSHX · $status").setContentText("本地处理声音，点此返回；可随时停止麦克风")
+            .setContentTitle("DSHX · $status").setContentText("使用手机系统识别，点此返回；可随时停止麦克风")
             .setContentIntent(open).addAction(Notification.Action.Builder(null, "停止语音", stop).build()).setOngoing(true).build()
     }
 }

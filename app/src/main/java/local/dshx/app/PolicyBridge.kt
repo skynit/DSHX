@@ -37,9 +37,11 @@ class PolicyBridge(
     @Volatile private var phoneCall: Call? = null
     @Volatile private var modelCall: Call? = null
     private val nativeCalls = ConcurrentHashMap<String, CompletableFuture<JSONObject>>()
+    private val voiceEvents = ConcurrentHashMap<String, (JSONObject) -> Unit>()
 
     /** Called off the main thread; replies share the existing authenticated connection. */
-    fun voice(action: String, data: JSONObject = JSONObject()): JSONObject = request("voice", action, data, 180)
+    fun voice(action: String, data: JSONObject = JSONObject(), onEvent: ((JSONObject) -> Unit)? = null): JSONObject =
+        request("voice", action, data, 180, onEvent)
 
     fun memory(action: String, data: JSONObject = JSONObject()): JSONObject = request("memory", action, data, 60)
 
@@ -57,13 +59,15 @@ class PolicyBridge(
         }
     }
 
-    private fun request(channel: String, action: String, data: JSONObject, timeout: Long): JSONObject {
+    private fun request(channel: String, action: String, data: JSONObject, timeout: Long,
+                        onEvent: ((JSONObject) -> Unit)? = null): JSONObject {
         val socket = client ?: throw IllegalStateException("引擎尚未连接，请先启动 dsh。")
         check(!closed) { "引擎连接已停止。" }
         val id = UUID.randomUUID().toString()
         val key = "$channel:$id"
         val result = CompletableFuture<JSONObject>()
         nativeCalls[key] = result
+        if (channel == "voice" && onEvent != null) voiceEvents[id] = onEvent
         var cancel = false
         try {
             check(client === socket && !closed) { "引擎连接已停止。" }
@@ -76,15 +80,23 @@ class PolicyBridge(
         } catch (error: InterruptedException) {
             cancel = true
             throw error
+        } catch (error: java.util.concurrent.ExecutionException) {
+            cancel = channel == "voice"
+            throw error
         } catch (error: java.util.concurrent.TimeoutException) {
             cancel = true
             throw IllegalStateException(if (channel == "knowledge") "等待知识回执超时；任务可能已受理，请用原操作编号核实结果。"
                 else "请求等待超时，请重新读取长期记忆或语音状态确认实际结果。", error)
         } finally {
+            voiceEvents.remove(id)
             nativeCalls.remove(key)
             result.cancel(false)
             if (cancel && channel == "memory" && !closed && client === socket) runCatching {
                 send(socket, JSONObject().put("memory", id).put("action", "cancel").put("data", JSONObject().put("id", id)))
+            }
+            if (cancel && channel == "voice" && action == "prompt" && !closed && client === socket) runCatching {
+                send(socket, JSONObject().put("voice", UUID.randomUUID().toString()).put("action", "cancel")
+                    .put("data", JSONObject().put("interaction", data.getString("interaction"))))
             }
         }
     }
@@ -136,6 +148,18 @@ class PolicyBridge(
                 }
                 if (request.has("voice") || request.has("memory")) {
                     val channel = if (request.has("memory")) "memory" else "voice"
+                    if (channel == "voice" && request.has("event")) {
+                        require(request.keys().asSequence().toSet() == setOf("voice", "event"))
+                        val id = request.getString("voice")
+                        val event = request.getJSONObject("event")
+                        require(event.keys().asSequence().toSet() == setOf("session", "text"))
+                        require(event.get("session") is String && event.getString("session").matches(Regex("[A-Za-z0-9._:-]{1,128}")))
+                        require(event.get("text") is String && event.getString("text").codePointCount(0, event.getString("text").length) <= 4000)
+                        val pending = nativeCalls["voice:$id"]
+                        if (pending != null && !pending.isDone) try { voiceEvents[id]?.invoke(event) }
+                        catch (error: Exception) { pending.completeExceptionally(error) }
+                        continue
+                    }
                     require(request.keys().asSequence().all { it in setOf(channel, "ok", "result", "error") })
                     require(request.get("ok") is Boolean)
                     nativeCalls["$channel:${request.getString(channel)}"]?.complete(request)
@@ -265,6 +289,7 @@ class PolicyBridge(
     private fun release() {
         nativeCalls.values.forEach { it.completeExceptionally(IllegalStateException("引擎连接已停止。")) }
         nativeCalls.clear()
+        voiceEvents.clear()
         phoneCall?.cancelled?.set(true)
         modelCall?.cancelled?.set(true)
         runCatching { server.close() }

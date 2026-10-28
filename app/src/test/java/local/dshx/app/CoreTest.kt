@@ -3,6 +3,12 @@ package local.dshx.app
 import org.json.JSONObject
 import android.content.ClipData
 import android.content.Intent
+import android.content.pm.ResolveInfo
+import android.content.pm.ServiceInfo
+import android.os.Bundle
+import android.speech.RecognitionService
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
 import android.accessibilityservice.AccessibilityService
 import android.app.KeyguardManager
 import android.graphics.Rect
@@ -30,6 +36,7 @@ import org.robolectric.annotation.Implementation
 import org.robolectric.annotation.Implements
 import org.robolectric.annotation.LooperMode
 import org.robolectric.shadows.ShadowAccessibilityService
+import org.robolectric.shadows.ShadowSpeechRecognizer
 import org.robolectric.util.ReflectionHelpers
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
@@ -614,7 +621,8 @@ class CoreTest {
         assertFalse(engine.restore { fail("未恢复的引擎不能导入"); ByteArrayInputStream(byteArrayOf()) })
     }
 
-    @Test fun voiceStartExplainsMissingModelsBeforeOpeningTheMicrophone() {
+    @Test fun voiceStartExplainsMissingSystemSpeechBeforeOpeningTheMicrophone() {
+        ShadowSpeechRecognizer.setIsOnDeviceRecognitionAvailable(false)
         val app = RuntimeEnvironment.getApplication()
         val root = folder.newFolder()
         val context = object : ContextWrapper(app) { override fun getFilesDir() = root }
@@ -624,8 +632,781 @@ class CoreTest {
         for (mode in listOf("input", "talk", "wake")) {
             voice.start(mode)
             assertFalse(voice.state.active)
-            assertEquals("请先在设置中下载本地语音识别模型。", voice.state.error)
+            assertEquals("手机没有可用的系统语音识别服务，请在系统语音设置中安装或启用。", voice.state.error)
         }
+    }
+
+    private fun <T> speechResult(result: java.util.concurrent.Future<T>): T {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)
+        while (!result.isDone && System.nanoTime() < deadline) {
+            shadowOf(Looper.getMainLooper()).idle()
+            Thread.sleep(1)
+        }
+        return result.get(1, TimeUnit.SECONDS)
+    }
+
+    private fun enableSystemSpeech() {
+        ShadowSpeechRecognizer.setIsOnDeviceRecognitionAvailable(false)
+        val app = RuntimeEnvironment.getApplication()
+        shadowOf(app).grantPermissions(android.Manifest.permission.RECORD_AUDIO)
+        shadowOf(app.packageManager).addResolveInfoForIntent(Intent(RecognitionService.SERVICE_INTERFACE), ResolveInfo().apply {
+            serviceInfo = ServiceInfo().apply { packageName = "test.phone.voice"; name = "test.phone.voice.RecognitionService" }
+        })
+    }
+
+    private fun systemSpeech(previous: ShadowSpeechRecognizer? = null): ShadowSpeechRecognizer {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)
+        while (System.nanoTime() < deadline) {
+            shadowOf(Looper.getMainLooper()).idle()
+            val recognizer = ShadowSpeechRecognizer.getLatestSpeechRecognizer()
+            if (recognizer != null) {
+                val speech = shadowOf(recognizer)
+                if (speech !== previous && !speech.isDestroyed && speech.lastRecognizerIntent != null) return speech
+            }
+            Thread.sleep(1)
+        }
+        throw AssertionError("系统语音请求未在主线程启动")
+    }
+
+    @Test @Config(sdk = [26, 34]) @LooperMode(LooperMode.Mode.PAUSED)
+    fun voiceSystemSpeechUsesDefaultServiceAndOnlyReturnsFinalText() {
+        enableSystemSpeech()
+        val app = RuntimeEnvironment.getApplication()
+        val input = VoiceInput(app, VoiceModels(app))
+        val executor = Executors.newSingleThreadExecutor()
+        val level = AtomicReference(0f)
+        try {
+            val result = executor.submit<String> { input.listen(null, { false }, onLevel = level::set) {} }
+            val speech = systemSpeech()
+            val intent = speech.lastRecognizerIntent
+            assertEquals(RecognizerIntent.ACTION_RECOGNIZE_SPEECH, intent.action)
+            assertNull(intent.component)
+            assertEquals("zh-CN", intent.getStringExtra(RecognizerIntent.EXTRA_LANGUAGE))
+            assertFalse(intent.hasExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE))
+            assertFalse(intent.hasExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE))
+            speech.triggerOnReadyForSpeech(Bundle())
+            speech.triggerOnRmsChanged(4f)
+            assertEquals(0.5f, level.get(), 0.001f)
+            speech.triggerOnPartialResults(Bundle().apply { putStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION, arrayListOf("尚未说完")) })
+            assertFalse(result.isDone)
+            speech.triggerOnEndOfSpeech()
+            speech.triggerOnResults(Bundle().apply { putStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION, arrayListOf("  最终问题  ")) })
+            assertEquals("最终问题", speechResult(result))
+            shadowOf(Looper.getMainLooper()).idle()
+            assertTrue(speech.isDestroyed)
+            assertEquals(0f, level.get(), 0f)
+
+            val next = executor.submit<String> { input.listen(null, { false }) {} }
+            val nextSpeech = systemSpeech()
+            speech.triggerOnResults(Bundle().apply { putStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION, arrayListOf("上一轮迟到结果")) })
+            assertFalse(next.isDone)
+            nextSpeech.triggerOnResults(Bundle().apply { putStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION, arrayListOf("下一轮问题")) })
+            assertEquals("下一轮问题", speechResult(next))
+            shadowOf(Looper.getMainLooper()).idle()
+            assertTrue(nextSpeech.isDestroyed)
+        } finally { input.close(); executor.shutdownNow(); shadowOf(Looper.getMainLooper()).idle() }
+    }
+
+    @Test @Config(sdk = [26, 34]) @LooperMode(LooperMode.Mode.PAUSED)
+    fun voiceSystemSpeechKeepsServiceFailuresSeparateFromSilenceAndCancellation() {
+        enableSystemSpeech()
+        val app = RuntimeEnvironment.getApplication()
+        val input = VoiceInput(app, VoiceModels(app))
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            val empty = executor.submit<String> { input.listen(null, { false }, allowEmpty = true) {} }
+            val silent = systemSpeech()
+            silent.triggerOnError(SpeechRecognizer.ERROR_NO_MATCH)
+            assertEquals("", speechResult(empty))
+            shadowOf(Looper.getMainLooper()).idle()
+            assertTrue(silent.isDestroyed)
+
+            val failed = executor.submit<String> { input.listen(null, { false }, allowEmpty = true) {} }
+            val network = systemSpeech()
+            network.triggerOnError(SpeechRecognizer.ERROR_NETWORK)
+            val error = assertThrows(java.util.concurrent.ExecutionException::class.java) { speechResult(failed) }
+            assertTrue(error.cause!!.message!!.contains("网络"))
+            shadowOf(Looper.getMainLooper()).idle()
+            assertTrue(network.isDestroyed)
+
+            val cleanupQueued = CountDownLatch(1)
+            val stopped = executor.submit<String> { input.listen(null, { false }, onLevel = { cleanupQueued.countDown() }) {} }
+            val active = systemSpeech()
+            input.stop()
+            assertTrue(cleanupQueued.await(3, TimeUnit.SECONDS))
+            Thread.sleep(75)
+            assertFalse("主线程完成清理前，后台调用不能返回", stopped.isDone)
+            assertFalse(active.isDestroyed)
+            active.triggerOnResults(Bundle().apply { putStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION, arrayListOf("取消后的结果")) })
+            val cancelled = assertThrows(java.util.concurrent.ExecutionException::class.java) { speechResult(stopped) }
+            assertTrue(cancelled.cause is java.util.concurrent.CancellationException)
+            shadowOf(Looper.getMainLooper()).idle()
+            assertTrue(active.isDestroyed)
+        } finally { input.close(); executor.shutdownNow(); shadowOf(Looper.getMainLooper()).idle() }
+    }
+
+    @Test @Config(sdk = [34]) @LooperMode(LooperMode.Mode.PAUSED)
+    fun voiceSystemSpeechUsesAndroidOnDeviceServiceWhenAvailable() {
+        val app = RuntimeEnvironment.getApplication()
+        shadowOf(app).grantPermissions(android.Manifest.permission.RECORD_AUDIO)
+        ShadowSpeechRecognizer.setIsOnDeviceRecognitionAvailable(true)
+        assertTrue(VoiceInput.available(app))
+        val input = VoiceInput(app, VoiceModels(app))
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            val result = executor.submit<String> { input.listen(null, { false }) {} }
+            val speech = systemSpeech()
+            assertTrue(SpeechRecognizer.isOnDeviceRecognitionAvailable(app))
+            speech.triggerOnResults(Bundle().apply { putStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION, arrayListOf("系统设备端识别")) })
+            assertEquals("系统设备端识别", speechResult(result))
+            shadowOf(Looper.getMainLooper()).idle()
+            assertTrue(speech.isDestroyed)
+        } finally { input.close(); executor.shutdownNow(); shadowOf(Looper.getMainLooper()).idle() }
+    }
+
+    @Test @Config(sdk = [34]) @LooperMode(LooperMode.Mode.PAUSED)
+    fun voiceSystemSpeechFallsBackOnceWhenDeviceChineseIsUnavailable() {
+        enableSystemSpeech()
+        ShadowSpeechRecognizer.setIsOnDeviceRecognitionAvailable(true)
+        val app = RuntimeEnvironment.getApplication()
+        val input = VoiceInput(app, VoiceModels(app))
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            val result = executor.submit<String> { input.listen(null, { false }) {} }
+            val device = systemSpeech()
+            device.triggerOnError(SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE)
+            val fallback = systemSpeech(device)
+            assertTrue(device.isDestroyed)
+            device.triggerOnResults(Bundle().apply { putStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION, arrayListOf("旧服务迟到结果")) })
+            assertFalse(result.isDone)
+            fallback.triggerOnResults(Bundle().apply { putStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION, arrayListOf("默认服务识别中文")) })
+            assertEquals("默认服务识别中文", speechResult(result))
+            assertTrue(fallback.isDestroyed)
+        } finally { input.close(); executor.shutdownNow(); shadowOf(Looper.getMainLooper()).idle() }
+    }
+
+    @Test @Config(sdk = [34]) @LooperMode(LooperMode.Mode.PAUSED)
+    fun voiceSystemSpeechFallbackKeepsTheOriginalTotalDeadline() {
+        enableSystemSpeech()
+        ShadowSpeechRecognizer.setIsOnDeviceRecognitionAvailable(true)
+        val app = RuntimeEnvironment.getApplication()
+        val input = VoiceInput(app, VoiceModels(app))
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            val result = executor.submit<String> { input.listen(null, { false }) {} }
+            val device = systemSpeech()
+            device.triggerOnPartialResults(Bundle().apply { putStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION, arrayListOf("讲话中")) })
+            org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofSeconds(50))
+            device.triggerOnError(SpeechRecognizer.ERROR_SERVER_DISCONNECTED)
+            val fallback = systemSpeech(device)
+            fallback.triggerOnPartialResults(Bundle().apply { putStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION, arrayListOf("仍在讲话")) })
+            org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofSeconds(11))
+            val failure = assertThrows(java.util.concurrent.ExecutionException::class.java) { speechResult(result) }
+            assertTrue(failure.cause!!.message!!.contains("时间过长"))
+            assertTrue(fallback.isDestroyed)
+        } finally { input.close(); executor.shutdownNow(); shadowOf(Looper.getMainLooper()).idle() }
+    }
+
+    @Test @Config(sdk = [34]) @LooperMode(LooperMode.Mode.PAUSED)
+    fun voiceSystemSpeechStartsSilenceTimeoutOnlyAfterTheServiceIsReady() {
+        enableSystemSpeech()
+        val app = RuntimeEnvironment.getApplication()
+        val input = VoiceInput(app, VoiceModels(app))
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            val result = executor.submit<String> { input.listen(null, { false }) {} }
+            val speech = systemSpeech()
+            org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofSeconds(6))
+            Thread.sleep(75)
+            shadowOf(Looper.getMainLooper()).idle()
+            assertFalse(result.isDone)
+            assertFalse(speech.isDestroyed)
+            speech.triggerOnReadyForSpeech(Bundle())
+            org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofSeconds(4))
+            Thread.sleep(75)
+            shadowOf(Looper.getMainLooper()).idle()
+            assertFalse(result.isDone)
+            speech.triggerOnResults(Bundle().apply { putStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION, arrayListOf("准备完成后的问题")) })
+            assertEquals("准备完成后的问题", speechResult(result))
+
+            val startup = executor.submit<String> { input.listen(null, { false }, allowEmpty = true) {} }
+            systemSpeech()
+            org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofSeconds(11))
+            val failure = assertThrows(java.util.concurrent.ExecutionException::class.java) { speechResult(startup) }
+            assertTrue(failure.cause!!.message!!.contains("启动超时"))
+        } finally { input.close(); executor.shutdownNow(); shadowOf(Looper.getMainLooper()).idle() }
+    }
+
+    // Robolectric 没有公开的语音开始触发方法，直接使用同一识别请求安装的监听器。
+    private fun speechListener(speech: ShadowSpeechRecognizer): android.speech.RecognitionListener =
+        ReflectionHelpers.getField(ReflectionHelpers.callInstanceMethod<Any>(speech, "getState"), "recognitionListener")
+
+    private fun speechWords(text: String): Bundle = Bundle().apply {
+        putStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION, arrayListOf(text))
+    }
+
+    @Test @Config(sdk = [26, 34]) @LooperMode(LooperMode.Mode.PAUSED)
+    fun voiceSystemSpeechNoiseAndUnstableWordsCannotInterruptAnAnswer() {
+        enableSystemSpeech()
+        val app = RuntimeEnvironment.getApplication()
+        val input = VoiceInput(app, VoiceModels(app))
+        val executor = Executors.newSingleThreadExecutor()
+        val calls = AtomicInteger()
+        try {
+            val result = executor.submit<String> { input.listen(null, { false }, allowEmpty = true,
+                onSpeech = { calls.incrementAndGet() }) {} }
+            val speech = systemSpeech()
+            speech.triggerOnReadyForSpeech(Bundle())
+            repeat(4) { speechListener(speech).onBeginningOfSpeech(); speech.triggerOnRmsChanged(35f) }
+            assertEquals("环境声音的开始通知不能直接打断", 0, calls.get())
+            speech.triggerOnPartialResults(speechWords("嗯"))
+            speech.triggerOnPartialResults(speechWords("……"))
+            speech.triggerOnPartialResults(speechWords("噪声错字"))
+            org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofMillis(350))
+            speech.triggerOnPartialResults(speechWords("完全不同"))
+            assertEquals("一次不稳定文字不能打断", 0, calls.get())
+            speech.triggerOnPartialResults(speechWords("我想问一个问题"))
+            assertEquals(0, calls.get())
+            org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofMillis(350))
+            speech.triggerOnPartialResults(speechWords("我想问一个新的问题"))
+            assertEquals(1, calls.get())
+            assertFalse(result.isDone)
+            speech.triggerOnResults(speechWords("我想问一个新的问题。"))
+            assertEquals("我想问一个新的问题。", speechResult(result))
+            assertEquals(1, calls.get())
+        } finally { input.close(); executor.shutdownNow(); shadowOf(Looper.getMainLooper()).idle() }
+    }
+
+    @Test @Config(sdk = [26, 34]) @LooperMode(LooperMode.Mode.PAUSED)
+    fun voiceSystemSpeechStopsWhenTextStallsDespiteBackgroundNoiseAndWaitsForFinal() {
+        enableSystemSpeech()
+        val app = RuntimeEnvironment.getApplication()
+        val input = VoiceInput(app, VoiceModels(app))
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            val stops = AtomicInteger()
+            val result = executor.submit<String> { input.listen(null, { false }) { if (it == "正在识别") stops.incrementAndGet() } }
+            val speech = systemSpeech()
+            speech.triggerOnReadyForSpeech(Bundle())
+            speechListener(speech).onBeginningOfSpeech()
+            speech.triggerOnPartialResults(speechWords("我已经说完的问题"))
+            org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofMillis(1300))
+            speech.triggerOnPartialResults(speechWords("我已经说完的问题"))
+            repeat(5) { speech.triggerOnRmsChanged(30f); speechListener(speech).onBeginningOfSpeech() }
+            org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofMillis(600))
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
+            while (stops.get() == 0 && System.nanoTime() < deadline) {
+                shadowOf(Looper.getMainLooper()).idle(); Thread.sleep(1)
+            }
+            assertTrue("文字没有继续增长时，应主动停止收音", stops.get() == 1)
+            assertFalse("中间结果不能直接作为最终问题提交", result.isDone)
+            assertFalse(speech.isDestroyed)
+            speech.triggerOnResults(speechWords("我已经说完的完整问题。"))
+            assertEquals("我已经说完的完整问题。", speechResult(result))
+            assertTrue(speech.isDestroyed)
+        } finally { input.close(); executor.shutdownNow(); shadowOf(Looper.getMainLooper()).idle() }
+    }
+
+    @Test @Config(sdk = [34]) @LooperMode(LooperMode.Mode.PAUSED)
+    fun voiceSystemSpeechDoesNotInterruptForAFillerAfterAnAssistantEcho() {
+        enableSystemSpeech()
+        val app = RuntimeEnvironment.getApplication()
+        val input = VoiceInput(app, VoiceModels(app))
+        val executor = Executors.newSingleThreadExecutor()
+        val calls = AtomicInteger()
+        try {
+            val result = executor.submit<String> { input.listen(null, { false }, allowEmpty = true,
+                echoText = { "这是助手正在播报的内容" }, onSpeech = { calls.incrementAndGet() }) {} }
+            val speech = systemSpeech()
+            val words = "这是助手正在播报的内容。嗯"
+            speech.triggerOnPartialResults(speechWords(words))
+            org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofMillis(350))
+            speech.triggerOnPartialResults(speechWords(words))
+            speech.triggerOnResults(speechWords(words))
+            assertEquals("", speechResult(result))
+            assertEquals(0, calls.get())
+        } finally { input.close(); executor.shutdownNow(); shadowOf(Looper.getMainLooper()).idle() }
+    }
+
+    @Test @Config(sdk = [26, 34]) @LooperMode(LooperMode.Mode.PAUSED)
+    fun voiceSystemSpeechNewWordsKeepLongSpeechOpenAndFinalSingleWordsRemainValid() {
+        enableSystemSpeech()
+        val app = RuntimeEnvironment.getApplication()
+        val input = VoiceInput(app, VoiceModels(app))
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            val stops = AtomicInteger()
+            val result = executor.submit<String> { input.listen(null, { false }) { if (it == "正在识别") stops.incrementAndGet() } }
+            val speech = systemSpeech()
+            speech.triggerOnReadyForSpeech(Bundle())
+            for (i in 1..8) {
+                speech.triggerOnPartialResults(speechWords("正在继续说话".repeat(i)))
+                org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofMillis(1200))
+                Thread.sleep(60)
+                shadowOf(Looper.getMainLooper()).idle()
+                assertEquals(0, stops.get())
+                assertFalse(result.isDone)
+            }
+            speech.triggerOnResults(speechWords("完整的长问题"))
+            assertEquals("完整的长问题", speechResult(result))
+            for (word in listOf("好", "不", "停")) {
+                val next = executor.submit<String> { input.listen(null, { false }) {} }
+                systemSpeech().triggerOnResults(speechWords(word))
+                assertEquals(word, speechResult(next))
+            }
+            val noise = executor.submit<String> { input.listen(null, { false }, allowEmpty = true) {} }
+            systemSpeech().triggerOnResults(speechWords("嗯"))
+            assertEquals("", speechResult(noise))
+        } finally { input.close(); executor.shutdownNow(); shadowOf(Looper.getMainLooper()).idle() }
+    }
+
+    @Test @Config(sdk = [34]) @LooperMode(LooperMode.Mode.PAUSED)
+    fun voiceSystemSpeechNewWordsInvalidateAQueuedStopBeforeItReachesTheMainThread() {
+        enableSystemSpeech()
+        val app = RuntimeEnvironment.getApplication()
+        val input = VoiceInput(app, VoiceModels(app))
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            val stops = AtomicInteger()
+            val result = executor.submit<String> { input.listen(null, { false }) { if (it == "正在识别") stops.incrementAndGet() } }
+            val speech = systemSpeech()
+            speech.triggerOnReadyForSpeech(Bundle())
+            speech.triggerOnPartialResults(speechWords("我还在说"))
+            org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofMillis(1900))
+            val request = ReflectionHelpers.getField<Any>(input, "request")
+            val queued = ReflectionHelpers.getField<java.util.concurrent.atomic.AtomicBoolean>(request, "stopping")
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
+            while (!queued.get() && System.nanoTime() < deadline) Thread.sleep(1)
+            assertTrue("后台应已排入停止请求", queued.get())
+            // 新文字先于停止任务到达，不能被旧的停滞判断截断。
+            speechListener(speech).onPartialResults(speechWords("我还在说后面还有一部分"))
+            shadowOf(Looper.getMainLooper()).idle()
+            assertEquals(0, stops.get())
+            assertFalse(queued.get())
+            assertFalse(result.isDone)
+            speech.triggerOnResults(speechWords("我还在说后面还有一部分。"))
+            assertEquals("我还在说后面还有一部分。", speechResult(result))
+        } finally { input.close(); executor.shutdownNow(); shadowOf(Looper.getMainLooper()).idle() }
+    }
+
+    @Test @Config(sdk = [34]) @LooperMode(LooperMode.Mode.PAUSED)
+    fun voiceSystemSpeechStopHasAFixedFinalDeadlineDespiteRepeatedEndAndNoise() {
+        enableSystemSpeech()
+        val app = RuntimeEnvironment.getApplication()
+        val input = VoiceInput(app, VoiceModels(app))
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            val stops = AtomicInteger()
+            val result = executor.submit<String> { input.listen(null, { false }) { if (it == "正在识别") stops.incrementAndGet() } }
+            val speech = systemSpeech()
+            speech.triggerOnReadyForSpeech(Bundle())
+            speech.triggerOnPartialResults(speechWords("说完了请提交"))
+            org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofMillis(1900))
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
+            while (stops.get() == 0 && System.nanoTime() < deadline) {
+                shadowOf(Looper.getMainLooper()).idle(); Thread.sleep(1)
+            }
+            assertEquals(1, stops.get())
+            org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofMillis(4000))
+            speech.triggerOnEndOfSpeech()
+            speech.triggerOnPartialResults(speechWords("说完了请提交。"))
+            speech.triggerOnRmsChanged(45f)
+            org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofMillis(1100))
+            val failure = assertThrows(java.util.concurrent.ExecutionException::class.java) { speechResult(result) }
+            assertTrue(failure.cause!!.message!!.contains("识别超时"))
+            assertTrue(speech.isDestroyed)
+        } finally { input.close(); executor.shutdownNow(); shadowOf(Looper.getMainLooper()).idle() }
+    }
+
+    @Test @Config(sdk = [34]) @LooperMode(LooperMode.Mode.PAUSED)
+    fun voiceSystemSpeechWaitsForTheFinalResultWhenTheServiceEndsNearTheNoInputDeadline() {
+        enableSystemSpeech()
+        val app = RuntimeEnvironment.getApplication()
+        val input = VoiceInput(app, VoiceModels(app))
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            val result = executor.submit<String> { input.listen(null, { false }, allowEmpty = true,
+                echoText = { "助手的播报" }) {} }
+            val speech = systemSpeech()
+            speech.triggerOnReadyForSpeech(Bundle())
+            speech.triggerOnPartialResults(speechWords("助手的播报"))
+            org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofMillis(4500))
+            speech.triggerOnEndOfSpeech()
+            org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofMillis(1000))
+            Thread.sleep(75)
+            shadowOf(Looper.getMainLooper()).idle()
+            assertFalse("服务已结束收音时，应保留最终结果等待窗口", result.isDone)
+            speech.triggerOnResults(speechWords("用户实际说出的完整问题"))
+            assertEquals("用户实际说出的完整问题", speechResult(result))
+        } finally { input.close(); executor.shutdownNow(); shadowOf(Looper.getMainLooper()).idle() }
+    }
+
+    @Test @Config(sdk = [34]) @LooperMode(LooperMode.Mode.PAUSED)
+    fun voiceSystemSpeechEchoAndPunctuationDoNotDisableTheNoInputDeadline() {
+        enableSystemSpeech()
+        val app = RuntimeEnvironment.getApplication()
+        val input = VoiceInput(app, VoiceModels(app))
+        val executor = Executors.newSingleThreadExecutor()
+        val calls = AtomicInteger()
+        try {
+            val result = executor.submit<String> { input.listen(null, { false }, allowEmpty = true,
+                echoText = { "助手正在播报的文字" }, onSpeech = { calls.incrementAndGet() }) {} }
+            val speech = systemSpeech()
+            speech.triggerOnReadyForSpeech(Bundle())
+            repeat(3) {
+                speechListener(speech).onBeginningOfSpeech()
+                speech.triggerOnPartialResults(speechWords("助手正在播报的文字"))
+                speech.triggerOnPartialResults(speechWords("……"))
+                speech.triggerOnRmsChanged(40f)
+                org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofSeconds(2))
+            }
+            assertEquals("", speechResult(result))
+            assertEquals(0, calls.get())
+            assertTrue(speech.isDestroyed)
+        } finally { input.close(); executor.shutdownNow(); shadowOf(Looper.getMainLooper()).idle() }
+    }
+
+    @Test @Config(sdk = [26, 34]) @LooperMode(LooperMode.Mode.PAUSED)
+    fun voiceSystemSpeechConfirmsWordsBeforeNotifyingOnceAndKeepsListening() {
+        enableSystemSpeech()
+        val app = RuntimeEnvironment.getApplication()
+        val input = VoiceInput(app, VoiceModels(app))
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            for (first in listOf("begin", "partial", "final")) {
+                val calls = AtomicInteger()
+                val result = executor.submit<String> {
+                    input.listen(null, { false }, onSpeech = {
+                        assertEquals(Looper.getMainLooper(), Looper.myLooper())
+                        calls.incrementAndGet()
+                    }) {}
+                }
+                val speech = systemSpeech()
+                speech.triggerOnReadyForSpeech(Bundle())
+                speech.triggerOnRmsChanged(30f)
+                assertEquals(0, calls.get())
+                if (first == "begin") {
+                    speechListener(speech).onBeginningOfSpeech()
+                    assertEquals(0, calls.get())
+                    assertFalse(result.isDone)
+                    assertFalse(speech.isDestroyed)
+                }
+                if (first != "final") {
+                    speech.triggerOnPartialResults(speechWords("等一下"))
+                    assertEquals(0, calls.get())
+                    org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofMillis(350))
+                    speech.triggerOnPartialResults(speechWords("等一下，我还有问题"))
+                    assertEquals(1, calls.get())
+                    assertFalse(result.isDone)
+                    assertFalse(speech.isDestroyed)
+                }
+                speech.triggerOnResults(speechWords("  等一下，我还有问题。  "))
+                assertEquals("等一下，我还有问题。", speechResult(result))
+                assertEquals(1, calls.get())
+                assertTrue(speech.isDestroyed)
+                speechListener(speech).onBeginningOfSpeech()
+                speech.triggerOnPartialResults(speechWords("迟到的文字"))
+                assertEquals(1, calls.get())
+            }
+        } finally { input.close(); executor.shutdownNow(); shadowOf(Looper.getMainLooper()).idle() }
+    }
+
+    @Test @Config(sdk = [26, 34]) @LooperMode(LooperMode.Mode.PAUSED)
+    fun voiceSystemSpeechDoesNotInterruptForAssistantEchoOrVolume() {
+        enableSystemSpeech()
+        val app = RuntimeEnvironment.getApplication()
+        val input = VoiceInput(app, VoiceModels(app))
+        val executor = Executors.newSingleThreadExecutor()
+        val calls = AtomicInteger()
+        try {
+            val result = executor.submit<String> {
+                input.listen(null, { false }, allowEmpty = true, onSpeech = { calls.incrementAndGet() },
+                    echoText = { "你好，我可以帮你查看今天的日程。" }) {}
+            }
+            val speech = systemSpeech()
+            speech.triggerOnReadyForSpeech(Bundle())
+            speechListener(speech).onBeginningOfSpeech()
+            speech.triggerOnRmsChanged(100f)
+            speech.triggerOnPartialResults(speechWords("你好 我可以帮你查看"))
+            speech.triggerOnPartialResults(speechWords("我可以帮你查询今天的日程"))
+            assertEquals(0, calls.get())
+            assertFalse(result.isDone)
+            speech.triggerOnResults(speechWords("你好我可以帮你查看今天的日程"))
+            assertEquals("", speechResult(result))
+            assertEquals(0, calls.get())
+            assertTrue(speech.isDestroyed)
+        } finally { input.close(); executor.shutdownNow(); shadowOf(Looper.getMainLooper()).idle() }
+    }
+
+    @Test @Config(sdk = [26, 34]) @LooperMode(LooperMode.Mode.PAUSED)
+    fun voiceSystemSpeechInterruptsOnUserPartialAndKeepsTheEntireFinalQuestion() {
+        enableSystemSpeech()
+        val app = RuntimeEnvironment.getApplication()
+        val input = VoiceInput(app, VoiceModels(app))
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            for (partial in listOf(true, false)) {
+                val echo = AtomicReference("我可以帮你查看今天的日程")
+                val calls = AtomicInteger()
+                val result = executor.submit<String> {
+                    input.listen(null, { false }, onSpeech = { calls.incrementAndGet(); echo.set("") }, echoText = echo::get) {}
+                }
+                val speech = systemSpeech()
+                speech.triggerOnReadyForSpeech(Bundle())
+                speechListener(speech).onBeginningOfSpeech()
+                if (partial) speech.triggerOnPartialResults(speechWords("我可以帮你查看今天的日程"))
+                assertEquals(0, calls.get())
+                if (partial) {
+                    speech.triggerOnPartialResults(speechWords("等一下，先告诉我"))
+                    assertEquals(0, calls.get())
+                    org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofMillis(350))
+                    speech.triggerOnPartialResults(speechWords("等一下，先告诉我"))
+                    assertEquals(1, calls.get())
+                    assertEquals("", echo.get())
+                    assertFalse(result.isDone)
+                    assertFalse(speech.isDestroyed)
+                    speech.triggerOnPartialResults(speechWords("我可以帮你查看今天的日程"))
+                    speechListener(speech).onBeginningOfSpeech()
+                    assertEquals(1, calls.get())
+                } else {
+                    // 仅提供最终结果的服务中，已经开始说话不能再按静音超时截断。
+                    org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofSeconds(6))
+                    Thread.sleep(75)
+                    shadowOf(Looper.getMainLooper()).idle()
+                    assertFalse(result.isDone)
+                    assertFalse(speech.isDestroyed)
+                }
+                speech.triggerOnResults(speechWords("等一下，先告诉我明天的安排。"))
+                assertEquals("等一下，先告诉我明天的安排。", speechResult(result))
+                assertEquals(1, calls.get())
+            }
+        } finally { input.close(); executor.shutdownNow(); shadowOf(Looper.getMainLooper()).idle() }
+    }
+
+    @Test @Config(sdk = [34]) @LooperMode(LooperMode.Mode.PAUSED)
+    fun voiceSystemSpeechRemovesOnlyTheEchoPrefixFromAMixedFinalResult() {
+        enableSystemSpeech()
+        val app = RuntimeEnvironment.getApplication()
+        val input = VoiceInput(app, VoiceModels(app))
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            for ((heard, question) in listOf(
+                "查看今天的日程。等一下先看天气。" to "等一下先看天气。",
+                "我可以帮你查看今天的日程。停下" to "停下",
+            )) {
+                val calls = AtomicInteger()
+                val echo = AtomicReference("我可以帮你查看今天的日程")
+                val result = executor.submit<String> {
+                    input.listen(null, { false }, onSpeech = { calls.incrementAndGet(); echo.set("") }, echoText = echo::get) {}
+                }
+                val speech = systemSpeech()
+                speech.triggerOnPartialResults(speechWords(heard))
+                org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofMillis(350))
+                speech.triggerOnPartialResults(speechWords(heard))
+                assertEquals(1, calls.get())
+                assertFalse(result.isDone)
+                speech.triggerOnResults(speechWords(heard))
+                assertEquals(question, speechResult(result))
+                assertEquals(1, calls.get())
+            }
+        } finally { input.close(); executor.shutdownNow(); shadowOf(Looper.getMainLooper()).idle() }
+    }
+
+    @Test @Config(sdk = [34]) @LooperMode(LooperMode.Mode.PAUSED)
+    fun voiceSystemSpeechExpiresEchoHistorySoAUserCanRepeatTheAssistant() {
+        enableSystemSpeech()
+        val app = RuntimeEnvironment.getApplication()
+        val input = VoiceInput(app, VoiceModels(app))
+        val executor = Executors.newSingleThreadExecutor()
+        val calls = AtomicInteger()
+        val first = "我可以帮你查看今天的日程"
+        val second = "下午三点需要参加会议"
+        val echo = AtomicReference(first)
+        try {
+            val result = executor.submit<String> {
+                input.listen(null, { false }, onSpeech = { calls.incrementAndGet() }, echoText = echo::get) {}
+            }
+            val speech = systemSpeech()
+            speech.triggerOnReadyForSpeech(Bundle())
+            echo.set(second)
+            speech.triggerOnPartialResults(speechWords(first))
+            echo.set("")
+            speech.triggerOnPartialResults(speechWords(second))
+            assertEquals(0, calls.get())
+            org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofSeconds(3))
+            speech.triggerOnPartialResults(speechWords(first))
+            assertEquals(0, calls.get())
+            org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofMillis(350))
+            speech.triggerOnPartialResults(speechWords(first))
+            assertEquals(1, calls.get())
+            assertFalse(result.isDone)
+            speech.triggerOnResults(speechWords(first))
+            assertEquals(first, speechResult(result))
+        } finally { input.close(); executor.shutdownNow(); shadowOf(Looper.getMainLooper()).idle() }
+    }
+
+    @Test @Config(sdk = [34]) @LooperMode(LooperMode.Mode.PAUSED)
+    fun voiceSystemSpeechGuardsPlaybackTailAndRequiresConfirmedUserWords() {
+        enableSystemSpeech()
+        val app = RuntimeEnvironment.getApplication()
+        val input = VoiceInput(app, VoiceModels(app))
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            for (partial in listOf(false, true)) {
+                val calls = AtomicInteger()
+                val echo = AtomicReference("我可以帮你查看今天的日程")
+                val result = executor.submit<String> {
+                    input.listen(null, { false }, onSpeech = { calls.incrementAndGet() }, echoText = echo::get) {}
+                }
+                val speech = systemSpeech()
+                speech.triggerOnReadyForSpeech(Bundle())
+                echo.set("")
+                speechListener(speech).onBeginningOfSpeech()
+                speech.triggerOnPartialResults(speechWords("我可以帮你查看今天的日程"))
+                assertEquals(0, calls.get())
+                if (partial) {
+                    speech.triggerOnPartialResults(speechWords("请先帮我看天气"))
+                    assertEquals(0, calls.get())
+                    org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofMillis(350))
+                    speech.triggerOnPartialResults(speechWords("请先帮我看天气"))
+                }
+                else {
+                    org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofMillis(600))
+                    speechListener(speech).onBeginningOfSpeech()
+                }
+                assertEquals(if (partial) 1 else 0, calls.get())
+                assertFalse(result.isDone)
+                speech.triggerOnResults(speechWords("请先帮我看天气"))
+                assertEquals("请先帮我看天气", speechResult(result))
+                assertEquals(1, calls.get())
+            }
+        } finally { input.close(); executor.shutdownNow(); shadowOf(Looper.getMainLooper()).idle() }
+    }
+
+    @Test @Config(sdk = [34]) @LooperMode(LooperMode.Mode.PAUSED)
+    fun voiceSystemSpeechReturnsEmptyForSilenceAndEchoNoMatchAndCanRestart() {
+        enableSystemSpeech()
+        val app = RuntimeEnvironment.getApplication()
+        val input = VoiceInput(app, VoiceModels(app))
+        val executor = Executors.newSingleThreadExecutor()
+        val calls = AtomicInteger()
+        try {
+            for (echo in listOf("", "我可以帮你查看今天的日程")) {
+                val result = executor.submit<String> {
+                    input.listen(null, { false }, timeoutSeconds = 1, allowEmpty = true,
+                        onSpeech = { calls.incrementAndGet() }, echoText = { echo }) {}
+                }
+                val speech = systemSpeech()
+                speech.triggerOnReadyForSpeech(Bundle())
+                if (echo.isNotEmpty()) {
+                    speechListener(speech).onBeginningOfSpeech()
+                    speech.triggerOnPartialResults(speechWords(echo))
+                    speech.triggerOnError(SpeechRecognizer.ERROR_NO_MATCH)
+                } else org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofSeconds(2))
+                assertEquals("", speechResult(result))
+                assertEquals(0, calls.get())
+                assertTrue(speech.isDestroyed)
+            }
+            val next = executor.submit<String> { input.listen(null, { false }, onSpeech = { calls.incrementAndGet() }) {} }
+            systemSpeech().triggerOnResults(speechWords("重新监听的问题"))
+            assertEquals("重新监听的问题", speechResult(next))
+            assertEquals(1, calls.get())
+        } finally { input.close(); executor.shutdownNow(); shadowOf(Looper.getMainLooper()).idle() }
+    }
+
+    @Test @Config(sdk = [26, 34]) @LooperMode(LooperMode.Mode.PAUSED)
+    fun voiceSystemSpeechIgnoresLateBeginPartialFinalAndLevelsAfterCancellation() {
+        enableSystemSpeech()
+        val app = RuntimeEnvironment.getApplication()
+        val input = VoiceInput(app, VoiceModels(app))
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            for (stop in listOf(true, false)) {
+                val cancelled = java.util.concurrent.atomic.AtomicBoolean(false)
+                val calls = AtomicInteger()
+                val levels = AtomicInteger()
+                val result = executor.submit<String> {
+                    input.listen(null, cancelled::get, onSpeech = { calls.incrementAndGet() },
+                        onLevel = { if (it > 0f) levels.incrementAndGet() }) {}
+                }
+                val speech = systemSpeech()
+                if (stop) input.stop() else cancelled.set(true)
+                speechListener(speech).onBeginningOfSpeech()
+                speech.triggerOnPartialResults(speechWords("取消后的中间结果"))
+                speech.triggerOnResults(speechWords("取消后的最终结果"))
+                speech.triggerOnRmsChanged(20f)
+                val failure = assertThrows(java.util.concurrent.ExecutionException::class.java) { speechResult(result) }
+                assertTrue(failure.cause is java.util.concurrent.CancellationException)
+                assertEquals(0, calls.get())
+                assertEquals(0, levels.get())
+                assertTrue(speech.isDestroyed)
+                val next = executor.submit<String> { input.listen(null, { false }, onSpeech = { calls.incrementAndGet() }) {} }
+                val nextSpeech = systemSpeech(speech)
+                speechListener(speech).onBeginningOfSpeech()
+                speech.triggerOnPartialResults(speechWords("上一轮迟到结果"))
+                assertEquals(0, calls.get())
+                nextSpeech.triggerOnResults(speechWords("下一轮有效问题"))
+                assertEquals("下一轮有效问题", speechResult(next))
+                assertEquals(1, calls.get())
+            }
+        } finally { input.close(); executor.shutdownNow(); shadowOf(Looper.getMainLooper()).idle() }
+    }
+
+    @Test @Config(sdk = [34]) @LooperMode(LooperMode.Mode.PAUSED)
+    fun voiceSystemSpeechNotifiesOnlyOnceAcrossServiceFallback() {
+        enableSystemSpeech()
+        ShadowSpeechRecognizer.setIsOnDeviceRecognitionAvailable(true)
+        val app = RuntimeEnvironment.getApplication()
+        val input = VoiceInput(app, VoiceModels(app))
+        val executor = Executors.newSingleThreadExecutor()
+        val calls = AtomicInteger()
+        try {
+            val result = executor.submit<String> { input.listen(null, { false }, onSpeech = { calls.incrementAndGet() }) {} }
+            val device = systemSpeech()
+            speechListener(device).onBeginningOfSpeech()
+            assertEquals(0, calls.get())
+            device.triggerOnPartialResults(speechWords("已确认的用户提问"))
+            org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofMillis(350))
+            device.triggerOnPartialResults(speechWords("已确认的用户提问"))
+            assertEquals(1, calls.get())
+            device.triggerOnError(SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE)
+            val fallback = systemSpeech(device)
+            speechListener(device).onBeginningOfSpeech()
+            device.triggerOnPartialResults(speechWords("旧服务迟到文字"))
+            speechListener(fallback).onBeginningOfSpeech()
+            fallback.triggerOnPartialResults(speechWords("新的问题开头"))
+            assertEquals(1, calls.get())
+            assertFalse(result.isDone)
+            fallback.triggerOnResults(speechWords("新的问题开头和完整结尾"))
+            assertEquals("新的问题开头和完整结尾", speechResult(result))
+            assertEquals(1, calls.get())
+        } finally { input.close(); executor.shutdownNow(); shadowOf(Looper.getMainLooper()).idle() }
+    }
+
+    @Test fun voiceSystemSpeechAvailabilityRefreshAndMigrationKeepOtherModels() {
+        ShadowSpeechRecognizer.setIsOnDeviceRecognitionAvailable(false)
+        val app = RuntimeEnvironment.getApplication()
+        val root = folder.newFolder()
+        val context = object : ContextWrapper(app) { override fun getFilesDir() = root }
+        for (name in listOf("speech-20240717", "speech-20240717.new", "wake-20251220-1", "local-50968a44", "custom-model")) {
+            File(root, "voice/models/$name").mkdirs()
+            File(root, "voice/models/$name/keep").writeText("model")
+        }
+        File(root, "voice/models/wake-20251220-1/silero_vad.onnx").writeText("old vad")
+        val voice = VoiceControl(context, Engine(context))
+        assertFalse(voice.state.speechAvailable)
+        enableSystemSpeech()
+        voice.refreshSpeech()
+        assertTrue(voice.state.speechAvailable)
+        assertFalse(File(root, "voice/models/speech-20240717").exists())
+        assertFalse(File(root, "voice/models/speech-20240717.new").exists())
+        assertFalse(File(root, "voice/models/wake-20251220-1/silero_vad.onnx").exists())
+        for (name in listOf("wake-20251220-1", "local-50968a44", "custom-model")) assertEquals("model", File(root, "voice/models/$name/keep").readText())
+        val catalog = JSONObject(app.assets.open("voice/models.json").bufferedReader().use { it.readText() })
+        assertFalse(catalog.has("speech"))
+        assertTrue(catalog.has("wake"))
+        assertTrue(catalog.has("local"))
+        assertFalse(catalog.getJSONObject("wake").toString().contains("silero_vad"))
     }
 
     @Test fun chatUrlOpensTheVoiceSessionAndKeepsInstanceAuthentication() {
@@ -635,6 +1416,271 @@ class CoreTest {
         assertEquals("test-token", url.getQueryParameter("token"))
         assertEquals("session-1", url.getQueryParameter("dshx-session"))
         assertTrue(MainActivity.sameOrigin(instance, url.toString()))
+    }
+
+    @Test fun voiceSpeechInterruptDefaultsOnIndependentlyOfTheLegacyWakeSwitch() {
+        val app = RuntimeEnvironment.getApplication()
+        val preferences = app.getSharedPreferences("voice", 0)
+        preferences.edit().remove("speechInterrupt").putBoolean("interrupt", false).commit()
+        try {
+            val voice = VoiceControl(app, Engine(app))
+            assertTrue(voice.interrupt)
+            voice.interrupt = false
+            assertFalse(VoiceControl(app, Engine(app)).interrupt)
+            voice.interrupt = true
+            assertTrue(VoiceControl(app, Engine(app)).interrupt)
+            assertFalse(preferences.getBoolean("interrupt", true))
+        } finally { preferences.edit().remove("speechInterrupt").remove("interrupt").commit() }
+    }
+
+    @Test fun voiceStreamingTextStartsWithAShortSentenceAndKeepsSplitCodeAndLinksOutOfSpeech() {
+        val text = VoiceControl.SpeechText()
+        assertEquals("你好，", text.add("你好，"))
+        assertNull(text.take())
+        text.add("我来帮你。后面的回答还在生成")
+        assertEquals("你好，我来帮你。", text.take())
+        assertNull(text.take())
+        text.add("，不需要等整篇完成。\n`")
+        assertEquals("后面的回答还在生成，不需要等整篇完成。", text.take())
+        text.add("``kotlin\nsecret = \"不能朗读的代码\"\n``")
+        text.add("`请查看[说明](https://example.com/private)，然后继续🙂。")
+        text.finish("你好，我来帮你。后面的回答还在生成，不需要等整篇完成。\n```kotlin\nsecret = \"不能朗读的代码\"\n```请查看[说明](https://example.com/private)，然后继续🙂。")
+        val spoken = generateSequence { text.take(true) }.joinToString("")
+        assertTrue(spoken.contains("代码请查看聊天界面"))
+        assertTrue(spoken.contains("请查看说明，然后继续🙂。"))
+        assertFalse(spoken.contains("secret"))
+        assertFalse(spoken.contains("kotlin"))
+        assertFalse(spoken.contains("https"))
+        assertThrows(IllegalStateException::class.java) { text.add("迟到文字") }
+    }
+
+    @Test fun voiceStreamingTextFlushesWithoutPunctuationAndNeverReplaysTheFinalAnswer() {
+        val text = VoiceControl.SpeechText()
+        val opening = "这是一段没有标点但已经可以朗读的回答🙂"
+        text.add(opening)
+        assertNull(text.take())
+        assertEquals(opening, text.take(true))
+        text.finish(opening + "最后补充。")
+        assertEquals("最后补充。", text.take())
+        assertNull(text.take(true))
+        val code = VoiceControl.SpeechText()
+        code.add("```python\n不应读出的未闭合代码")
+        code.finish("```python\n不应读出的未闭合代码")
+        val spoken = generateSequence { code.take(true) }.joinToString("")
+        assertFalse(spoken.contains("未闭合代码"))
+        val long = VoiceControl.SpeechText()
+        long.add("🙂".repeat(4050))
+        long.finish("🙂".repeat(4000))
+        val all = generateSequence { long.take(true) }.joinToString("")
+        assertEquals(4000, all.codePointCount(0, all.length))
+        assertEquals("🙂".repeat(4000), all)
+    }
+
+    @Test fun voiceBridgeDeliversOnlyMatchingDeltasBeforeTheFinalReplyAndIgnoresLateEvents() {
+        val policy = ToolPolicy().apply { begin("stream-instance") }
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            PolicyBridge(policy, "stream-instance") {}.use { bridge ->
+                bridge.start()
+                Socket("127.0.0.1", bridge.port).use { socket ->
+                    socket.soTimeout = 3000
+                    val reader = socket.getInputStream().bufferedReader()
+                    fun send(value: JSONObject) { socket.getOutputStream().apply { write((value.toString() + "\n").toByteArray()); flush() } }
+                    fun read() = JSONObject(reader.readLine())
+                    send(JSONObject().put("version", 1).put("instance", bridge.instance).put("token", bridge.token))
+                    assertTrue(read().getBoolean("ok"))
+                    val received = java.util.concurrent.CopyOnWriteArrayList<String>()
+                    val first = CountDownLatch(1)
+                    val result = executor.submit<JSONObject> {
+                        bridge.voice("prompt", JSONObject().put("interaction", "round-1")) { event ->
+                            received.add(event.getString("text")); first.countDown()
+                        }
+                    }
+                    val id = read().getString("voice")
+                    fun event(key: String, text: String) = JSONObject().put("voice", key)
+                        .put("event", JSONObject().put("session", "session-1").put("text", text))
+                    send(event("another-request", "其他轮次"))
+                    send(event(id, "先收到的回答。"))
+                    assertTrue(first.await(3, TimeUnit.SECONDS))
+                    assertFalse(result.isDone)
+                    assertEquals(listOf("先收到的回答。"), received.toList())
+                    send(JSONObject().put("voice", id).put("ok", true).put("result", JSONObject().put("text", "完整回答")))
+                    assertEquals("完整回答", result.get(3, TimeUnit.SECONDS).getString("text"))
+                    send(event(id, "结束后迟到"))
+                    send(JSONObject().put("id", 1).put("method", "register").put("session", "live").put("title", "仍连接"))
+                    assertTrue(read().getBoolean("ok"))
+                    assertEquals(listOf("先收到的回答。"), received.toList())
+                }
+            }
+        } finally { executor.shutdownNow() }
+    }
+
+    @Test @LooperMode(LooperMode.Mode.PAUSED)
+    fun voiceManualInterruptCancelsGenerationAndKeepsThePartialReplyAndSession() {
+        val app = RuntimeEnvironment.getApplication()
+        val root = folder.newFolder()
+        val context = object : ContextWrapper(app) { override fun getFilesDir() = root }
+        context.getSharedPreferences("voice-output", 0).edit().clear().commit()
+        val policy = ToolPolicy().apply { begin("interrupt-instance") }
+        PolicyBridge(policy, "interrupt-instance") {}.use { bridge ->
+            bridge.start()
+            Socket("127.0.0.1", bridge.port).use { socket ->
+                socket.soTimeout = 3000
+                val reader = socket.getInputStream().bufferedReader()
+                fun send(value: JSONObject) { socket.getOutputStream().apply { write((value.toString() + "\n").toByteArray()); flush() } }
+                fun read() = JSONObject(reader.readLine())
+                fun awaitState(voice: VoiceControl, ready: () -> Boolean) {
+                    val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(4)
+                    while (!ready() && System.nanoTime() < deadline) {
+                        shadowOf(Looper.getMainLooper()).idle(); Thread.sleep(1)
+                    }
+                    assertTrue("语音状态未及时更新：${voice.state}", ready())
+                }
+                send(JSONObject().put("version", 1).put("instance", bridge.instance).put("token", bridge.token))
+                assertTrue(read().getBoolean("ok"))
+                val engine = Engine(context)
+                ReflectionHelpers.setField(engine, "bridge", bridge)
+                ReflectionHelpers.setField(engine, "state", EngineState(url = "http://127.0.0.1:3080/"))
+                val voice = VoiceControl(context, engine)
+                voice.draft("请回答")
+                voice.start("send")
+                val prompt = read()
+                val event = JSONObject().put("session", "created-session").put("text", "还没有生成完")
+                send(JSONObject().put("voice", prompt.getString("voice")).put("event", event))
+                awaitState(voice) { voice.state.turns.lastOrNull()?.reply == "还没有生成完" && voice.state.canInterrupt }
+                voice.interruptAnswer()
+                val cancel = read()
+                assertEquals("cancel", cancel.getString("action"))
+                assertEquals(prompt.getJSONObject("data").getString("interaction"), cancel.getJSONObject("data").getString("interaction"))
+                send(JSONObject().put("voice", cancel.getString("voice")).put("ok", true).put("result", JSONObject().put("cancelled", true)))
+                send(JSONObject().put("voice", prompt.getString("voice")).put("event", event.put("text", "取消后迟到")))
+                awaitState(voice) { !voice.state.active }
+                assertEquals("created-session", voice.state.session)
+                assertEquals("还没有生成完", voice.state.turns.single().reply)
+                assertTrue(voice.state.turns.single().interrupted)
+                assertFalse(voice.state.canInterrupt)
+                assertNull(voice.state.error)
+            }
+        }
+    }
+
+    @Test @Config(sdk = [26, 34]) @LooperMode(LooperMode.Mode.PAUSED)
+    fun voiceMonitorFailureKeepsGenerationAndManualInterruptionStartsANewListen() {
+        enableSystemSpeech()
+        val app = RuntimeEnvironment.getApplication()
+        for (manualFirst in listOf(false, true)) {
+            val root = folder.newFolder()
+            val context = object : ContextWrapper(app) { override fun getFilesDir() = root }
+            context.getSharedPreferences("voice-output", 0).edit().clear().commit()
+            val policy = ToolPolicy().apply { begin("monitor-instance") }
+            PolicyBridge(policy, "monitor-instance") {}.use { bridge ->
+                bridge.start()
+                Socket("127.0.0.1", bridge.port).use { socket ->
+                    socket.soTimeout = 3000
+                    val reader = socket.getInputStream().bufferedReader()
+                    val readerWorker = Executors.newSingleThreadExecutor()
+                    fun send(value: JSONObject) {
+                        socket.getOutputStream().apply { write((value.toString() + "\n").toByteArray()); flush() }
+                    }
+                    fun read(): JSONObject = speechResult(readerWorker.submit<JSONObject> { JSONObject(reader.readLine()) })
+                    val engine = Engine(context)
+                    ReflectionHelpers.setField(engine, "bridge", bridge)
+                    ReflectionHelpers.setField(engine, "state", EngineState(url = "http://127.0.0.1:3080/"))
+                    val voice = VoiceControl(context, engine)
+                    val savedInterrupt = voice.interrupt
+                    val savedLocal = voice.local
+                    fun awaitState(ready: () -> Boolean) {
+                        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(4)
+                        while (!ready() && System.nanoTime() < deadline) {
+                            shadowOf(Looper.getMainLooper()).idle()
+                            Thread.sleep(1)
+                        }
+                        assertTrue("语音状态未及时更新，先手动打断=$manualFirst：${voice.state}", ready())
+                    }
+                    fun delta(request: JSONObject, text: String) = JSONObject().put("voice", request.getString("voice"))
+                        .put("event", JSONObject().put("session", "monitor-session").put("text", text))
+                    try {
+                        send(JSONObject().put("version", 1).put("instance", bridge.instance).put("token", bridge.token))
+                        assertTrue(read().getBoolean("ok"))
+                        voice.interrupt = true
+                        voice.local = false
+                        voice.start("talk")
+                        val firstInput = systemSpeech()
+                        firstInput.triggerOnReadyForSpeech(Bundle())
+                        firstInput.triggerOnResults(speechWords("第一个问题"))
+                        val monitor = systemSpeech(firstInput)
+                        monitor.triggerOnReadyForSpeech(Bundle())
+                        val prompt = read()
+                        assertEquals("prompt", prompt.getString("action"))
+                        assertEquals("第一个问题", prompt.getJSONObject("data").getString("text"))
+                        // 保持短于无标点播报阈值，使交接测试不依赖在线合成服务。
+                        send(delta(prompt, "生成"))
+                        awaitState { voice.state.canInterrupt && voice.state.autoInterrupt && voice.state.turns.singleOrNull()?.reply == "生成" }
+                        if (manualFirst) voice.interruptAnswer()
+                        monitor.triggerOnError(SpeechRecognizer.ERROR_NETWORK)
+                        if (!manualFirst) {
+                            awaitState { !voice.state.autoInterrupt }
+                            assertTrue(voice.state.active)
+                            assertTrue(voice.state.canInterrupt)
+                            assertEquals(VoiceControl.Phase.Answering, voice.state.phase)
+                            assertFalse(voice.state.turns.single().interrupted)
+                            assertFalse(voice.state.turns.single().incomplete)
+                            assertNull(voice.state.error)
+                            send(delta(prompt, "继续"))
+                            awaitState { voice.state.turns.singleOrNull()?.reply == "生成继续" }
+                            // 同一连接上的查询回执充当屏障，确认识别失败没有发出生成取消。
+                            send(JSONObject().put("id", 7).put("method", "register").put("session", "monitor-session").put("title", "语音"))
+                            assertEquals(7, read().getInt("id"))
+                            voice.interruptAnswer()
+                        }
+                        val cancel = read()
+                        assertEquals("cancel", cancel.getString("action"))
+                        assertEquals(prompt.getJSONObject("data").getString("interaction"), cancel.getJSONObject("data").getString("interaction"))
+                        send(JSONObject().put("voice", cancel.getString("voice")).put("ok", true)
+                            .put("result", JSONObject().put("cancelled", true)))
+                        val nextInput = systemSpeech(monitor)
+                        assertTrue(monitor.isDestroyed)
+                        monitor.triggerOnResults(speechWords("旧识别结果"))
+                        send(delta(prompt, "取消后迟到"))
+                        send(JSONObject().put("voice", prompt.getString("voice")).put("ok", false).put("error", "旧轮次已取消"))
+                        nextInput.triggerOnReadyForSpeech(Bundle())
+                        nextInput.triggerOnPartialResults(speechWords("第二个"))
+                        shadowOf(Looper.getMainLooper()).idle()
+                        assertEquals(1, voice.state.turns.size)
+                        nextInput.triggerOnResults(speechWords("第二个问题"))
+                        val nextPrompt = read()
+                        assertEquals("prompt", nextPrompt.getString("action"))
+                        assertEquals("第二个问题", nextPrompt.getJSONObject("data").getString("text"))
+                        assertEquals("monitor-session", nextPrompt.getJSONObject("data").getString("session"))
+                        assertNotEquals(prompt.getString("voice"), nextPrompt.getString("voice"))
+                        assertNotEquals(prompt.getJSONObject("data").getString("interaction"), nextPrompt.getJSONObject("data").getString("interaction"))
+                        val nextMonitor = systemSpeech(nextInput)
+                        nextMonitor.triggerOnReadyForSpeech(Bundle())
+                        monitor.triggerOnError(SpeechRecognizer.ERROR_AUDIO)
+                        send(delta(nextPrompt, "新回答"))
+                        awaitState { voice.state.turns.size == 2 && voice.state.turns.last().reply == "新回答" && voice.state.autoInterrupt }
+                        assertTrue(voice.state.active)
+                        assertTrue(voice.state.canInterrupt)
+                        assertEquals(listOf("第一个问题", "第二个问题"), voice.state.turns.map { it.text })
+                        assertEquals(if (manualFirst) "生成" else "生成继续", voice.state.turns.first().reply)
+                        assertTrue(voice.state.turns.first().interrupted)
+                        assertFalse(voice.state.turns.first().incomplete)
+                        assertFalse(voice.state.turns.last().interrupted)
+                        assertFalse(voice.state.turns.last().incomplete)
+                        assertNull(voice.state.error)
+                    } finally {
+                        voice.stop()
+                        try { awaitState { !voice.state.active } }
+                        finally {
+                            voice.interrupt = savedInterrupt
+                            voice.local = savedLocal
+                            readerWorker.shutdownNow()
+                            shadowOf(Looper.getMainLooper()).idle()
+                        }
+                    }
+                }
+            }
+        }
     }
 
     @Test fun voiceSessionSwitchClearsOnlyThePreviousConversationDisplay() {
@@ -681,6 +1727,36 @@ class CoreTest {
         voice.start("talk")
         assertNotNull(voice.state.error)
         assertEquals(recognized.turns, voice.state.turns)
+    }
+
+    @Test fun voiceInputPhasesDistinguishCaptureRecognitionAndWake() {
+        val ready = VoiceControl.State(active = true, phase = VoiceControl.Phase.Preparing)
+        val listening = ready.inputStatus("正在听")
+        assertEquals(VoiceControl.Phase.Listening, listening.phase)
+        assertEquals(VoiceControl.Phase.Recognizing, listening.inputStatus("正在识别").phase)
+        assertEquals(VoiceControl.Phase.Waiting, ready.inputStatus("等待唤醒：你好小橙").phase)
+        assertEquals(VoiceControl.Phase.Preparing, ready.inputStatus("正在初始化").phase)
+        assertEquals(VoiceControl.Phase.Idle, VoiceControl.State(active = true, downloading = true).phase)
+        assertEquals(VoiceControl.Phase.Preparing, ready.phase)
+    }
+
+    @Test fun voiceVolumeUsesActualEnergyAndStopClearsTheMeter() {
+        assertEquals(0f, VoiceInput.systemVolume(Float.NaN), 0f)
+        assertEquals(0f, VoiceInput.systemVolume(-10f), 0f)
+        assertEquals(0.5f, VoiceInput.systemVolume(4f), 0.001f)
+        assertEquals(1f, VoiceInput.systemVolume(30f), 0f)
+        assertEquals(0f, VoiceInput.volume(0.0, 512), 0f)
+        assertEquals(0f, VoiceInput.volume(0.0, 0), 0f)
+        assertEquals(0.5f, VoiceInput.volume(512 * 0.125 * 0.125, 512), 0.001f)
+        assertEquals(1f, VoiceInput.volume(512.0, 512), 0f)
+        val app = RuntimeEnvironment.getApplication()
+        val voice = VoiceControl(app, Engine(app))
+        ReflectionHelpers.setField(voice, "state", VoiceControl.State(active = true, phase = VoiceControl.Phase.Listening))
+        val level = ReflectionHelpers.getField<kotlinx.coroutines.flow.MutableStateFlow<Float>>(voice, "inputLevel")
+        level.value = 0.7f
+        voice.stop()
+        assertEquals(VoiceControl.Phase.Stopping, voice.state.phase)
+        assertEquals(0f, voice.level.value, 0f)
     }
 
     @Test fun voiceModelsPublishOnlyVerifiedSetsAndRepairSameSizeDamage() {
@@ -811,7 +1887,7 @@ class CoreTest {
         store.withFile { file -> assertThrows(IllegalStateException::class.java) { store.requireMemory(file, 512) } }
     }
 
-    @Test fun voiceKeywordUsesModelPhonesAndRemovesOnlyTheLeadingWake() {
+    @Test fun voiceKeywordUsesModelPhonesAndRejectsInvalidPhrases() {
         folder.newFile("pinyin.txt").writeText("U+4F60: nǐ # 你\nU+597D: hǎo,hào # 好\nU+5C0F: xiǎo # 小\nU+6A59: chéng # 橙\nU+7A0B: chéng # 程\n")
         val tokens = folder.newFile("tokens.txt").apply { writeText("n 0\nǐ 1\nh 2\nǎo 3\nx 4\niǎo 5\nch 6\néng 7\nHH 8\nAH0 9\nL 10\nOW1 11\n") }
         val english = folder.newFile("en.phone").apply { writeText("HELLO HH AH0 L OW1\n") }
@@ -819,11 +1895,6 @@ class CoreTest {
         assertEquals("HH AH0 L OW1 @hello", VoiceInput.keyword("hello", tokens, english))
         assertThrows(IllegalArgumentException::class.java) { VoiceInput.keyword("hello\n@bad", tokens, english) }
         assertThrows(IllegalArgumentException::class.java) { VoiceInput.keyword("unknown", tokens, english) }
-        assertEquals("打开设置", VoiceInput.removeWake("  你好，小橙！打开设置", "你好小橙"))
-        assertEquals("我说你好小橙", VoiceInput.removeWake("我说你好小橙", "你好小橙"))
-        assertEquals("打开设置", VoiceInput.removeWake("你好，小程！打开设置", "你好小橙", tokens, english))
-        assertEquals("我说你好小程", VoiceInput.removeWake("我说你好小程", "你好小橙", tokens, english))
-        assertEquals("你好小橙，打开设置", VoiceInput.removeWake("你好小程！你好小橙，打开设置", "你好小橙", tokens, english))
     }
 
     @Test fun voiceOutputDefaultsIgnoreLegacyCloneAndKeepProviderCredentialsSeparate() {
@@ -836,16 +1907,23 @@ class CoreTest {
             val initial = VoiceOutput.settings(context)
             assertEquals("edge", initial.provider)
             assertEquals("zh-CN-XiaoxiaoNeural", initial.edgeVoice)
-            assertEquals("seed-tts-2.0", initial.resource)
-            assertEquals("zh_female_xiaohe_uranus_bigtts", initial.volcVoice)
+            assertEquals("seed-tts-1.0", initial.resource)
+            assertEquals("zh_female_wanwanxiaohe_moon_bigtts", initial.volcVoice)
+            assertEquals("zh_female_xiaohe_uranus_bigtts", initial.audioVoice)
             VoiceOutput(context).use { it.prepare { false } }
-            val previous = initial.copy(resource = "seed-tts-1.0", volcVoice = "zh_female_wanwanxiaohe_moon_bigtts")
+            val previous = initial.copy(resource = "seed-tts-2.0", volcVoice = "zh_female_xiaohe_uranus_bigtts")
             VoiceOutput.save(context, previous)
             assertEquals(previous, VoiceOutput.settings(context))
             val volc = initial.copy(provider = "volc", auth = "token", appId = "app-123", accessKey = "secret-value")
             VoiceOutput.save(context, volc)
             assertEquals(volc, VoiceOutput.settings(context))
             assertFalse(volc.toString().contains("secret-value"))
+            val generated = volc.copy(provider = "volc-audio", audioVoice = "custom_2_0_voice")
+            VoiceOutput.save(context, generated)
+            assertEquals(generated, VoiceOutput.settings(context))
+            assertEquals(volc.volcVoice, VoiceOutput.settings(context).volcVoice)
+            assertThrows(IllegalArgumentException::class.java) { VoiceOutput.save(context, initial.copy(provider = "volc-audio")) }
+            assertThrows(IllegalArgumentException::class.java) { VoiceOutput.save(context, generated.copy(audioVoice = "")) }
             VoiceOutput.save(context, volc.copy(provider = "edge"))
             assertEquals("secret-value", VoiceOutput.settings(context).accessKey)
             assertEquals("old-local-clone", old.getString("profile", null))
@@ -878,7 +1956,7 @@ class CoreTest {
         }
     }
 
-    @Test fun voiceEdgeWebSocketReceivesAudioOnlyAfterTurnCompletes() {
+    @Test fun voiceEdgeSynthesizeKeepsCompleteAudioCompatibility() {
         val context = RuntimeEnvironment.getApplication()
         context.getSharedPreferences("voice-output", 0).edit().clear().commit()
         val messages = java.util.concurrent.CopyOnWriteArrayList<String>()
@@ -924,6 +2002,242 @@ class CoreTest {
         } finally { worker.shutdownNow() }
     }
 
+    @Test fun voiceEdgeStreamDeliversAudioBeforeTurnEndOnCallingThread() {
+        val context = RuntimeEnvironment.getApplication()
+        context.getSharedPreferences("voice-output", 0).edit().clear().commit()
+        val received = CountDownLatch(1)
+        val finish = CountDownLatch(1)
+        val worker = Executors.newSingleThreadExecutor()
+        try {
+            okhttp3.mockwebserver.MockWebServer().use { server ->
+                server.enqueue(okhttp3.mockwebserver.MockResponse().withWebSocketUpgrade(object : okhttp3.WebSocketListener() {
+                    override fun onMessage(webSocket: okhttp3.WebSocket, text: String) {
+                        if (!text.contains("Path:ssml")) return
+                        val headers = "Path:audio\r\nContent-Type:audio/mpeg\r\n".toByteArray()
+                        webSocket.send(okio.ByteString.of(*(byteArrayOf(0, headers.size.toByte()) + headers + byteArrayOf(1, 2))))
+                        if (finish.await(3, TimeUnit.SECONDS)) {
+                            webSocket.send(okio.ByteString.of(*(byteArrayOf(0, headers.size.toByte()) + headers + byteArrayOf(3))))
+                            webSocket.send("Path:turn.end\r\n\r\n")
+                        }
+                    }
+                }))
+                VoiceOutput(context).use { output ->
+                    val audio = ByteArrayOutputStream()
+                    val future = worker.submit {
+                        val caller = Thread.currentThread()
+                        output.stream("你好", { false }, server.url("/edge").toString()) {
+                            assertSame(caller, Thread.currentThread())
+                            audio.write(it); received.countDown()
+                        }
+                    }
+                    assertTrue(received.await(3, TimeUnit.SECONDS))
+                    assertFalse(future.isDone)
+                    assertEquals("", output.speakingText)
+                    finish.countDown()
+                    future.get(3, TimeUnit.SECONDS)
+                    assertArrayEquals(byteArrayOf(1, 2, 3), audio.toByteArray())
+                }
+            }
+        } finally { finish.countDown(); worker.shutdownNow() }
+    }
+
+    @Test fun voiceEdgeStreamCancellationClosesSocketAndKeepsCancelledQueueStopped() {
+        val context = RuntimeEnvironment.getApplication()
+        context.getSharedPreferences("voice-output", 0).edit().clear().commit()
+        val ready = CountDownLatch(1)
+        val disconnected = CountDownLatch(1)
+        val cancel = java.util.concurrent.atomic.AtomicBoolean(false)
+        val worker = Executors.newSingleThreadExecutor()
+        try {
+            okhttp3.mockwebserver.MockWebServer().use { server ->
+                server.enqueue(okhttp3.mockwebserver.MockResponse().withWebSocketUpgrade(object : okhttp3.WebSocketListener() {
+                    override fun onMessage(webSocket: okhttp3.WebSocket, text: String) {
+                        if (text.contains("Path:ssml")) ready.countDown()
+                    }
+                    override fun onFailure(webSocket: okhttp3.WebSocket, t: Throwable, response: okhttp3.Response?) {
+                        disconnected.countDown()
+                    }
+                }))
+                VoiceOutput(context).use { output ->
+                    val future = worker.submit {
+                        output.stream("你好", cancel::get, server.url("/edge").toString()) { fail("取消后不应交付音频") }
+                    }
+                    assertTrue(ready.await(3, TimeUnit.SECONDS))
+                    cancel.set(true)
+                    val error = assertThrows(java.util.concurrent.ExecutionException::class.java) { future.get(2, TimeUnit.SECONDS) }
+                    assertTrue(error.cause is java.util.concurrent.CancellationException)
+                    assertTrue(disconnected.await(2, TimeUnit.SECONDS))
+                    assertThrows(java.util.concurrent.CancellationException::class.java) {
+                        output.speak("下一句", cancel::get) { fail("取消后不应报告开始播放") }
+                    }
+                    assertEquals(1, server.requestCount)
+                    assertEquals("", output.speakingText)
+                }
+            }
+        } finally { worker.shutdownNow() }
+    }
+
+    @Test fun voiceEdgeStreamRejectsDisconnectAfterPartialAudio() {
+        val context = RuntimeEnvironment.getApplication()
+        context.getSharedPreferences("voice-output", 0).edit().clear().commit()
+        val received = CountDownLatch(1)
+        val disconnect = CountDownLatch(1)
+        val worker = Executors.newSingleThreadExecutor()
+        try {
+            okhttp3.mockwebserver.MockWebServer().use { server ->
+                server.enqueue(okhttp3.mockwebserver.MockResponse().withWebSocketUpgrade(object : okhttp3.WebSocketListener() {
+                    override fun onMessage(webSocket: okhttp3.WebSocket, text: String) {
+                        if (!text.contains("Path:ssml")) return
+                        val headers = "Path:audio\r\nContent-Type:audio/mpeg\r\n".toByteArray()
+                        webSocket.send(okio.ByteString.of(*(byteArrayOf(0, headers.size.toByte()) + headers + byteArrayOf(1))))
+                        if (disconnect.await(3, TimeUnit.SECONDS)) webSocket.close(1000, "early")
+                    }
+                }))
+                VoiceOutput(context).use { output ->
+                    val future = worker.submit {
+                        output.stream("你好", { false }, server.url("/edge").toString()) { received.countDown() }
+                    }
+                    assertTrue(received.await(3, TimeUnit.SECONDS))
+                    disconnect.countDown()
+                    val error = assertThrows(java.util.concurrent.ExecutionException::class.java) { future.get(2, TimeUnit.SECONDS) }
+                    assertTrue(error.cause is IllegalStateException)
+                    assertTrue(error.cause!!.message!!.contains("提前结束"))
+                }
+            }
+        } finally { disconnect.countDown(); worker.shutdownNow() }
+    }
+
+    @Test fun voiceEdgeStreamRejectsOverflowAndConsumerFailureAndCanBeReused() {
+        val context = RuntimeEnvironment.getApplication()
+        context.getSharedPreferences("voice-output", 0).edit().clear().commit()
+        okhttp3.mockwebserver.MockWebServer().use { server ->
+            for (size in listOf(256 * 1024 + 1, 1, 2)) {
+                server.enqueue(okhttp3.mockwebserver.MockResponse().withWebSocketUpgrade(object : okhttp3.WebSocketListener() {
+                    override fun onMessage(webSocket: okhttp3.WebSocket, text: String) {
+                        if (!text.contains("Path:ssml")) return
+                        val headers = "Path:audio\r\nContent-Type:audio/mpeg\r\n".toByteArray()
+                        webSocket.send(okio.ByteString.of(*(byteArrayOf(0, headers.size.toByte()) + headers + ByteArray(size) { 7 })))
+                        webSocket.send("Path:turn.end\r\n\r\n")
+                        // 完成后的旧回调无权污染下一次请求。
+                        webSocket.send(okio.ByteString.of(0))
+                    }
+                }))
+            }
+            VoiceOutput(context).use { output ->
+                assertThrows(IllegalStateException::class.java) {
+                    output.stream("过载", { false }, server.url("/edge").toString()) { fail("超限包不应交付") }
+                }
+                val failure = IllegalArgumentException("consumer")
+                assertSame(failure, assertThrows(IllegalArgumentException::class.java) {
+                    output.stream("失败", { false }, server.url("/edge").toString()) { throw failure }
+                })
+                assertArrayEquals(byteArrayOf(7, 7), output.synthesize("重试", { false }, server.url("/edge").toString()))
+            }
+        }
+    }
+
+    @Test fun voiceOutputBufferBoundsBytesDrainsCompletionAndDiscardsCancelledOrFailedData() {
+        val buffer = VoiceOutput.AudioBuffer(4)
+        buffer.offer(byteArrayOf(1, 2, 3))
+        assertArrayEquals(byteArrayOf(1, 2, 3), buffer.poll())
+        buffer.offer(byteArrayOf(4, 5, 6, 7))
+        buffer.finish()
+        buffer.offer(byteArrayOf(99))
+        buffer.fail(IllegalStateException("完成后的断连"))
+        assertFalse(buffer.drained())
+        assertArrayEquals(byteArrayOf(4, 5, 6, 7), buffer.poll())
+        assertTrue(buffer.drained())
+        assertNull(buffer.poll())
+        buffer.cancel()
+        assertThrows(java.util.concurrent.CancellationException::class.java) { buffer.poll() }
+        val overflow = VoiceOutput.AudioBuffer(4)
+        overflow.offer(byteArrayOf(1, 2, 3))
+        assertThrows(IllegalStateException::class.java) { overflow.offer(byteArrayOf(4, 5)) }
+        assertTrue(overflow.ended)
+        assertThrows(IllegalStateException::class.java) { overflow.poll() }
+        val failed = VoiceOutput.AudioBuffer()
+        failed.offer(byteArrayOf(1))
+        val cause = IllegalStateException("断连")
+        failed.fail(cause)
+        failed.offer(byteArrayOf(2))
+        assertSame(cause, assertThrows(IllegalStateException::class.java) { failed.poll() })
+        val empty = VoiceOutput.AudioBuffer()
+        empty.finish()
+        assertThrows(IllegalStateException::class.java) { empty.poll() }
+        val total = VoiceOutput.AudioBuffer()
+        repeat(32) { total.offer(ByteArray(256 * 1024)); assertNotNull(total.poll()) }
+        assertThrows(IllegalStateException::class.java) { total.offer(byteArrayOf(1)) }
+    }
+
+    @Test fun voiceEdgeMp3FramesPreserveContinuityAcrossEveryPacketBoundary() {
+        val frame = ByteArray(144).apply { this[0] = 255.toByte(); this[1] = 243.toByte(); this[2] = 100; this[3] = 192.toByte() }
+        val audio = frame + frame
+        for (split in 0..audio.size) {
+            val frames = VoiceOutput.Mp3Frames()
+            val decoded = ByteArrayOutputStream()
+            frames.accept(audio.copyOfRange(0, split)) { decoded.write(it) }
+            frames.accept(audio.copyOfRange(split, audio.size)) { decoded.write(it) }
+            frames.finish()
+            assertArrayEquals("split=$split", audio, decoded.toByteArray())
+        }
+        val frames = VoiceOutput.Mp3Frames()
+        val decoded = ByteArrayOutputStream()
+        val tag = byteArrayOf(73, 68, 51, 4, 0, 0, 0, 0, 0, 3, 1, 2, 3)
+        (tag + audio).forEach { byte -> frames.accept(byteArrayOf(byte)) { decoded.write(it) } }
+        frames.finish()
+        assertArrayEquals(audio, decoded.toByteArray())
+        val incomplete = VoiceOutput.Mp3Frames()
+        incomplete.accept(frame.copyOf(143)) { fail("半帧不能交给解码器") }
+        assertThrows(IllegalStateException::class.java) { incomplete.finish() }
+        assertThrows(IllegalStateException::class.java) { VoiceOutput.Mp3Frames().accept(ByteArray(12)) {} }
+        assertThrows(IllegalStateException::class.java) {
+            VoiceOutput.Mp3Frames().accept(byteArrayOf(73, 68, 51, 4, 0, 0, 127, 127, 127, 127)) {}
+        }
+    }
+
+    @Test fun voiceOutputTransientFocusDoesNotCancelAndOldPermanentLossCannotStopNextStream() {
+        val context = RuntimeEnvironment.getApplication()
+        context.getSharedPreferences("voice-output", 0).edit().clear().commit()
+        val interrupted = AtomicInteger()
+        val connections = java.util.concurrent.LinkedBlockingQueue<okhttp3.WebSocket>()
+        val worker = Executors.newSingleThreadExecutor()
+        try {
+            okhttp3.mockwebserver.MockWebServer().use { server ->
+                repeat(2) {
+                    server.enqueue(okhttp3.mockwebserver.MockResponse().withWebSocketUpgrade(object : okhttp3.WebSocketListener() {
+                        override fun onMessage(webSocket: okhttp3.WebSocket, text: String) {
+                            if (text.contains("Path:ssml")) connections.put(webSocket)
+                        }
+                    }))
+                }
+                VoiceOutput(context) { interrupted.incrementAndGet() }.use { output ->
+                    val first = worker.submit { output.stream("第一句", { false }, server.url("/edge").toString()) {} }
+                    assertNotNull(connections.poll(3, TimeUnit.SECONDS))
+                    val operation = VoiceOutput::class.java.getDeclaredField("active").apply { isAccessible = true }.get(output)
+                    val listener = VoiceOutput::class.java.getDeclaredMethod("focusListener", operation.javaClass)
+                        .apply { isAccessible = true }.invoke(output, operation) as android.media.AudioManager.OnAudioFocusChangeListener
+                    listener.onAudioFocusChange(android.media.AudioManager.AUDIOFOCUS_LOSS_TRANSIENT)
+                    listener.onAudioFocusChange(android.media.AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK)
+                    assertFalse(first.isDone)
+                    assertEquals(0, interrupted.get())
+                    listener.onAudioFocusChange(android.media.AudioManager.AUDIOFOCUS_LOSS)
+                    assertThrows(java.util.concurrent.ExecutionException::class.java) { first.get(2, TimeUnit.SECONDS) }
+                    assertEquals(1, interrupted.get())
+                    val next = worker.submit { output.stream("第二句", { false }, server.url("/edge").toString()) {} }
+                    assertNotNull(connections.poll(3, TimeUnit.SECONDS))
+                    listener.onAudioFocusChange(android.media.AudioManager.AUDIOFOCUS_LOSS)
+                    assertFalse(next.isDone)
+                    assertEquals(1, interrupted.get())
+                    output.close()
+                    val error = assertThrows(java.util.concurrent.ExecutionException::class.java) { next.get(2, TimeUnit.SECONDS) }
+                    assertTrue(error.cause is java.util.concurrent.CancellationException)
+                    assertThrows(java.util.concurrent.CancellationException::class.java) { output.speak("关闭后", { false }) }
+                    assertEquals("", output.speakingText)
+                }
+            }
+        } finally { worker.shutdownNow() }
+    }
+
     @Test fun voiceVolcSendsDefaultSpeakerAndReceivesCompleteAudio() {
         val context = RuntimeEnvironment.getApplication()
         val settings = VoiceOutput.Settings(provider = "volc", auth = "token", appId = "test-app", accessKey = "test-access")
@@ -938,11 +2252,11 @@ class CoreTest {
                 val request = server.takeRequest(2, TimeUnit.SECONDS)!!
                 assertEquals("test-app", request.getHeader("X-Api-App-Id"))
                 assertEquals("test-access", request.getHeader("X-Api-Access-Key"))
-                assertEquals("seed-tts-2.0", request.getHeader("X-Api-Resource-Id"))
+                assertEquals("seed-tts-1.0", request.getHeader("X-Api-Resource-Id"))
                 assertNotNull(request.getHeader("X-Api-Request-Id"))
                 val body = JSONObject(request.body.readUtf8()).getJSONObject("req_params")
                 assertEquals("火山你好", body.getString("text"))
-                assertEquals("zh_female_xiaohe_uranus_bigtts", body.getString("speaker"))
+                assertEquals("zh_female_wanwanxiaohe_moon_bigtts", body.getString("speaker"))
                 assertEquals("mp3", body.getJSONObject("audio_params").getString("format"))
             }
         } finally { context.getSharedPreferences("voice-output", 0).edit().clear().commit() }
@@ -989,12 +2303,75 @@ class CoreTest {
         } finally { context.getSharedPreferences("voice-output", 0).edit().clear().commit() }
     }
 
+    @Test fun voiceVolcAudioUsesDocumentedRequestAndReadsNonStreamingAudio() {
+        val context = RuntimeEnvironment.getApplication()
+        try {
+            for (auth in listOf("key", "token")) {
+                VoiceOutput.save(context, VoiceOutput.Settings(provider = "volc-audio", auth = auth,
+                    apiKey = "test-key", appId = "test-app", accessKey = "test-token"))
+                okhttp3.mockwebserver.MockWebServer().use { server ->
+                    server.enqueue(okhttp3.mockwebserver.MockResponse()
+                        .setBody("{\"audio\":\"AQID\",\"duration\":2,\"original_duration\":2,\"url\":\"https://unused.invalid/audio\"}"))
+                    VoiceOutput(context).use { output ->
+                        assertArrayEquals(byteArrayOf(1, 2, 3), output.synthesize("你好，小何。", { false }, server.url("/tts/create").toString()))
+                    }
+                    val request = server.takeRequest(2, TimeUnit.SECONDS)!!
+                    assertNull(request.getHeader("X-Api-Resource-Id"))
+                    assertNotNull(request.getHeader("X-Api-Request-Id"))
+                    assertEquals(if (auth == "key") "test-key" else null, request.getHeader("X-Api-Key"))
+                    assertEquals(if (auth == "token") "test-app" else null, request.getHeader("X-Api-App-Id"))
+                    assertEquals(if (auth == "token") "test-token" else null, request.getHeader("X-Api-Access-Key"))
+                    val body = JSONObject(request.body.readUtf8())
+                    assertEquals("seed-audio-1.0", body.getString("model"))
+                    assertTrue(body.getString("text_prompt").contains("@音频1"))
+                    assertTrue(body.getString("text_prompt").endsWith("你好，小何。"))
+                    assertEquals("zh_female_xiaohe_uranus_bigtts", body.getJSONArray("references").getJSONObject(0).getString("speaker"))
+                    assertEquals("mp3", body.getJSONObject("audio_config").getString("format"))
+                    assertEquals(24000, body.getJSONObject("audio_config").getInt("sample_rate"))
+                    assertFalse(body.has("req_params"))
+                    assertEquals(1, server.requestCount)
+                }
+            }
+        } finally { context.getSharedPreferences("voice-output", 0).edit().clear().commit() }
+    }
+
+    @Test fun voiceVolcAudioRejectsErrorsMissingAudioAndRedirects() {
+        val context = RuntimeEnvironment.getApplication()
+        VoiceOutput.save(context, VoiceOutput.Settings(provider = "volc-audio", apiKey = "test-key"))
+        try {
+            okhttp3.mockwebserver.MockWebServer().use { server ->
+                val responses = listOf(
+                    okhttp3.mockwebserver.MockResponse().setBody("{\"code\":45001115,\"audio\":\"AQI=\",\"message\":\"secret-provider-message\"}"),
+                    okhttp3.mockwebserver.MockResponse().setBody("{\"url\":\"https://unused.invalid/audio\"}"),
+                    okhttp3.mockwebserver.MockResponse().setBody("{\"audio\":\"\"}"),
+                    okhttp3.mockwebserver.MockResponse().setBody("{\"audio\":\"a\"}"),
+                    okhttp3.mockwebserver.MockResponse().setBody("secret-provider-message"),
+                    okhttp3.mockwebserver.MockResponse().setSocketPolicy(okhttp3.mockwebserver.SocketPolicy.DISCONNECT_AFTER_REQUEST),
+                    okhttp3.mockwebserver.MockResponse().setResponseCode(403),
+                    okhttp3.mockwebserver.MockResponse().setResponseCode(302).setHeader("Location", server.url("/do-not-send-credentials")),
+                )
+                for (response in responses) {
+                    server.enqueue(response)
+                    VoiceOutput(context).use { output ->
+                        val failure = assertThrows(IllegalStateException::class.java) { output.synthesize("你好", { false }, server.url("/tts/create").toString()) }
+                        assertFalse(failure.message.orEmpty().contains("secret-provider-message"))
+                    }
+                    assertNotNull(server.takeRequest(2, TimeUnit.SECONDS))
+                }
+                assertEquals(responses.size, server.requestCount)
+            }
+        } finally { context.getSharedPreferences("voice-output", 0).edit().clear().commit() }
+    }
+
     @Test fun voiceSpeechChunksPreserveEmojiAndKeepCodeOutOfPlayback() {
         val text = "🙂".repeat(650)
         val chunks = VoiceOutput.chunks(text)
         assertEquals(listOf(300, 300, 50), chunks.map { it.codePointCount(0, it.length) })
         assertEquals(text, chunks.joinToString(""))
         assertEquals(text, VoiceOutput.chunks(text, 60).joinToString(""))
+        assertEquals(text, VoiceOutput.chunks(text, 60, sentences = false).joinToString(""))
+        assertEquals(listOf("你好。今天好吗？"), VoiceOutput.chunks("你好。今天好吗？", sentences = false))
+        assertEquals(listOf("你好。", "今天好", "吗？"), VoiceOutput.chunks("你好。今天好吗？", 3, sentences = false))
         assertTrue(VoiceOutput.chunks(text, 60).all { it.codePointCount(0, it.length) <= 60 })
         assertEquals(listOf("你好。", "链接，代码请查看聊天界面。"), VoiceOutput.chunks("**你好。**[链接](https://example.com)```bash\nprivate command\n```"))
     }
@@ -1045,7 +2422,7 @@ class CoreTest {
         val info = android.app.ActivityManager.MemoryInfo().apply { availMem = 900L * 1024 * 1024; totalMem = 2500L * 1024 * 1024; threshold = 150L * 1024 * 1024 }
         shadowOf(manager).setMemoryInfo(info)
         val models = VoiceModels(app)
-        models.requireMemory("speech")
+        assertThrows(IllegalStateException::class.java) { models.requireMemory("speech") }
         assertThrows(IllegalStateException::class.java) { models.requireMemory("output") }
         assertFalse(models.ready("output"))
         models.requireMemory("local", 512)

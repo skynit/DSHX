@@ -191,7 +191,7 @@ fun DshScreen(
                                 .semantics { if (index == 3) contentDescription = "语音聊天" }
                                 .selectable(selected, role = Role.Tab, onClick = {
                                     tab = index; logs = false
-                                    if (index == 3 && running && voiceState.speechReady && !voiceState.active) onVoice("talk")
+                                    if (index == 3 && running && voiceState.speechAvailable && !voiceState.active) onVoice("talk")
                                     if (index == 1 && voiceState.active && !voiceState.downloading) onVoice("stop")
                                 })
                                 .padding(horizontal = 4.dp, vertical = 8.dp),
@@ -377,7 +377,7 @@ private fun VoiceChat(
     }
     BoxWithConstraints(modifier) {
         val compact = maxHeight < 400.dp
-        val inlineControl = compact && (state.active || running && state.speechReady)
+        val inlineControl = compact && (state.active || running && state.speechAvailable)
         val gutter = if (maxWidth >= 600.dp) 32.dp else 16.dp
         Column(Modifier.align(Alignment.TopCenter).widthIn(max = 680.dp).fillMaxSize().padding(horizontal = gutter, vertical = 16.dp),
             verticalArrangement = Arrangement.spacedBy(if (compact) 8.dp else 16.dp)) {
@@ -437,9 +437,9 @@ private fun VoiceChat(
                         Note("先启动工作区，即可使用语音聊天。")
                         Action(if (busy) "正在启动…" else "启动 dsh", onClick = onStart, enabled = !busy, primary = true, icon = Lucide.Play)
                     }
-                    !state.speechReady -> {
-                        Note("首次使用需下载语音识别模型。")
-                        Action("下载语音识别模型", onClick = { action("download") }, primary = true, icon = Lucide.Download)
+                    !state.speechAvailable -> {
+                        Note("手机没有可用的系统语音识别服务，请在系统设置中安装或启用。")
+                        Action("系统语音设置", onClick = { action("speech-settings") }, primary = true, icon = Lucide.Settings2)
                     }
                     else -> {
                         VoiceButton("开始语音", Lucide.Mic, { action("talk") }, size = if (compact) 48 else 64, primary = true)
@@ -483,10 +483,9 @@ private fun VoiceSettings(voice: VoiceControl, state: VoiceControl.State, action
     var interrupt by remember { mutableStateOf(voice.interrupt) }
     var message by remember { mutableStateOf<String?>(null) }
     var saveError by remember { mutableStateOf<String?>(null) }
-    val echoSupported = voice.echoSupported
 
     Section("语音")
-    Note("录音在本机识别；对话文字发送至聊天模型，回答文字发送至所选播报服务。")
+    Note("录音由手机系统服务识别；对话文字发送至聊天模型，回答文字发送至所选播报服务。")
     Panel {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
             Icon(Lucide.Mic, contentDescription = null, modifier = Modifier.size(18.dp), tint = MiuixTheme.colorScheme.onSurfaceVariantSummary)
@@ -508,7 +507,7 @@ private fun VoiceSettings(voice: VoiceControl, state: VoiceControl.State, action
         AssistantField("唤醒短语", wake, 40, state.active, 1)
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             if (state.active) Action(if (state.downloading) "取消下载" else "停止语音", onClick = { action("stop") }, danger = true, icon = Lucide.Square)
-            else Action("开启声音唤醒", onClick = { action("wake") }, enabled = state.speechReady, primary = true, icon = Lucide.Mic)
+            else Action("开启声音唤醒", onClick = { action("wake") }, enabled = state.speechAvailable, primary = true, icon = Lucide.Mic)
             Action("保存唤醒词", onClick = {
                 runCatching { voice.wakeWord = wake.text.toString() }
                     .onSuccess { message = "唤醒词已保存"; saveError = null }
@@ -522,7 +521,7 @@ private fun VoiceSettings(voice: VoiceControl, state: VoiceControl.State, action
                 modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
         }
         Spacer(Modifier.height(12.dp))
-        Note(if (!state.speechReady) "先下载下方语音识别模型，即可开启唤醒。" else if (state.downloading) "模型准备期间，语音设置暂不可修改。" else if (state.active) "停止语音后可修改设置。后台监听会显示持续通知。" else "说出已保存的短语唤醒助手，后台监听会显示持续通知。")
+        Note(if (!state.speechAvailable) "请先安装或启用手机系统语音识别服务。" else if (state.downloading) "模型准备期间，语音设置暂不可修改。" else if (state.active) "停止语音后可修改设置。后台监听会显示持续通知。" else "说出已保存的短语唤醒助手，后台监听会显示持续通知。")
     }
     VoiceOutputSettings(voice, state, action)
     Panel(padding = 0) {
@@ -546,15 +545,17 @@ private fun VoiceSettings(voice: VoiceControl, state: VoiceControl.State, action
             Note("仅用于下载模型文件，不发送录音。")
         }
         Divider()
-        VoiceModelRow("语音识别", "本机识别录音 · 约 229 MiB", state.speechReady, !state.active) { action("download") }
+        SettingsRow("系统语音识别", if (state.speechAvailable) "手机系统识别服务可用。" else "请在系统设置中安装或启用识别服务。") {
+            Action("系统语音设置", onClick = { action("speech-settings") }, enabled = !state.active, icon = Lucide.Settings2)
+        }
         Divider()
         VoiceModelRow("本地小模型", "参与简单任务分工 · 约 379 MiB", state.localReady, !state.active) { action("download-local") }
 
     }
     Panel(padding = 0) {
         Text("高级选项", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(16.dp).semantics { heading() })
-        SettingsSwitch("播报中唤醒 · 实验功能", if (echoSupported) "播报时也可唤醒，默认关闭。依赖设备回声消除，可能误唤醒。" else "当前设备不支持回声消除，暂不可开启。",
-            interrupt, !state.active && (interrupt || echoSupported)) { interrupt = it; voice.interrupt = it }
+        SettingsSwitch("语音打断", "回答与播报期间继续收音，确认插话后停止上一轮回答。",
+            interrupt, !state.active) { interrupt = it; voice.interrupt = it }
     }
 }
 

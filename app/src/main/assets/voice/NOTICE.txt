@@ -6,12 +6,6 @@ sherpa-onnx v1.13.2, https://github.com/k2-fsa/sherpa-onnx
   official kws-models release archive. A separate license for these weights was
   not present in the downloaded archive; the runtime license must not be taken
   as proof of model-weight licensing. This remains a release review item.
-Silero VAD, https://github.com/snakers4/silero-vad
-  MIT; see licenses/silero-LICENSE.txt. Weight SHA256 is pinned in models.json.
-SenseVoice, https://github.com/FunAudioLLM/SenseVoice
-  Converted model: csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17,
-  revision 2365baeacb507f821a0c8120fcee3d484dba7a07.
-  See licenses/SenseVoice-LICENSE.txt; original project license captured 2026-10-22.
 Qwen3-0.6B, https://huggingface.co/Qwen/Qwen3-0.6B
   GGUF Q4_K_M by unsloth/Qwen3-0.6B-GGUF,
   revision 50968a4468ef4233ed78cd7c3de230dd1d61a56b.
@@ -24,7 +18,7 @@ pinyin-data, https://github.com/mozillazg/pinyin-data
   See licenses/pinyin-data-LICENSE.txt. First character pronunciation is used;
   phrase-specific polyphonic pronunciation is not inferred.
 hi-mochi, https://github.com/gongpx20069/hi-mochi
-  Commit 1f87e1645431dd843d4cdf0ab3fefae5bea59473; MIT.
+  Commit 8a1756087d1306c0d05e2b6b3a667c1ed06ec800; MIT.
   Architectural reference only; no source copied. See licenses/hi-mochi-LICENSE.txt.
 
 Native Kotlin/JNI integration and dsh plugin code are maintained in DSHX.

@@ -17,6 +17,12 @@ class VoiceModels(private val context: Context) {
     private val catalog by lazy { context.assets.open("voice/models.json").bufferedReader().use { JSONObject(it.readText()) } }
     private val root = File(context.filesDir, "voice/models")
 
+    init {
+        // 仅清理已移除的旧版整句识别资源，保留唤醒和文字模型。
+        listOf("speech-20240717", "speech-20240717.new").forEach { File(root, it).deleteRecursively() }
+        File(root, "wake-20251220-1/silero_vad.onnx").delete()
+    }
+
     fun directory(name: String): File = File(root, "$name-${catalog.getJSONObject(name).getString("version")}")
 
     fun ready(name: String): Boolean = runCatching {
@@ -44,7 +50,6 @@ class VoiceModels(private val context: Context) {
         // Preserve Android's low-memory reserve; this is admission control, not a reservation.
         // Qwen3 f16 KV is 112 KiB per token on this model (448 MiB / 4096).
         val minimum = when (name) {
-            "speech" -> 512L * 1024 * 1024
             "local" -> 700L * 1024 * 1024 + (contextTokens.coerceIn(512, 4096) - 512L) * 112 * 1024
             else -> error("未知模型类型")
         }
