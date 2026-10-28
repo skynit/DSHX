@@ -11,7 +11,7 @@
 1. 安装下方列出的 JDK、Android SDK、NDK、CMake 与命令行工具。
 2. 在仓库根目录创建不提交的 `local.properties`，写入实际 SDK 路径，例如 `sdk.dir=/你的/Android/Sdk`；示例路径需要自行替换。
 3. 确认 NDK 与 CMake 已安装到该 SDK，必要时通过 `ANDROID_NDK_HOME` 指定 NDK 路径。
-4. 准备语音依赖，再构建对应设备架构的运行包，最后构建 Android 安装包。依赖准备会下载语音库与唤醒资源；大体积识别与可选文本模型由应用后续下载；播报默认在线使用 Edge TTS。
+4. 准备语音依赖，再构建对应设备架构的运行包，最后构建 Android 安装包。依赖准备会下载语音库与唤醒资源；系统语音识别不需要应用下载模型，可选文本模型由应用后续下载；播报默认在线使用 Edge TTS。
 
 ## 开发环境与命令
 
@@ -70,4 +70,4 @@ Node 适配测试集中在 `core/test.mjs`，依赖已经构建或安装、与�
 
 构建补丁除注册项目模块，还适配上游文件和搜索、最终工具准入、默认 Full、附件发布、用户手动终端、插件失败恢复、人设、模型用量与 `storages` 路径。补丁要求目标片段唯一匹配；上游版本变更导致锚点不符时构建停止，不能静默忽略。
 
-[`tools/voice.py`](../tools/voice.py) 根据固定版本和摘要准备 sherpa-onnx Android 库、唤醒及发音资源、模型清单和 llama.cpp 源码。大型识别与文本模型按清单由应用按需下载，在线播报不下载模型。随后 [`app/build.gradle.kts`](../app/build.gradle.kts) 检查运行资源和语音库摘要，选择单个目标架构，通过 CMake 编译本机推理库，再生成 APK。
+[`tools/voice.py`](../tools/voice.py) 根据固定版本和摘要准备 sherpa-onnx Android 库、唤醒及发音资源、模型清单和 llama.cpp 源码。可选文本模型按清单由应用按需下载；语音识别使用手机系统服务，在线播报也不下载模型。随后 [`app/build.gradle.kts`](../app/build.gradle.kts) 检查运行资源和语音库摘要，选择单个目标架构，通过 CMake 编译本机推理库，再生成 APK。
