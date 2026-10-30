@@ -1,0 +1,16 @@
+{
+  "format": "web-v1",
+  "id": "quick-notes",
+  "name": "随手便签",
+  "version": "1.0.0",
+  "description": "在 DSHX 内记录文字，关闭再打开仍保留内容。",
+  "entry": "index.html",
+  "capabilities": [
+    "storage"
+  ],
+  "settings": [],
+  "files": {
+    "index.html": "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><style>:root{color-scheme:light dark;--bg:#f8f7f5;--fg:#262523;--surface:#eeedea;--line:#dedcd8;--accent:#426ba2}*{box-sizing:border-box}body{margin:0;padding:20px 16px 40px;background:var(--bg);color:var(--fg);font:16px/1.6 system-ui,sans-serif}h1{font-size:22px;margin:0 0 8px}p{margin:8px 0}textarea,input,button{font:inherit;color:inherit}textarea,input{width:100%;padding:12px;background:var(--surface);border:1px solid var(--line);border-radius:10px}textarea{resize:vertical;min-height:220px}button{min-height:48px;padding:10px 20px;margin-top:12px;background:var(--surface);border:0;border-radius:10px}button:active{opacity:.7}button:focus-visible,textarea:focus-visible{outline:2px solid var(--accent);outline-offset:3px}.muted{opacity:.75}#status{min-height:1.6em} @media(prefers-color-scheme:dark){:root{--bg:#20201f;--fg:#e9e7e3;--surface:#2c2b29;--line:#42403d}}</style></head><body><h1>随手便签</h1><p class=\"muted\">文字保存在此应用的独立数据中。</p><label for=\"note\">便签内容</label><textarea id=\"note\" placeholder=\"记下此刻的想法\"></textarea><button id=\"save\" disabled>保存</button><p id=\"status\" role=\"status\">正在读取…</p><script src=\"main.js\"></script></body></html>",
+    "main.js": "(async () => { const note=document.querySelector('#note'), status=document.querySelector('#status'), save=document.querySelector('#save'); try { await dshx.ready; note.value=await dshx.storage.get('note')||''; status.textContent='已准备好'; save.disabled=false; save.onclick=async()=>{save.disabled=true;try{await dshx.storage.set('note',note.value);status.textContent='已保存';}catch(e){status.textContent=e.message;}finally{save.disabled=false;}};}catch(e){status.textContent=e.message;} })();"
+  }
+}

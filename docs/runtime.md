@@ -12,6 +12,8 @@
 
 **作用。** [`CoreStore.kt`](../app/src/main/java/local/dshx/app/CoreStore.kt) 由 `Engine` 创建，负责把 APK 内的运行资源安装到应用私有目录。这里“离线”指安装运行环境无需临时下载 Node 或 dsh；不表示云端模型调用无需联网。
 
+运行包内预装 Git；`bin/git` 是主程序，`libexec/git-core` 保存它调用的传输助手和子命令入口，`share/git-core/templates` 保存新建仓库模板。相关文件与 Node 一样由固定版本和摘要锁定，随 APK 安装，无需用户另装 Termux 或 Git。HTTP/HTTPS 传输的依赖库和证书也包含在运行包中。
+
 运行包分为三个文件：
 
 | 资源 | 谁生成、保存什么、谁使用 |

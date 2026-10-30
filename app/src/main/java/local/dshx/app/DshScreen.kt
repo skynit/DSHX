@@ -102,9 +102,14 @@ data class BundleInfo(val dsh: String, val node: String, val abi: String, val un
 internal enum class AppPage(val title: String, val settings: Boolean = false) {
     Home("DSHX"), Chat("对话"), Settings("设置", true), Voice("语音聊天"), Logs("运行诊断"), Library("知识库"),
     Assistant("助手与资料", true), VoiceOptions("语音交互", true), Tasks("任务分工", true),
-    Permissions("手机操作与权限", true), Backup("备份与恢复", true);
+    Permissions("手机操作与权限", true), Hosting("实验体", true), HostingOptions("培养设置", true),
+    Apps("微应用", true), Backup("备份与恢复", true);
 
-    val previous: AppPage get() = if (settings && this != Settings) Settings else Home
+    val previous: AppPage get() = when {
+        this == HostingOptions -> Hosting
+        settings && this != Settings -> Settings
+        else -> Home
+    }
 }
 
 internal val LocalStatusColor = staticCompositionLocalOf { Color(0xFF23845F) }
@@ -157,6 +162,8 @@ fun DshScreen(
     diagnostics: () -> String, pageError: String?, onReload: () -> Unit,
     assistantStore: AssistantStore,
     memoryStore: MemoryStore, onMemory: (String, org.json.JSONObject) -> org.json.JSONObject,
+    onHosting: (String, org.json.JSONObject) -> org.json.JSONObject,
+    onOpenSession: (String) -> Unit,
     knowledgeStore: KnowledgeStore, onKnowledge: (String, org.json.JSONObject) -> org.json.JSONObject,
     knowledgePicking: Boolean, onKnowledgeFile: (String, org.json.JSONObject) -> Unit,
     libraryStore: LibraryStore, libraryRevision: Int, libraryBusy: Boolean,
@@ -168,6 +175,8 @@ fun DshScreen(
     canSwipeChat: (Int) -> Boolean = { true },
     startup: Boolean = false, onStartupFinished: () -> Unit = {},
     accessibilityNotice: Boolean = false, onAccessibilityDismiss: () -> Unit = {},
+    onApps: (String, org.json.JSONObject) -> org.json.JSONObject = { _, _ -> error("微应用管理尚未连接。") },
+    onCreateApp: (org.json.JSONObject) -> org.json.JSONObject = { error("微应用创建尚未连接。") },
 ) {
     var tab by rememberSaveable { mutableIntStateOf(0) }
     var settingsPage by rememberSaveable { mutableStateOf(AppPage.Settings) }
@@ -194,6 +203,8 @@ fun DshScreen(
     val visited = remember { mutableSetOf(page) }
     SideEffect { visited += page }
     val running = state.url != null
+    val specimen = rememberSpecimenState(running, page == AppPage.Hosting || page == AppPage.HostingOptions,
+        page == AppPage.HostingOptions, onHosting)
     val active = running || state.busy && !state.backup.busy
     val webReady = (webVersion?.substringBefore('.')?.toIntOrNull() ?: 0) >= 126
     var keyboardOpen by remember { mutableStateOf(false) }
@@ -215,7 +226,7 @@ fun DshScreen(
         when {
             library -> library = false
             logs -> logs = false
-            tab == 2 && settingsPage != AppPage.Settings -> settingsPage = AppPage.Settings
+            tab == 2 && settingsPage != AppPage.Settings -> settingsPage = settingsPage.previous
             else -> { tab = 0; tabsShown = true }
         }
     }
@@ -294,6 +305,11 @@ fun DshScreen(
                     } else if (shownPage == AppPage.Voice && !showLogs) {
                         VoiceChat(Modifier.fillMaxSize(), voice, voiceState, running, state.busy, onVoice, onStart,
                             onSettings = { selectTab(2); settingsPage = AppPage.VoiceOptions }, onChat = { selectTab(1) }, onBack = ::goBack)
+                    } else if (shownPage == AppPage.Hosting || shownPage == AppPage.HostingOptions) {
+                        SpecimenScreen(specimen, running, shownPage == AppPage.HostingOptions, current, ::goBack,
+                            onOptions = { backGesture.reset(); settingsPage = AppPage.HostingOptions },
+                            onSaved = { backGesture.reset(); settingsPage = AppPage.Hosting },
+                            openSession = { onOpenSession(it); selectTab(1) })
                     } else {
                         BoxWithConstraints(Modifier.fillMaxSize().verticalScroll(scroll)) {
                           val gutter = if (maxWidth >= 600.dp) 32.dp else 16.dp
@@ -302,7 +318,7 @@ fun DshScreen(
                             verticalArrangement = Arrangement.spacedBy(12.dp),
                           ) {
                             val hasBack = shownPage.settings || shownPage == AppPage.Chat
-                            Row(Modifier.fillMaxWidth().offset(x = if (hasBack) (-12).dp else 0.dp),
+                            if (shownPage != AppPage.Apps) Row(Modifier.fillMaxWidth().offset(x = if (hasBack) (-12).dp else 0.dp),
                                 verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
                                 if (hasBack) {
                                     LibraryIcon(Lucide.ChevronLeft, if (shownPage.settings && shownPage != AppPage.Settings) "返回设置总览" else "返回工作台", ::goBack, iconSize = 16)
@@ -380,6 +396,8 @@ fun DshScreen(
                                     voice, voiceState, onVoice, phone, phoneRevision, onPhonePermission,
                                     backupPicking, onBackup, onPage = { backGesture.reset(); settingsPage = it },
                                     onLibrary = { library = true },
+                                    onHostingSession = { onOpenSession(it); selectTab(1) },
+                                    onApps = onApps, onCreateApp = onCreateApp,
                                 )
                             }
                             Spacer(Modifier.height(4.dp))
@@ -603,7 +621,7 @@ private fun VoiceLevel(voice: VoiceControl) {
 }
 
 @Composable
-private fun VoiceButton(label: String, icon: ImageVector, onClick: () -> Unit, size: Int = 48, primary: Boolean = false, danger: Boolean = false,
+internal fun VoiceButton(label: String, icon: ImageVector, onClick: () -> Unit, size: Int = 48, primary: Boolean = false, danger: Boolean = false,
     iconSize: Int = if (size > 48) 26 else 20) {
     val colors = MiuixTheme.colorScheme
     var focused by remember { mutableStateOf(false) }
@@ -807,7 +825,8 @@ internal fun MemorySettings(store: MemoryStore, running: Boolean, visible: Boole
         status?.ready != true -> "本地记忆尚未就绪。"
         status?.active == true -> "已启用 · ${status!!.count} 条记忆 · ${status!!.pending} 条待确认"
         saved?.enabled == true -> "已保存启用设置，当前尚未生效；已有记忆仍可管理。"
-        else -> "已关闭，已有记忆仍可管理。"
+        saved?.autoSave == true -> "对话读取已关闭，自动整理已开启。"
+        else -> "对话读取与自动整理已关闭，已有记忆仍可管理。"
     }
     val feedback: @Composable () -> Unit = {
         Note(statusText)
@@ -820,20 +839,20 @@ internal fun MemorySettings(store: MemoryStore, running: Boolean, visible: Boole
     }
     if (options && visible) MemoryDialog("记忆设置", { options = false }) {
         Panel(padding = 0) {
-            SettingsSwitch("长期记忆", "保存于本机，开启后可在新会话使用；关闭后仍可管理已有记忆。",
+            SettingsSwitch("长期记忆", "开启后，对话与实验体可读取相关记忆；此开关不影响自动整理保存。",
                 saved?.enabled ?: false, available, if (saved == null) "状态未知" else null) { enabled ->
                 saved?.let { change(it.copy(enabled = enabled)) }
             }
             Divider()
-            SettingsSwitch("自动整理", "调用当前配置的模型。使用云端模型时，参与整理的对话片段会发送至该模型。",
-                saved?.autoSave ?: false, available && (saved?.autoSave == true || saved?.enabled == true),
+            SettingsSwitch("自动整理", "自动保存对话中的长期信息与实验体经验。使用云端模型时，相关片段会发送至该模型。",
+                saved?.autoSave ?: false, available,
                 if (saved == null) "状态未知" else null) { enabled ->
                 if (enabled) confirmation = "auto" else saved?.let { change(it.copy(autoSave = false)) }
             }
             Divider()
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 feedback()
-                if (saved?.enabled == true && saved?.autoSave == true && status?.autoReady == false) Note("自动整理模型尚未就绪；本地记忆管理仍可使用。")
+                if (saved?.autoSave == true && status?.autoReady == false) Note("自动整理模型尚未就绪；本地记忆管理仍可使用。")
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Action("刷新状态", onClick = { request() }, enabled = !loading)
                     Action("清空记忆", onClick = { confirmation = "clear" }, enabled = available && listRevision != null, danger = true)
@@ -884,7 +903,7 @@ internal fun MemorySettings(store: MemoryStore, running: Boolean, visible: Boole
                         if (!job.optBoolean("modelReady", false)) Note("来源模型当前未配置，请先恢复原模型配置。")
                         if (job.getInt("attempts") >= 2) Note("本次任务已重试，请检查模型配置后重新开启自动整理。")
                         Action("继续整理", onClick = { request("retry", org.json.JSONObject().put("id", job.getString("id"))) },
-                            enabled = available && saved?.enabled == true && saved?.autoSave == true && status?.autoReady == true &&
+                            enabled = available && saved?.autoSave == true && status?.autoReady == true &&
                                 job.optBoolean("modelReady", false) && state != "running" && job.getInt("attempts") < 2 && job.optString("id").isNotBlank())
                     }
                     Divider()
@@ -905,7 +924,7 @@ internal fun MemorySettings(store: MemoryStore, running: Boolean, visible: Boole
         AssistantField("正文", content, 2000, loading, 8, codePoints = true)
         AssistantField("失效时间（可选）", expiry, 16, loading, 1, "年-月-日 时:分，留空表示长期有效")
         current?.let { entry ->
-            Note("来源：${if (entry.source.getString("kind") == "manual") "手动保存" else "自动整理"}；${if (entry.locked) "已锁定，自动整理不会覆盖" else "未锁定"}")
+            Note("来源：${if (entry.source.getString("kind") == "manual") "手动保存" else if (entry.source.optString("origin") == "specimen") "实验体自动整理" else "自动整理"}；${if (entry.locked) "已锁定，自动整理不会覆盖" else "未锁定"}")
             entry.source.optString("session").takeIf(String::isNotBlank)?.let { Note("来源会话：$it") }
             if (entry.source.has("events")) Note("来源事件：${entry.source.opt("events")}")
             Note("创建：${memoryTime(entry.createdAt)}；更新：${memoryTime(entry.updatedAt)}")
@@ -924,7 +943,7 @@ internal fun MemorySettings(store: MemoryStore, running: Boolean, visible: Boole
     confirmation?.takeIf { visible }?.let { action ->
         MemoryDialog(when (action) { "auto" -> "开启自动整理"; "remove" -> "删除这条记忆"; else -> "清空全部记忆" }, { confirmation = null }) {
             Note(when (action) {
-                "auto" -> "开启后，将使用当前已配置模型整理新对话。若使用云端模型，参与整理的对话片段会发送给该模型。"
+                "auto" -> "开启后，将自动整理新对话与每轮培养结果，保存到本机记忆。无需开启对话读取。若使用云端模型，相关片段会发送给该模型。"
                 "remove" -> "删除后不再用于后续对话，并阻止从原来源重新提取。此操作无法撤销。"
                 else -> "将删除全部记忆、待确认候选和旧整理任务。开关保持原值。此操作无法撤销，会话备份不能恢复记忆。"
             })
@@ -988,7 +1007,7 @@ internal fun MemoryDialog(title: String, close: () -> Unit, scroll: Boolean = tr
 }
 
 @Composable
-internal fun AssistantField(label: String, state: TextFieldState, limit: Int, disabled: Boolean, lines: Int, hint: String = "", secret: Boolean = false, codePoints: Boolean = false, issue: String? = null) {
+internal fun AssistantField(label: String, state: TextFieldState, limit: Int, disabled: Boolean, lines: Int, hint: String = "", secret: Boolean = false, codePoints: Boolean = false, issue: String? = null, minLines: Int = 1) {
     var focused by remember { mutableStateOf(false) }
     val value = state.text.toString().trim()
     val size = if (codePoints) value.codePointCount(0, value.length) else value.length
@@ -1011,7 +1030,7 @@ internal fun AssistantField(label: String, state: TextFieldState, limit: Int, di
                 .border(if (focused || invalid) 2.dp else 1.dp, border, shape)
                 .padding(12.dp)
         val decorator = androidx.compose.foundation.text.input.TextFieldDecorator { inner ->
-            Box(contentAlignment = Alignment.CenterStart) {
+            Box(contentAlignment = if (minLines > 1) Alignment.TopStart else Alignment.CenterStart) {
                 if (state.text.isEmpty() && hint.isNotEmpty()) Text(hint, fontSize = 14.sp, lineHeight = 21.sp, color = colors.onSurfaceVariantSummary)
                 inner()
             }
@@ -1020,7 +1039,7 @@ internal fun AssistantField(label: String, state: TextFieldState, limit: Int, di
             cursorBrush = SolidColor(colors.primary), modifier = fieldModifier, decorator = decorator)
         else BasicTextField(state = state, enabled = !disabled, textStyle = style,
             cursorBrush = SolidColor(colors.primary), modifier = fieldModifier, decorator = decorator,
-            lineLimits = if (lines == 1) TextFieldLineLimits.SingleLine else TextFieldLineLimits.MultiLine(maxHeightInLines = lines))
+            lineLimits = if (lines == 1) TextFieldLineLimits.SingleLine else TextFieldLineLimits.MultiLine(minHeightInLines = minLines, maxHeightInLines = lines))
         if (invalid) Text(issue ?: "超出长度限制，请缩短后保存。", fontSize = 12.sp, color = colors.error)
     }
     Spacer(Modifier.height(16.dp))

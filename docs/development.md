@@ -62,11 +62,15 @@ JAVA_HOME=/usr/lib/jvm/java-17-openjdk ./gradlew :app:testDebugUnitTest \
 
 Node 适配测试集中在 `core/test.mjs`，依赖已经构建或安装、与当前源码一致的运行目录。`DSHX_CORE` 指向该目录，`DSHX_WORKSPACE` 指向可写测试工作区；需要 Android 原生库的测试必须在对应环境执行，不能直接把开发机 `core/` 当作手机运行目录。使用 `--test-name-pattern` 选择涉及模块的用例，应先核对所选测试需要的运行目录与平台，不能把开发机包内的依赖当作已构建的 Android 环境。
 
+后台托管只选择 `^Android hosting` 适配用例，以及 `CoreTest` 中的状态查询、运行包缺失修复和服务恢复相关用例。测试中的本地模型适配器、虚拟时钟和手机回执用于验证执行流程，不代表真实服务商或实体手机验收。
+
+实验体优化只选 `^Android (hosting|memory local specimen|assistant usage)`，覆盖来源、后台竞争、预算、目标与复用；原生选择 `specimenSkillAdoptionIsDurableIdempotentAndKeepsUserEdits`、`specimenDraftsSurviveRefreshAndInvalidDraftsDoNotPreventStopping` 及实际受影响的技能、桥接、运行包修复方法。新增模块 `specimen.mjs`、`specimen-store.mjs`、`background.mjs` 必须同时包含在构建清单和启动必需文件检查中。模拟器上运行同组测试时使用 APK 实际安装的对应架构运行目录，固定模型与手机回执仍不代表真实服务商或真实手机动作。
+
 构建检查、单元测试、界面检查、设备实际功能和真实模型服务分别报告。涉及界面时，按项目规则使用 `niri-window-screenshot` 按实时窗口编号截取本机目标窗口并打开检查；文档修改本身无需重新构建 APK 或验证手机界面。
 
 ## 构建模块如何协作
 
-[`tools/core.py`](../tools/core.py) 是运行包构建入口：执行锁定依赖的 `npm ci --omit=dev --ignore-scripts`，校验固定 Termux 包，提取 Android Node、bash、rg、证书和实际依赖库；保留官方网页与许可，移除不适用的桌面原生二进制及 LibreOffice 打包内容；按固定锚点应用 Android 补丁，使用 NDK 编译 `native.node`、`dshx-run` 和 PTY 扩展，再检查原生文件的 16KB 对齐，生成三个资源文件。**NDK** 是开发者安装的 Android 原生编译工具集，负责把 C/C++ 编译成目标架构库；对齐检查不是 16KB 真机功能验收。
+[`tools/core.py`](../tools/core.py) 是运行包构建入口：执行锁定依赖的 `npm ci --omit=dev --ignore-scripts`，校验固定 Termux 包，提取 Android Node、bash、rg、Git、Git 传输助手与模板、证书和实际依赖库；保留官方网页与许可，移除不适用的桌面原生二进制及 LibreOffice 打包内容；按固定锚点应用 Android 补丁，使用 NDK 编译 `native.node`、`dshx-run` 和 PTY 扩展，再检查原生文件的 16KB 对齐，生成三个资源文件。**NDK** 是开发者安装的 Android 原生编译工具集，负责把 C/C++ 编译成目标架构库；对齐检查不是 16KB 真机功能验收。
 
 构建补丁除注册项目模块，还适配上游文件和搜索、最终工具准入、默认 Full、附件发布、用户手动终端、插件失败恢复、人设、模型用量与 `storages` 路径。补丁要求目标片段唯一匹配；上游版本变更导致锚点不符时构建停止，不能静默忽略。
 

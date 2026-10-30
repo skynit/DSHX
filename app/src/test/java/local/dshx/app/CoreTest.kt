@@ -65,6 +65,16 @@ import kotlinx.coroutines.withTimeout
 class CoreTest {
     @get:Rule val folder = TemporaryFolder()
 
+    @Test fun darkPaletteUsesReferenceBlackAndNeutralSurfaces() {
+        val colors = AppColors(true)
+        assertEquals(0xFF0E0E0E.toInt(), colors.background)
+        for (color in listOf(colors.background, colors.surface, colors.text, colors.muted, colors.border, colors.input, colors.selected)) {
+            val red = color ushr 16 and 0xff
+            assertEquals(red, color ushr 8 and 0xff)
+            assertEquals(red, color and 0xff)
+        }
+    }
+
     @Test fun startupStartsTheEngineServiceOnceAndDoesNotRestartOnRecreation() {
         val app = RuntimeEnvironment.getApplication()
         val shadow = shadowOf(app)
@@ -95,6 +105,87 @@ class CoreTest {
             assertEquals(EngineService::class.java.name, shadow.nextStartedService?.component?.className)
             assertNull(shadow.nextStartedService)
         } finally { page.destroy() }
+    }
+
+    @Test @Config(sdk = [26, 34]) fun engineServiceRestartsAfterSystemRecreationAndHonorsExplicitStop() {
+        val engine = (RuntimeEnvironment.getApplication() as DshApp).engine
+        val jobs = mutableListOf<Runnable>()
+        ReflectionHelpers.setField(engine, "worker", Executor { jobs.add(it) })
+        val controller = Robolectric.buildService(EngineService::class.java).create()
+        val service = controller.get()
+        try {
+            assertEquals(android.app.Service.START_STICKY, service.onStartCommand(null, 0, 1))
+            assertEquals(1, jobs.size)
+            assertEquals(android.app.Service.START_STICKY, service.onStartCommand(Intent(), 0, 2))
+            assertEquals(1, jobs.size)
+            assertEquals(android.app.Service.START_NOT_STICKY, service.onStartCommand(Intent().setAction("stop"), 0, 3))
+            ReflectionHelpers.callInstanceMethod<Unit>(service, "finished",
+                ReflectionHelpers.ClassParameter.from(Boolean::class.javaPrimitiveType, true))
+            shadowOf(Looper.getMainLooper()).idleFor(2, TimeUnit.MINUTES)
+            assertEquals(1, jobs.size)
+            assertTrue(shadowOf(service).isStoppedBySelf)
+        } finally { controller.destroy() }
+    }
+
+    @Test fun engineServiceRetriesExitedProcessesWithBackoffAndResetsAfterStableRunning() {
+        val engine = (RuntimeEnvironment.getApplication() as DshApp).engine
+        val jobs = mutableListOf<Runnable>()
+        ReflectionHelpers.setField(engine, "worker", Executor { jobs.add(it) })
+        val controller = Robolectric.buildService(EngineService::class.java).create()
+        val service = controller.get()
+        val main = shadowOf(Looper.getMainLooper())
+        fun exit() {
+            ReflectionHelpers.setField(engine, "active", false)
+            ReflectionHelpers.setField(engine, "state", EngineState(phase = "启动或运行失败"))
+            ReflectionHelpers.callInstanceMethod<Unit>(service, "finished",
+                ReflectionHelpers.ClassParameter.from(Boolean::class.javaPrimitiveType, true))
+        }
+        try {
+            service.onStartCommand(Intent(), 0, 1)
+            for (seconds in listOf(1L, 2L, 4L, 8L, 16L, 32L, 60L, 60L)) {
+                val before = jobs.size
+                exit()
+                main.idleFor(seconds * 1000 - 1, TimeUnit.MILLISECONDS)
+                assertEquals(before, jobs.size)
+                main.idleFor(1, TimeUnit.MILLISECONDS)
+                assertEquals(before + 1, jobs.size)
+            }
+            ReflectionHelpers.setField(service, "readySince", android.os.SystemClock.elapsedRealtime())
+            main.idleFor(1, TimeUnit.MINUTES)
+            val before = jobs.size
+            exit()
+            main.idleFor(1, TimeUnit.SECONDS)
+            assertEquals(before + 1, jobs.size)
+            exit()
+            service.onStartCommand(Intent().setAction("stop"), 0, 2)
+            main.idleFor(2, TimeUnit.MINUTES)
+            assertEquals(before + 1, jobs.size)
+            assertTrue(shadowOf(service).isStoppedBySelf)
+        } finally { controller.destroy() }
+    }
+
+    @Test fun engineServiceStopsForPreparationFailureAndCancelsRetriesWhenDestroyed() {
+        val engine = (RuntimeEnvironment.getApplication() as DshApp).engine
+        val jobs = mutableListOf<Runnable>()
+        ReflectionHelpers.setField(engine, "worker", Executor { jobs.add(it) })
+        val controller = Robolectric.buildService(EngineService::class.java).create()
+        val service = controller.get()
+        service.onStartCommand(Intent(), 0, 1)
+        ReflectionHelpers.setField(engine, "active", false)
+        ReflectionHelpers.setField(engine, "state", EngineState(phase = "无法启动"))
+        ReflectionHelpers.callInstanceMethod<Unit>(service, "finished",
+            ReflectionHelpers.ClassParameter.from(Boolean::class.javaPrimitiveType, false))
+        shadowOf(Looper.getMainLooper()).idleFor(2, TimeUnit.MINUTES)
+        assertEquals(1, jobs.size)
+        assertTrue(shadowOf(service).isStoppedBySelf)
+        service.onStartCommand(Intent(), 0, 2)
+        ReflectionHelpers.setField(engine, "active", false)
+        ReflectionHelpers.setField(engine, "state", EngineState(phase = "启动或运行失败"))
+        ReflectionHelpers.callInstanceMethod<Unit>(service, "finished",
+            ReflectionHelpers.ClassParameter.from(Boolean::class.javaPrimitiveType, true))
+        controller.destroy()
+        shadowOf(Looper.getMainLooper()).idleFor(2, TimeUnit.MINUTES)
+        assertEquals(2, jobs.size)
     }
 
     @Test fun accessibilityAuthorizationMatchesOurServiceEvenBeforeItConnects() {
@@ -135,7 +226,7 @@ class CoreTest {
     }
 
     @Test fun settingsDetailsReturnToOverviewBeforeLeavingSettings() {
-        val details = listOf(AppPage.Assistant, AppPage.VoiceOptions, AppPage.Tasks, AppPage.Permissions, AppPage.Backup)
+        val details = listOf(AppPage.Assistant, AppPage.VoiceOptions, AppPage.Tasks, AppPage.Permissions, AppPage.Hosting, AppPage.Backup)
         details.forEach { page ->
             assertTrue(page.settings)
             assertEquals(AppPage.Settings, page.previous)
@@ -144,6 +235,9 @@ class CoreTest {
         assertTrue(AppPage.Settings.settings)
         assertFalse(AppPage.Chat.settings)
         assertEquals(AppPage.Home, AppPage.Chat.previous)
+        assertEquals("实验体", AppPage.Hosting.title)
+        assertEquals(AppPage.Hosting, AppPage.HostingOptions.previous)
+        assertEquals(AppPage.Settings, AppPage.HostingOptions.previous.previous)
     }
 
     @Test fun backGestureUsesDistanceSpeedAndReleaseDirection() {
@@ -394,6 +488,11 @@ class CoreTest {
         assertEquals(9L, status.revision)
         assertEquals(1, status.count)
         assertEquals(1, status.pending)
+        val autoOnly = MemoryStore.status(localMemoryStatus().put("settings", MemoryStore.Settings(false, true).json()).put("autoReady", true))
+        assertFalse(autoOnly.settings.enabled)
+        assertTrue(autoOnly.settings.autoSave)
+        assertTrue(autoOnly.autoReady)
+        assertFalse(autoOnly.active)
         assertEquals("waiting", status.jobs.single().getString("state"))
         for (state in listOf("waiting", "running", "failed")) {
             json.getJSONArray("jobs").getJSONObject(0).put("state", state)
@@ -427,6 +526,11 @@ class CoreTest {
         assertEquals(10L, readRevision)
         assertEquals("auto", entry.source.getString("kind"))
         assertTrue(entry.source.getBoolean("confirmed"))
+        val specimen = MemoryStore.entry(localMemoryEntry("specimen").put("type", "experience")
+            .put("source", JSONObject().put("kind", "auto").put("origin", "specimen").put("session", "cultivation-1")
+                .put("events", org.json.JSONArray().put(6))))
+        assertEquals("specimen", specimen.source.getString("origin"))
+        assertEquals(6, specimen.source.getJSONArray("events").getInt(0))
         assertTrue(entry.locked)
         assertEquals(8000L, entry.expiresAt)
         assertThrows(Exception::class.java) { MemoryStore.status(json.put("settings", JSONObject.NULL).put("revision", JSONObject.NULL).put("message", "本地记忆无法读取")) }
@@ -842,7 +946,7 @@ class CoreTest {
         assertFalse(engine.restore { fail("正在备份时不应读取另一份备份"); ByteArrayInputStream(byteArrayOf()) })
         assertTrue(engine.state.backup.busy)
         var startFinished = false
-        engine.start { startFinished = true }
+        engine.start { restart -> assertFalse(restart); startFinished = true }
         assertTrue(startFinished)
         assertEquals(1, jobs.size)
         assertFalse(engine.active)
@@ -2757,14 +2861,27 @@ class CoreTest {
 
     private val contents = linkedMapOf(
         "bin/node" to "node".toByteArray(),
+        "bin/git" to "git".toByteArray(),
+        "libexec/git-core/git-remote-http" to "git http".toByteArray(),
+        "libexec/git-core/git-remote-https" to "git https".toByteArray(),
+        "share/git-core/templates/info/exclude" to "git excludes".toByteArray(),
         "start.mjs" to "start".toByteArray(),
         "plugins.mjs" to "plugins".toByteArray(),
         "phone.mjs" to "phone".toByteArray(),
         "assistant.mjs" to "assistant".toByteArray(),
+        "hosting.mjs" to "hosting".toByteArray(),
+        "specimen.mjs" to "specimen".toByteArray(),
+        "specimen-store.mjs" to "specimen store".toByteArray(),
+        "background.mjs" to "background".toByteArray(),
+        "apps.mjs" to "apps".toByteArray(),
         "memory.mjs" to "memory".toByteArray(),
         "memory-store.mjs" to "memory store".toByteArray(),
         "memory-extract.mjs" to "memory extract".toByteArray(),
         "read-budget.mjs" to "shared read budget".toByteArray(),
+        "knowledge.mjs" to "knowledge".toByteArray(),
+        "knowledge-store.mjs" to "knowledge store".toByteArray(),
+        "knowledge-search.mjs" to "knowledge search".toByteArray(),
+        "knowledge-model.mjs" to "knowledge model".toByteArray(),
         "lib/node_modules/@deepseek-ai/dsh/lib/bin.js" to "dsh".toByteArray(),
         "lib/node_modules/pnpm/bin/pnpm.cjs" to "pnpm".toByteArray(),
         "lib/node_modules/pnpm/dist/pnpm.cjs" to "pnpm code".toByteArray(),
@@ -2788,7 +2905,8 @@ class CoreTest {
     }
 
     private fun manifest(zip: ByteArray, files: Map<String, ByteArray> = contents, version: String = "test-1"): CoreStore.Manifest {
-        val entries = files.mapValues { (name, bytes) -> CoreStore.Entry(bytes.size.toLong(), hash(bytes), name == "bin/node") }
+        val entries = files.mapValues { (name, bytes) -> CoreStore.Entry(bytes.size.toLong(), hash(bytes),
+            name in listOf("bin/node", "bin/git", "libexec/git-core/git-remote-http", "libexec/git-core/git-remote-https")) }
         return CoreStore.Manifest(version, "x86_64", hash(zip), zip.size.toLong(), entries)
     }
 
@@ -2805,6 +2923,9 @@ class CoreTest {
         assertEquals(file, store.current(manifest(zip)))
         assertEquals("dsh", File(file, "lib/node_modules/@deepseek-ai/dsh/lib/bin.js").readText())
         assertTrue(File(file, "bin/node").canExecute())
+        assertTrue(File(file, "bin/git").canExecute())
+        assertTrue(File(file, "libexec/git-core/git-remote-http").canExecute())
+        assertTrue(File(file, "libexec/git-core/git-remote-https").canExecute())
         assertFalse(File(folder.root, ".archive").exists())
         assertFalse(File(folder.root, ".install").exists())
     }
@@ -2840,7 +2961,9 @@ class CoreTest {
     }
 
     @Test fun missingPluginLauncherRequiresRepairWithoutScanningOtherFiles() {
-        for (name in listOf("start.mjs", "plugins.mjs", "memory.mjs", "phone.mjs", "lib/node_modules/pnpm/dist/pnpm.cjs", "lib/node_modules/npm/lib/cli.js")) {
+        for (name in listOf("start.mjs", "plugins.mjs", "memory.mjs", "phone.mjs", "hosting.mjs", "specimen.mjs", "specimen-store.mjs", "background.mjs", "bin/git",
+            "libexec/git-core/git-remote-http", "libexec/git-core/git-remote-https", "share/git-core/templates/info/exclude",
+            "lib/node_modules/pnpm/dist/pnpm.cjs", "lib/node_modules/npm/lib/cli.js")) {
             val store = CoreStore(folder.newFolder())
             val zip = archive()
             val installed = install(store, zip)
@@ -2947,13 +3070,15 @@ class CoreTest {
             }
         }
         val engine = Engine(context, Executor { jobs.add(it) })
-        engine.start {}
+        var restart: Boolean? = null
+        engine.start { restart = it }
         assertTrue(engine.stop())
         jobs.single().run()
         org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
         assertEquals(0, assetReads)
         assertFalse(engine.active)
         assertEquals("已停止", engine.state.phase)
+        assertEquals(false, restart)
         assertFalse(EngineRecovery(files).needed)
     }
 
@@ -3220,6 +3345,149 @@ class CoreTest {
         }
         assertEquals(0, lost.get())
         assertFalse(policy.state.connected)
+    }
+
+    @Test fun hostingStatusReadsWithoutASessionAndCannotDispatchPhoneActions() {
+        val policy = ToolPolicy().apply { begin("hosting-instance") }
+        var queries = 0
+        var actions = 0
+        PolicyBridge(policy, "hosting-instance", phone = { _, _, _, _ -> actions++; JSONObject() }, phoneStatus = {
+            queries++
+            JSONObject().put("ok", true).put("enabled", true).put("locked", true).put("interactive", false).put("ready", false)
+        }) {}.use { bridge ->
+            bridge.start()
+            Socket("127.0.0.1", bridge.port).use { socket ->
+                socket.soTimeout = 3000
+                val reader = socket.getInputStream().bufferedReader()
+                fun send(value: JSONObject): JSONObject {
+                    socket.getOutputStream().write((value.toString() + "\n").toByteArray())
+                    socket.getOutputStream().flush()
+                    return JSONObject(reader.readLine())
+                }
+                assertTrue(send(JSONObject().put("version", 1).put("instance", bridge.instance).put("token", bridge.token)).getBoolean("ok"))
+                val request = JSONObject().put("id", 1).put("method", "phone-status")
+                val status = send(request).getJSONObject("result")
+                assertTrue(status.getBoolean("locked"))
+                assertFalse(status.getBoolean("interactive"))
+                assertFalse(status.getBoolean("ready"))
+                assertEquals(1, queries)
+                listOf("action", "args", "session").forEach { extra ->
+                    assertFalse(send(JSONObject(request.toString()).put(extra, "open")).getBoolean("ok"))
+                }
+                assertFalse(send(JSONObject().put("id", 2).put("method", "phone").put("session", "missing")
+                    .put("action", "home").put("args", JSONObject())).getBoolean("ok"))
+                assertEquals(1, queries)
+                assertEquals(0, actions)
+                assertTrue(policy.state.sessions.isEmpty())
+            }
+        }
+    }
+
+    @Test fun hostingSettingsValidateDraftsAndExplainActualResults() {
+        val saved = hostingSettings(true, " 20 ", "", "  读取当前界面  ")
+        assertEquals(20, saved.getInt("probability"))
+        assertEquals("读取当前界面", saved.getString("prompt"))
+        assertEquals("", saved.getString("session"))
+        listOf("-1", "101", "20.5", "", "概率").forEach { probability ->
+            assertThrows(IllegalArgumentException::class.java) { hostingSettings(true, probability, "", "任务") }
+        }
+        assertThrows(IllegalArgumentException::class.java) { hostingSettings(true, "20", "", " ") }
+        assertThrows(IllegalArgumentException::class.java) { hostingSettings(false, "20", "../session", "任务") }
+        assertThrows(IllegalArgumentException::class.java) { hostingSettings(false, "20", "", "字".repeat(4001)) }
+        assertFalse(hostingSettings(false, "0", "", "").getBoolean("enabled"))
+        assertEquals("设备锁屏，已跳过", hostingResult(JSONObject().put("reason", "locked")))
+        assertEquals("操作结果未知，未重放", hostingResult(JSONObject().put("outcome", "unknown")))
+        assertEquals("本轮执行失败", hostingResult(JSONObject().put("outcome", "failed").put("reason", "completed")))
+        assertEquals("请先启动 dsh", specimenStatus(false, false, null))
+        assertEquals("状态未知", specimenStatus(true, false, null))
+        assertEquals("正在读取或保存…", specimenStatus(true, true, null))
+        val status = JSONObject().put("settings", saved).put("running", false)
+        assertEquals("等待下一次机会", specimenStatus(true, false, status))
+        assertEquals("正在执行", specimenStatus(true, false, status.put("running", true)))
+        saved.put("enabled", false)
+        assertEquals("未启用", specimenStatus(true, false, status.put("running", false)))
+    }
+
+    @Test fun specimenDraftsSurviveRefreshAndInvalidDraftsDoNotPreventStopping() = runBlocking {
+        var saved = JSONObject().put("enabled", false).put("probability", 20).put("session", "").put("prompt", "原指令")
+        var revision = 1
+        var writes = 0
+        var reject = false
+        val state = SpecimenState(this,
+            androidx.compose.foundation.text.input.TextFieldState("20"),
+            androidx.compose.foundation.text.input.TextFieldState(),
+            androidx.compose.foundation.text.input.TextFieldState(),
+            androidx.compose.runtime.mutableStateOf(false)) { action, data ->
+            if (action == "settings") {
+                assertEquals(revision.toLong(), data.getLong("expectedRevision"))
+                if (reject) error("保存失败")
+                saved = JSONObject(data.getJSONObject("settings").toString())
+                revision++; writes++
+            }
+            JSONObject().put("revision", revision).put("settings", JSONObject(saved.toString())).put("running", false)
+        }
+        suspend fun awaitRequest() { withTimeout(3000) { while (state.loading) kotlinx.coroutines.delay(10) } }
+        state.request(); awaitRequest()
+        assertEquals("原指令", state.prompt.text.toString())
+        state.prompt.edit { replace(0, length, "编辑中的草稿") }
+        state.request(); awaitRequest()
+        assertEquals("编辑中的草稿", state.prompt.text.toString())
+        assertEquals("原指令", state.status!!.getJSONObject("settings").getString("prompt"))
+        var returned = 0
+        state.save(true, done = { returned++ }); awaitRequest()
+        assertTrue(state.enabled)
+        assertEquals(1, returned)
+        assertEquals("编辑中的草稿", saved.getString("prompt"))
+        // 关闭不提交坏草稿，也不以表单校验阻挡停止。
+        state.prompt.edit { replace(0, length, "") }
+        state.probability.edit { replace(0, length, "999") }
+        state.session.edit { replace(0, length, "../bad") }
+        state.save(false, stop = true); awaitRequest()
+        assertFalse(state.enabled)
+        assertEquals(20, saved.getInt("probability"))
+        assertEquals("编辑中的草稿", saved.getString("prompt"))
+        assertEquals("", saved.getString("session"))
+        assertEquals(2, writes)
+        state.prompt.edit { replace(0, length, "不应保存") }
+        reject = true
+        state.save(done = { returned++ }); awaitRequest()
+        assertEquals("保存失败", state.error)
+        assertEquals(1, returned)
+        assertEquals("编辑中的草稿", saved.getString("prompt"))
+        state.leave(clear = true)
+        assertNull(state.status)
+        assertFalse(state.loading)
+    }
+
+    @Test fun hostingBridgeUsesItsOwnChannelAndReleasesPendingRequestsOnDisconnect() {
+        val policy = ToolPolicy().apply { begin("hosting-channel") }
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            PolicyBridge(policy, "hosting-channel") {}.use { bridge ->
+                bridge.start()
+                Socket("127.0.0.1", bridge.port).use { socket ->
+                    socket.soTimeout = 3000
+                    val reader = socket.getInputStream().bufferedReader()
+                    fun send(value: JSONObject) {
+                        socket.getOutputStream().write((value.toString() + "\n").toByteArray()); socket.getOutputStream().flush()
+                    }
+                    send(JSONObject().put("version", 1).put("instance", bridge.instance).put("token", bridge.token))
+                    assertTrue(JSONObject(reader.readLine()).getBoolean("ok"))
+                    val request = executor.submit<JSONObject> { bridge.hosting("status") }
+                    val frame = JSONObject(reader.readLine())
+                    assertTrue(frame.has("hosting")); assertFalse(frame.has("voice")); assertFalse(frame.has("memory"))
+                    assertEquals("status", frame.getString("action"))
+                    send(JSONObject().put("hosting", frame.getString("hosting")).put("ok", true).put("result", JSONObject().put("revision", 7)))
+                    assertEquals(7, request.get(3, TimeUnit.SECONDS).getInt("revision"))
+                    assertThrows(IllegalArgumentException::class.java) { bridge.hosting("execute") }
+                    val pending = executor.submit<JSONObject> { bridge.hosting("status") }
+                    assertTrue(JSONObject(reader.readLine()).has("hosting"))
+                    bridge.close()
+                    assertThrows(java.util.concurrent.ExecutionException::class.java) { pending.get(3, TimeUnit.SECONDS) }
+                    assertTrue(ReflectionHelpers.getField<Map<*, *>>(bridge, "nativeCalls").isEmpty())
+                }
+            }
+        } finally { executor.shutdownNow() }
     }
 
     @Test fun policyBridgeLosesAuthorityOnAuthenticatedDisconnect() {
@@ -5238,6 +5506,35 @@ class CoreTest {
         assertEquals(setOf(shared, project), store.skills().map { store.file(it.id) }.toSet())
     }
 
+    @Test fun specimenSkillAdoptionIsDurableIdempotentAndKeepsUserEdits() {
+        val store = LibraryStore(folder.root)
+        val body = "---\nname: specimen-read-page\ndescription: 读取页面\n---\n\n检查页面再读取。"
+        val digest = java.security.MessageDigest.getInstance("SHA-256").digest(body.toByteArray()).joinToString("") { "%02x".format(it) }
+        val proposal = JSONObject().put("id", "candidate-1").put("operation", "operation-1").put("name", "specimen-read-page")
+            .put("body", body).put("digest", digest).put("workspace", File(folder.root, "workspace").absolutePath)
+        val wrongWorkspace = JSONObject(proposal.toString()).put("workspace", "/another-workspace")
+        assertThrows(LibraryStore.SkillNotWritten::class.java) { store.adoptSkill(wrongWorkspace) }
+        val collision = File(folder.root, "workspace/.dsh/skills/specimen-read-page/SKILL.md").apply { parentFile!!.mkdirs(); writeText("用户原有文件") }
+        assertThrows(LibraryStore.SkillNotWritten::class.java) { store.adoptSkill(proposal) }
+        assertEquals("用户原有文件", collision.readText()); collision.delete()
+        val first = store.adoptSkill(proposal)
+        val target = store.file(first.getString("path"))
+        assertTrue(target.absolutePath.contains("workspace/.dsh/skills/"))
+        assertEquals(body, target.readText())
+        assertEquals(first.toString(), LibraryStore(folder.root).adoptSkill(proposal).toString())
+        val receipts = File(folder.root, "specimen-adoptions.json")
+        val pending = JSONObject(receipts.readText()).apply { getJSONObject("operation-1").put("phase", "pending") }
+        receipts.writeText(pending.toString())
+        assertEquals("文件已写而最终回执丢失时恢复同步", first.toString(), LibraryStore(folder.root).adoptSkill(proposal).toString())
+        receipts.writeText(pending.toString()); target.delete()
+        assertEquals("发布前中断可以继续同一操作", first.toString(), LibraryStore(folder.root).adoptSkill(proposal).toString())
+        target.writeText(body + "\n用户改动")
+        assertThrows(IllegalArgumentException::class.java) { LibraryStore(folder.root).adoptSkill(proposal) }
+        assertTrue(target.readText().endsWith("用户改动"))
+        proposal.put("name", "../escape")
+        assertThrows(IllegalArgumentException::class.java) { store.adoptSkill(proposal) }
+    }
+
     @Test fun librarySkillValidationNeverReplacesExistingFilesOnFailure() {
         val store = LibraryStore(folder.root)
         val text = "---\nname: read-notes\ndescription: 阅读笔记\n---\n\n正文"
@@ -5262,6 +5559,506 @@ class CoreTest {
         assertTrue(store.file(entry.id).parentFile!!.list()!!.none { it.endsWith(".tmp") })
         val short = "---\nname: a\ndescription: 读\n---\n正文"
         assertEquals(short, store.readSkill(store.saveSkill("a", short)).text)
+    }
+
+    private fun microPackage(): JSONObject = RuntimeEnvironment.getApplication().assets
+        .open("skills/create-dshx-app/assets/skip-startup-ads.json").bufferedReader().use { JSONObject(it.readText()) }
+
+    private fun microInstall(store: AppStore, value: JSONObject = microPackage()): JSONObject {
+        val check = store.call("check", JSONObject().put("package", value))
+        store.call("install", JSONObject().put("checkId", check.getString("checkId")).put("hash", check.getString("hash"))
+            .put("operationId", java.util.UUID.randomUUID().toString()).put("expectedRevision", store.status().getLong("revision")))
+        return store.status().getJSONArray("apps").getJSONObject(0)
+    }
+
+    private fun microChange(store: AppStore, action: String, settings: JSONObject? = null): JSONObject = store.call(action,
+        JSONObject().put("id", "skip-startup-ads").put("operationId", java.util.UUID.randomUUID().toString())
+            .put("expectedRevision", store.status().getLong("revision")).apply { settings?.let { put("settings", it) } })
+
+    private fun microObservation(vararg texts: String): JSONObject = JSONObject().put("truncated", false)
+        .put("nodes", org.json.JSONArray(texts.mapIndexed { index, text ->
+            JSONObject().put("id", "n$index").put("text", text).put("enabled", true).put("textTruncated", false)
+                .put("clickTarget", if (text.contains("跳过")) "n$index" else "").put("viewId", "test:id/$index")
+        }))
+
+    private fun notesPackage(): JSONObject = RuntimeEnvironment.getApplication().assets
+        .open("skills/create-dshx-app/assets/quick-notes.json").bufferedReader().use { JSONObject(it.readText()) }
+
+    private fun apkSigner(): com.android.apksig.ApkSigner.SignerConfig {
+        val keys = java.security.KeyPairGenerator.getInstance("RSA").apply { initialize(2048) }.generateKeyPair()
+        val name = org.bouncycastle.asn1.x500.X500Name("CN=Micro app test")
+        val certificate = org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder(name, java.math.BigInteger.ONE,
+            java.util.Date(0), java.util.Date(4_102_444_800_000L), name, keys.public)
+            .build(org.bouncycastle.operator.jcajce.JcaContentSignerBuilder("SHA256withRSA").build(keys.private))
+        return com.android.apksig.ApkSigner.SignerConfig.Builder("test", keys.private,
+            listOf(org.bouncycastle.cert.jcajce.JcaX509CertificateConverter().getCertificate(certificate))).build()
+    }
+
+    @Test fun microApkExportsSignedIndependentPackagesAndKeepsUpdatesCompatible() {
+        val context = RuntimeEnvironment.getApplication()
+        val template = folder.newFile("runtime.apk")
+        context.assets.open("micro-apk/runtime.apk").use { input -> template.outputStream().use { input.copyTo(it) } }
+        val app = AppPackage.parse(notesPackage())
+        val signer = apkSigner()
+        val first = folder.newFile("notes.apk")
+        AppApk.assemble(template, app, 1, signer, first)
+        val verified = com.android.apksig.ApkVerifier.Builder(first).setMinCheckedPlatformVersion(26).build().verify()
+        assertTrue(verified.errors.toString(), verified.isVerified)
+        assertTrue(verified.isVerifiedUsingV2Scheme)
+        val module = com.reandroid.apk.ApkModule.loadApkFile(first)
+        try {
+            assertEquals(AppApk.packageName(app.id), module.androidManifest.packageName)
+            assertEquals(app.name, module.androidManifest.applicationLabelString)
+            assertEquals(app.version, module.androidManifest.versionName)
+            assertTrue(module.androidManifest.usesPermissions.isEmpty())
+            assertTrue(module.androidManifest.listApplicationElementsByTag("service").isEmpty())
+            assertEquals(AppApk.packageName(app.id), module.tableBlock.listPackages().single().name)
+        } finally { module.close() }
+        java.util.zip.ZipFile(first).use { zip ->
+            val packaged = zip.getInputStream(zip.getEntry("assets/micro-app/app.json")).bufferedReader().use { it.readText() }
+            assertEquals(app.json, AppPackage.parse(JSONObject(packaged)).json)
+            assertNotNull(zip.getEntry("assets/micro-app/sdk.js"))
+            assertTrue(zip.entries().asSequence().none { it.name.contains("core.zip") || it.name.contains("storage.json") || it.name.contains("state.json") || it.name.contains("lib/") })
+        }
+        val next = AppPackage.parse(notesPackage().put("version", "1.0.1"))
+        val second = folder.newFile("notes-update.apk")
+        AppApk.assemble(template, next, 2, signer, second)
+        val update = com.android.apksig.ApkVerifier.Builder(second).setMinCheckedPlatformVersion(26).build().verify()
+        assertTrue(update.isVerified)
+        assertArrayEquals(verified.signerCertificates.single().encoded, update.signerCertificates.single().encoded)
+        assertNotEquals(AppApk.packageName(app.id), AppApk.packageName("another-app"))
+        java.io.RandomAccessFile(second, "rw").use { it.seek(100); it.write(0) }
+        assertFalse(com.android.apksig.ApkVerifier.Builder(second).setMinCheckedPlatformVersion(26).build().verify().isVerified)
+    }
+
+    @Test fun microApkPreservesDeclaredBackgroundAndPhoneCapabilitiesWithoutPrivateSettings() {
+        val template = folder.newFile("phone-runtime.apk")
+        RuntimeEnvironment.getApplication().assets.open("micro-apk/runtime.apk").use { input -> template.outputStream().use { input.copyTo(it) } }
+        val definition = AppPackage.parse(microPackage().put("network", org.json.JSONArray(listOf("https://example.com"))))
+        val output = folder.newFile("phone.apk")
+        AppApk.assemble(template, definition, 1, apkSigner(), output)
+        val module = com.reandroid.apk.ApkModule.loadApkFile(output)
+        try {
+            assertEquals(setOf("android.permission.INTERNET", "android.permission.FOREGROUND_SERVICE", "android.permission.POST_NOTIFICATIONS"), module.androidManifest.usesPermissions.toSet())
+            val services = module.androidManifest.listApplicationElementsByTag("service")
+            assertEquals(2, services.size)
+            assertTrue(services.any { it.searchAttributeByResourceId(com.reandroid.arsc.chunk.xml.AndroidManifestBlock.ID_name).valueAsString == "local.dshx.app.PhoneService" })
+        } finally { module.close() }
+        java.util.zip.ZipFile(output).use { zip ->
+            val value = zip.getInputStream(zip.getEntry("assets/micro-app/app.json")).bufferedReader().use { JSONObject(it.readText()) }
+            assertEquals(0, value.getJSONArray("settings").getJSONObject(0).getJSONArray("default").length())
+            assertFalse(value.has("enabled")); assertFalse(value.has("storage"))
+        }
+        val broken = folder.newFile("broken.apk").apply { writeText("not an apk") }
+        val failed = File(output.parentFile, "failed.apk")
+        assertThrows(Exception::class.java) { AppApk.assemble(broken, definition, 1, apkSigner(), failed) }
+        assertFalse(failed.exists()); assertFalse(File(output.parentFile, "unsigned.apk").exists())
+    }
+
+    @Test @Config(shadows = [PhoneAccess::class])
+    fun microApkPhoneCallsRequireEnabledUnlockedScreenAndLiveOwner() {
+        val context = RuntimeEnvironment.getApplication()
+        val lock = shadowOf(context.getSystemService(KeyguardManager::class.java))
+        val power = shadowOf(context.getSystemService(PowerManager::class.java))
+        lock.setKeyguardLocked(false); lock.setIsDeviceLocked(false); power.turnScreenOn(true)
+        val controller = phoneService()
+        var enabled = true
+        val phone = AppPhone(context) { enabled }
+        try {
+            phoneRoot(controller.get())
+            val result = phone.call("observe", JSONObject(), "micro:test") { true }
+            assertTrue(result.has("snapshot")); phone.clear("micro:test")
+            enabled = false
+            assertThrows(IllegalArgumentException::class.java) { phone.call("observe", JSONObject(), "micro:test") { true } }
+            enabled = true; lock.setKeyguardLocked(true)
+            assertThrows(IllegalArgumentException::class.java) { phone.call("observe", JSONObject(), "micro:test") { true } }
+            lock.setKeyguardLocked(false); power.turnScreenOn(false)
+            assertThrows(IllegalArgumentException::class.java) { phone.call("observe", JSONObject(), "micro:test") { true } }
+            power.turnScreenOn(true)
+            assertThrows(IllegalArgumentException::class.java) { phone.call("observe", JSONObject(), "micro:test") { false } }
+        } finally { controller.destroy() }
+    }
+
+    @Test fun microAppCanSaveSettingsWhileDisabledWithoutBrieflyGrantingPhoneAccess() {
+        val store = AppStore(folder.newFolder("micro-configure"))
+        microInstall(store)
+        var started = 0
+        store.observe { if (store.active().isNotEmpty()) started++ }
+        val row = store.status("skip-startup-ads").getJSONArray("apps").getJSONObject(0)
+        store.configure("skip-startup-ads", JSONObject().put("apps", org.json.JSONArray()), row.getLong("revision"))
+        assertEquals(0, started); assertTrue(store.active().isEmpty())
+        assertThrows(IllegalArgumentException::class.java) {
+            store.configure("skip-startup-ads", JSONObject().put("apps", org.json.JSONArray()), row.getLong("revision"))
+        }
+        val current = store.status("skip-startup-ads").getJSONArray("apps").getJSONObject(0)
+        assertThrows(IllegalArgumentException::class.java) {
+            store.configure("skip-startup-ads", JSONObject().put("unknown", true), current.getLong("revision"))
+        }
+        assertTrue(store.active().isEmpty()); assertTrue(store.verify())
+    }
+
+    @Test fun microAppPackagesAcceptIndependentPagesLogicAndOptionalBackgroundEntries() {
+        val note = notesPackage()
+        val app = AppPackage.parse(note)
+        assertEquals("index.html", app.entry)
+        assertNull(app.background)
+        assertFalse(app.usesScreen)
+        assertEquals(setOf("storage"), app.capabilities)
+        assertTrue(app.files.getValue("main.js").contains("dshx.storage.set"))
+        val ad = AppPackage.parse(microPackage())
+        assertEquals("background.js", ad.background)
+        assertTrue(ad.usesScreen)
+        assertTrue(ad.scope(ad.settings(JSONObject())).isEmpty())
+        val fields = note.getJSONArray("settings")
+        fields.put(JSONObject().put("id", "title").put("type", "text").put("label", "标题").put("default", "便签"))
+        fields.put(JSONObject().put("id", "count").put("type", "number").put("label", "数量").put("default", 2))
+        fields.put(JSONObject().put("id", "show").put("type", "switch").put("label", "显示").put("default", false))
+        val settings = AppPackage.parse(note).settings(JSONObject().put("title", "我的便签").put("count", 3).put("show", true))
+        assertEquals("我的便签", settings.getString("title")); assertEquals(3, settings.getInt("count")); assertTrue(settings.getBoolean("show"))
+    }
+
+    @Test fun microAppPackagesRejectMissingEntriesPathEscapesUnknownCapabilitiesAndUnsafeScopes() {
+        assertThrows(IllegalArgumentException::class.java) { AppPackage.parse(microPackage().put("script", "任意字段")) }
+        val scope = microPackage()
+        scope.getJSONArray("settings").getJSONObject(0).put("default", org.json.JSONArray(listOf("test.app")))
+        assertThrows(IllegalArgumentException::class.java) { AppPackage.parse(scope) }
+        assertThrows(IllegalArgumentException::class.java) { AppPackage.parse(microPackage().put("entry", "missing.html")) }
+        assertThrows(IllegalArgumentException::class.java) { AppPackage.parse(microPackage().put("background", "missing.js")) }
+        val escape = microPackage(); escape.getJSONObject("files").put("../escape.js", "code")
+        assertThrows(IllegalArgumentException::class.java) { AppPackage.parse(escape) }
+        assertThrows(IllegalArgumentException::class.java) { AppPackage.parse(microPackage().put("capabilities", org.json.JSONArray(listOf("shell")))) }
+        assertThrows(IllegalArgumentException::class.java) { AppPackage.parse(microPackage().put("network", org.json.JSONArray(listOf("http://example.com")))) }
+        assertThrows(IllegalArgumentException::class.java) { AppPackage.parse(microPackage().put("id", "../escape")) }
+    }
+
+    @Test fun microAppPureAppsEnableWithoutPhoneScopesAndKeepDataIsolatedAcrossRestartAndUpdate() {
+        val store = AppStore(folder.root)
+        val note = notesPackage()
+        microInstall(store, note)
+        fun enable(id: String) = store.call("enable", JSONObject().put("id", id).put("settings", JSONObject())
+            .put("operationId", java.util.UUID.randomUUID().toString()).put("expectedRevision", store.status().getLong("revision")))
+        enable("quick-notes")
+        assertEquals(1, store.active().size)
+        store.storage("quick-notes", "set", JSONObject().put("key", "text").put("value", "独立便签"))
+        val firstRevision = store.active().single().revision
+        microInstall(store, JSONObject(note.toString()).put("id", "other-notes")); enable("other-notes")
+        assertEquals(firstRevision, store.active().first { it.app.id == "quick-notes" }.revision)
+        assertTrue(store.storage("other-notes", "get", JSONObject().put("key", "text")).isNull("value"))
+        assertEquals("独立便签", AppStore(folder.root).storage("quick-notes", "get", JSONObject().put("key", "text")).getString("value"))
+        val revision = store.active().first { it.app.id == "quick-notes" }.revision
+        microInstall(store, JSONObject(note.toString()).put("version", "1.0.1"))
+        assertThrows(IllegalArgumentException::class.java) { store.storage("quick-notes", "set", JSONObject().put("key", "text").put("value", "旧页面不应写入"), revision) }
+        assertEquals("独立便签", store.storage("quick-notes", "get", JSONObject().put("key", "text")).getString("value"))
+    }
+
+    @Test fun microAppPageServesOnlyItsPackageInjectsSdkAndRestrictsNetworkAndNavigation() {
+        val store = AppStore(folder.root)
+        microInstall(store, notesPackage())
+        store.call("enable", JSONObject().put("id", "quick-notes").put("settings", JSONObject()).put("operationId", "enable-notes").put("expectedRevision", 1))
+        val host = AppHost(RuntimeEnvironment.getApplication(), store)
+        val page = host.open("quick-notes")
+        try {
+            val html = page.resource("https://quick-notes.apps.dshx.local/index.html")!!
+            assertEquals(200, html.statusCode)
+            val body = html.data.bufferedReader().readText()
+            assertTrue(body.indexOf("/__dshx/sdk.js") < body.indexOf("main.js"))
+            assertTrue(html.responseHeaders.getValue("Content-Security-Policy").contains("frame-src 'none'"))
+            assertEquals(403, page.resource("file:///etc/passwd")!!.statusCode)
+            assertEquals(403, page.resource("https://other-notes.apps.dshx.local/main.js")!!.statusCode)
+            assertEquals(403, page.resource("https://example.com/data")!!.statusCode)
+            assertEquals(403, page.resource("https://quick-notes.apps.dshx.local/../state.json")!!.statusCode)
+            assertEquals(404, page.resource("https://quick-notes.apps.dshx.local/missing.js")!!.statusCode)
+            assertFalse(page.view.settings.allowFileAccess)
+            assertFalse(page.view.settings.allowContentAccess)
+            assertFalse(page.view.settings.javaScriptCanOpenWindowsAutomatically)
+        } finally { page.close() }
+    }
+
+    @Test fun microAppDisableClosesPagesBeforePendingVerificationCanFinish() {
+        val store = AppStore(folder.root)
+        microInstall(store, notesPackage())
+        store.call("enable", JSONObject().put("id", "quick-notes").put("settings", JSONObject()).put("operationId", "enable-before-pause").put("expectedRevision", 1))
+        val host = AppHost(RuntimeEnvironment.getApplication(), store)
+        val entered = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        val io = ReflectionHelpers.getField<java.util.concurrent.ExecutorService>(host, "io")
+        io.execute { entered.countDown(); release.await(10, TimeUnit.SECONDS) }
+        assertTrue(entered.await(2, TimeUnit.SECONDS))
+        val page = host.open("quick-notes")
+        try {
+            assertTrue(ReflectionHelpers.getField(host, "syncing"))
+            store.call("disable", JSONObject().put("id", "quick-notes").put("operationId", "disable-while-sync").put("expectedRevision", 2))
+            shadowOf(Looper.getMainLooper()).idle()
+            assertTrue("停用清理不应等待文件校验", ReflectionHelpers.getField(page, "closed"))
+            assertTrue(ReflectionHelpers.getField(host, "syncing"))
+        } finally { release.countDown(); page.close() }
+    }
+
+    @Test fun microAppInstallKeepsEmptyScopeAndPersistsExplicitDisableAcrossResumeAndRestart() {
+        val store = AppStore(folder.root)
+        assertFalse(microInstall(store).getBoolean("enabled"))
+        assertThrows(IllegalArgumentException::class.java) { microChange(store, "enable", JSONObject().put("apps", org.json.JSONArray())) }
+        microChange(store, "enable", JSONObject().put("apps", org.json.JSONArray(listOf("test.app"))))
+        assertEquals(1, store.active().size)
+        microChange(store, "disable")
+        PhoneControl(RuntimeEnvironment.getApplication()).resume()
+        assertTrue(store.active().isEmpty())
+        val reopened = AppStore(folder.root)
+        assertTrue(reopened.active().isEmpty())
+        assertFalse(reopened.status().getJSONArray("apps").getJSONObject(0).getBoolean("enabled"))
+    }
+
+    @Test fun microAppModificationReceiptsAreStableAndRejectStaleOrChangedRequests() {
+        val store = AppStore(folder.root)
+        microInstall(store)
+        val data = JSONObject().put("id", "skip-startup-ads").put("operationId", "same-operation").put("expectedRevision", 1)
+        val first = store.call("disable", data)
+        val reordered = JSONObject().put("expectedRevision", 1).put("operationId", "same-operation").put("id", "skip-startup-ads")
+        assertEquals(first.toString(), store.call("disable", reordered).toString())
+        assertEquals(2L, store.status().getLong("revision"))
+        assertEquals(first.toString(), store.call("status", JSONObject().put("operationId", "same-operation")).toString())
+        assertThrows(IllegalArgumentException::class.java) { store.call("remove", JSONObject(data.toString()).put("deleteData", false)) }
+        assertThrows(IllegalArgumentException::class.java) { store.call("disable", JSONObject(data.toString()).put("operationId", "stale")) }
+        assertFalse(store.call("status", JSONObject().put("operationId", "unknown")).getBoolean("known"))
+    }
+
+    @Test fun microAppUpdatesNeverOverwriteVersionAndKeepOldPackageOnFailure() {
+        val store = AppStore(folder.root)
+        microInstall(store)
+        microChange(store, "enable", JSONObject().put("apps", org.json.JSONArray(listOf("test.app"))))
+        val changed = microPackage().put("description", "同版本不允许替换")
+        assertThrows(IllegalArgumentException::class.java) { microInstall(store, changed) }
+        assertEquals("1.0.0", store.active().single().app.version)
+        microInstall(store, changed.put("version", "1.0.1"))
+        assertTrue(store.active().isEmpty())
+        assertEquals("test.app", store.status().getJSONArray("apps").getJSONObject(0).getJSONObject("settings").getJSONArray("apps").getString(0))
+        store.call("rollback", JSONObject().put("id", "skip-startup-ads").put("version", "1.0.0")
+            .put("operationId", "rollback").put("expectedRevision", store.status().getLong("revision")))
+        assertEquals("1.0.0", store.status().getJSONArray("apps").getJSONObject(0).getString("version"))
+        assertTrue(store.active().isEmpty())
+    }
+
+    @Test fun microAppChecksExpireAndCannotBeInstalledWithDifferentContentHash() {
+        var time = 1000L
+        val store = AppStore(folder.root, { time })
+        val check = store.call("check", JSONObject().put("package", microPackage()))
+        val install = JSONObject().put("checkId", check.getString("checkId")).put("hash", "wrong")
+            .put("operationId", "install").put("expectedRevision", 0)
+        assertThrows(IllegalArgumentException::class.java) { store.call("install", install) }
+        time += 300_001
+        assertThrows(IllegalArgumentException::class.java) { store.call("install", install.put("hash", check.getString("hash"))) }
+        assertEquals(0, store.status().getJSONArray("apps").length())
+    }
+
+    @Test fun microAppRejectsInvisibleApplicationsAndPreservesCorruptStateForRecovery() {
+        val store = AppStore(folder.root, visibleApps = { setOf("allowed.app") })
+        microInstall(store)
+        assertThrows(IllegalArgumentException::class.java) {
+            microChange(store, "enable", JSONObject().put("apps", org.json.JSONArray(listOf("hidden.app"))))
+        }
+        assertTrue(store.active().isEmpty())
+        val state = File(folder.root, "micro-apps/state.json").apply { writeText("损坏的数据") }
+        val corrupt = AppStore(folder.root)
+        assertNotNull(corrupt.error)
+        assertTrue(corrupt.active().isEmpty())
+        assertEquals("损坏的数据", state.readText())
+        assertThrows(IllegalArgumentException::class.java) { microInstall(corrupt) }
+    }
+
+    @Test fun microAppRejectsExternalPackageChangesAndDoesNotRecreateRemovedLogs() {
+        val store = AppStore(folder.root)
+        microInstall(store)
+        assertTrue(store.verify())
+        val file = File(folder.root, "micro-apps/packages/skip-startup-ads/1.0.0/app.json")
+        file.writeText(microPackage().put("description", "外部改动").toString())
+        assertFalse(store.verify())
+        assertNotNull(store.error)
+        assertTrue(store.status().getJSONArray("apps").getJSONObject(0).has("error"))
+        store.call("remove", JSONObject().put("id", "skip-startup-ads").put("deleteData", true)
+            .put("operationId", "remove").put("expectedRevision", store.status().getLong("revision")))
+        store.record("skip-startup-ads", "1.0.0", "rule", "unknown", "cancelled", "trigger")
+        assertFalse(File(folder.root, "micro-apps/data/skip-startup-ads/events.jsonl").exists())
+    }
+
+    @Test fun microAppBuiltinSkillIncludesReferencesAndPreservesUserEdits() {
+        val assets = RuntimeEnvironment.getApplication().assets
+        val store = LibraryStore(folder.root)
+        store.prepareSkills(assets)
+        val root = File(folder.root, "home/.dsh/skills/create-dshx-app")
+        assertTrue(File(root, "references/runtime.md").isFile)
+        assertTrue(File(root, "references/ad-skip.md").isFile)
+        assertTrue(File(root, "assets/skip-startup-ads.json").isFile)
+        val skill = File(root, "SKILL.md")
+        skill.appendText("\n用户自己的规则")
+        store.prepareSkills(assets)
+        assertTrue(skill.readText().endsWith("用户自己的规则"))
+    }
+
+    @Test @Config(shadows = [PhoneAccess::class])
+    fun microAppCannotReplaceAChatObservationBetweenCallsAndOldCleanupCannotClearNewOwner() {
+        val controller = phoneService()
+        try {
+            val service = controller.get()
+            phoneRoot(service)
+            val snapshot = service.observe("chat", { true }, {})
+            assertFalse(service.available("app:test"))
+            service.clear("app:old")
+            assertFalse(service.available("app:test"))
+            val saved = ReflectionHelpers.getField<Any>(service, "frame")
+            assertEquals(snapshot.getString("snapshot"), ReflectionHelpers.getField<String>(saved, "id"))
+            service.clear("chat")
+            assertTrue(service.available("app:test"))
+            service.observe("app:new", { true }, {})
+            service.clear("app:old")
+            assertFalse(service.available("chat"))
+        } finally { controller.destroy() }
+    }
+
+    @Test @Config(shadows = [PhoneAccess::class])
+    fun microAppNativeRuleSharesLockAndEnableChecksAndReturnsRealViewIds() {
+        val context = RuntimeEnvironment.getApplication()
+        shadowOf(context.getSystemService(KeyguardManager::class.java)).apply { setKeyguardLocked(false); setIsDeviceLocked(false) }
+        shadowOf(context.getSystemService(PowerManager::class.java)).turnScreenOn(true)
+        val control = PhoneControl(context)
+        val controller = phoneService()
+        try {
+            val root = phoneRoot(controller.get())
+            val node = phoneNode(root.window, "广告").apply { viewIdResourceName = "test.app:id/ad" }
+            shadowOf(root).addChild(node)
+            val result = control.appCall("observe", JSONObject(), "app:test") { true }
+            assertEquals("test.app:id/ad", AppPackage.completeNodes(result).single { it.optString("text") == "广告" }.getString("viewId"))
+            control.setEnabled(false)
+            assertEquals("disabled", assertThrows(PhoneFailure::class.java) { control.appCall("observe", JSONObject(), "app:test") { true } }.code)
+            control.setEnabled(true)
+            shadowOf(context.getSystemService(KeyguardManager::class.java)).setKeyguardLocked(true)
+            assertEquals("locked", assertThrows(PhoneFailure::class.java) { control.appCall("observe", JSONObject(), "app:test") { true } }.code)
+        } finally { controller.destroy() }
+    }
+
+    @Test fun microAppResultsSeparateClickReceiptFromBusinessConfirmation() {
+        assertTrue(appEvent(JSONObject().put("outcome", "completed")).contains("未确认"))
+        assertTrue(appEvent(JSONObject().put("outcome", "confirmed")).contains("已确认"))
+        assertTrue(appEvent(JSONObject().put("outcome", "unknown")).contains("未重放"))
+        assertEquals("已停用", appState(JSONObject().put("enabled", false), JSONObject()))
+    }
+
+    @Test fun microAppRollbackRejectsAnExternallyModifiedHistoricalVersion() {
+        val store = AppStore(folder.root)
+        microInstall(store)
+        microInstall(store, microPackage().put("version", "1.0.1"))
+        File(folder.root, "micro-apps/packages/skip-startup-ads/1.0.0/app.json").writeText(microPackage().put("description", "历史文件被修改").toString())
+        assertThrows(IllegalArgumentException::class.java) {
+            store.call("rollback", JSONObject().put("id", "skip-startup-ads").put("version", "1.0.0")
+                .put("operationId", "rollback-changed").put("expectedRevision", store.status().getLong("revision")))
+        }
+        assertEquals("1.0.1", store.status().getJSONArray("apps").getJSONObject(0).getString("version"))
+    }
+
+    @Test fun microAppBridgeRequiresLiveSessionsAndDoesNotDispatchPhoneActions() {
+        val policy = ToolPolicy().apply { begin("micro-bridge") }
+        val calls = AtomicInteger(); val phoneCalls = AtomicInteger()
+        PolicyBridge(policy, "micro-bridge", phone = { _, _, _, _ -> phoneCalls.incrementAndGet(); JSONObject() },
+            apps = { action, data -> calls.incrementAndGet(); assertEquals("status", action); assertEquals(0, data.length()); JSONObject().put("revision", 4) }) {}.use { bridge ->
+            bridge.start()
+            Socket("127.0.0.1", bridge.port).use { socket ->
+                socket.soTimeout = 3000
+                val reader = socket.getInputStream().bufferedReader()
+                fun send(row: JSONObject): JSONObject {
+                    socket.getOutputStream().write((row.toString() + "\n").toByteArray()); socket.getOutputStream().flush()
+                    return JSONObject(reader.readLine())
+                }
+                assertTrue(send(JSONObject().put("version", 1).put("instance", bridge.instance).put("token", bridge.token)).getBoolean("ok"))
+                fun request(id: Int) = JSONObject().put("id", id).put("method", "apps").put("session", "root").put("action", "status").put("args", JSONObject())
+                assertFalse(send(request(1)).getBoolean("ok"))
+                policy.register(bridge.instance, "root", "微应用", null)
+                assertEquals(4, send(request(2)).getJSONObject("result").getInt("revision"))
+                assertFalse(send(request(3).put("phone", "click")).getBoolean("ok"))
+                assertEquals(1, calls.get()); assertEquals(0, phoneCalls.get())
+            }
+        }
+    }
+
+    @Test @Config(shadows = [PhoneAccess::class, UnreadablePhoneNode::class])
+    fun microAppUnreadableDeclaredBranchesAreNeverTreatedAsComplete() {
+        val controller = phoneService()
+        try {
+            phoneRoot(controller.get())
+            val observation = controller.get().observe("app:test", { true }, {}, verifyTree = true)
+            assertTrue(observation.getBoolean("truncated"))
+            assertThrows(IllegalArgumentException::class.java) { AppPackage.completeNodes(observation) }
+        } finally { controller.destroy() }
+    }
+
+    @Test @Config(shadows = [PhoneAccess::class])
+    fun microAppRechecksOtherPageEvidenceBeforeDispatchingAnUnchangedClickTarget() {
+        val controller = phoneService()
+        try {
+            val service = controller.get(); val root = phoneRoot(service)
+            shadowOf(root).addChild(phoneNode(root.window, "广告"))
+            val skip = phoneNode(root.window, "跳过").apply {
+                isClickable = true; addAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_CLICK)
+            }
+            shadowOf(root).addChild(skip)
+            fun ready(): JSONObject {
+                val observed = service.observe("app:test", { true }, {}, verifyTree = true)
+                val saved = ReflectionHelpers.getField<Any>(service, "frame")
+                ReflectionHelpers.getField<List<Any>>(saved, "reads").forEach { read ->
+                    shadowOf(ReflectionHelpers.getField<AccessibilityNodeInfo>(read, "node")).setRefreshReturnValue(true)
+                }
+                val node = phoneTarget(service, AppPackage.completeNodes(observed).single { it.optString("text") == "跳过" }.getString("clickTarget"))
+                shadowOf(node).setRefreshReturnValue(true)
+                shadowOf(node).setOnPerformActionListener { action, _ -> action == AccessibilityNodeInfo.ACTION_CLICK }
+                return observed
+            }
+            val before = ready()
+            val beforeTarget = AppPackage.completeNodes(before).single { it.optString("text") == "跳过" }.getString("clickTarget")
+            assertTrue(service.act("click", JSONObject().put("snapshot", before.getString("snapshot")).put("node", beforeTarget), "app:test", {}, {}).getBoolean("ok"))
+            val actionsBefore = shadowOf(skip).performedActions.size
+            val observation = ready()
+            val target = AppPackage.completeNodes(observation).single { it.optString("text") == "跳过" }.getString("clickTarget")
+            val frame = ReflectionHelpers.getField<Any>(service, "frame")
+            val reads = ReflectionHelpers.getField<List<Any>>(frame, "reads")
+            reads.forEach { read -> shadowOf(ReflectionHelpers.getField<AccessibilityNodeInfo>(read, "node")).setRefreshReturnValue(true) }
+            val ad = reads.map { ReflectionHelpers.getField<AccessibilityNodeInfo>(it, "node") }.first { it.text?.toString() == "广告" }
+            ad.text = "普通引导"
+            val dispatched = AtomicInteger()
+            assertEquals("stale_snapshot", assertThrows(PhoneFailure::class.java) {
+                service.act("click", JSONObject().put("snapshot", observation.getString("snapshot")).put("node", target), "app:test", {}, { dispatched.incrementAndGet() })
+            }.code)
+            assertEquals(0, dispatched.get())
+            assertEquals(actionsBefore, shadowOf(skip).performedActions.size)
+        } finally { controller.destroy() }
+    }
+
+    @Test @Config(shadows = [PhoneAccess::class])
+    fun microAppRechecksCoveringWindowsAfterTheWholeTreeRefresh() {
+        val controller = phoneService()
+        try {
+            val service = controller.get(); val root = phoneRoot(service)
+            shadowOf(root).addChild(phoneNode(root.window, "广告"))
+            val skip = phoneNode(root.window, "跳过").apply {
+                isClickable = true; addAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_CLICK)
+            }
+            shadowOf(root).addChild(skip)
+            val observation = service.observe("app:test", { true }, {}, verifyTree = true)
+            val target = AppPackage.completeNodes(observation).single { it.optString("text") == "跳过" }.getString("clickTarget")
+            val frame = ReflectionHelpers.getField<Any>(service, "frame")
+            ReflectionHelpers.getField<List<Any>>(frame, "reads").forEach { read ->
+                shadowOf(ReflectionHelpers.getField<AccessibilityNodeInfo>(read, "node")).setRefreshReturnValue(true)
+            }
+            val handle = phoneTarget(service, target)
+            shadowOf(handle).setRefreshReturnValue(true)
+            shadowOf(handle).setOnPerformActionListener { _, _ -> true }
+            val checks = AtomicInteger(); val dispatched = AtomicInteger()
+            assertEquals("stale_snapshot", assertThrows(PhoneFailure::class.java) {
+                service.act("click", JSONObject().put("snapshot", observation.getString("snapshot")).put("node", target), "app:test", {
+                    if (checks.incrementAndGet() == 3) shadowOf(phoneCover(service, root)).setBoundsInScreen(Rect(10, 10, 95, 35))
+                }, { dispatched.incrementAndGet() })
+            }.code)
+            assertTrue(checks.get() >= 3)
+            assertEquals(0, dispatched.get())
+            assertTrue(shadowOf(handle).performedActions.isEmpty())
+        } finally { controller.destroy() }
     }
 
 }

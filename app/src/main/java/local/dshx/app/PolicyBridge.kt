@@ -24,6 +24,8 @@ class PolicyBridge(
     private val phoneFinished: ((String) -> Unit)? = null,
     private val model: ((JSONObject, () -> Boolean) -> JSONObject)? = null,
     private val smallModel: (() -> JSONObject)? = null,
+    private val phoneStatus: (() -> JSONObject)? = null,
+    private val apps: ((String, JSONObject) -> JSONObject)? = null,
     private val lost: () -> Unit,
 ) : Closeable {
     val token = UUID.randomUUID().toString() + UUID.randomUUID().toString()
@@ -38,12 +40,20 @@ class PolicyBridge(
     @Volatile private var modelCall: Call? = null
     private val nativeCalls = ConcurrentHashMap<String, CompletableFuture<JSONObject>>()
     private val voiceEvents = ConcurrentHashMap<String, (JSONObject) -> Unit>()
+    private val appSlots = Semaphore(4)
 
     /** Called off the main thread; replies share the existing authenticated connection. */
     fun voice(action: String, data: JSONObject = JSONObject(), onEvent: ((JSONObject) -> Unit)? = null): JSONObject =
         request("voice", action, data, 180, onEvent)
 
     fun memory(action: String, data: JSONObject = JSONObject()): JSONObject = request("memory", action, data, 60)
+
+    fun hosting(action: String, data: JSONObject = JSONObject()): JSONObject {
+        require(action in setOf("status", "settings", "evidence", "skill", "prepare", "applied", "rejected", "discard", "retry", "goal", "resolve")) { "不支持的托管操作。" }
+        return request("hosting", action, data, 30)
+    }
+
+    fun createApp(data: JSONObject): JSONObject = request("apps", "create", data, 30)
 
     /** 中断和超时只释放等待；业务取消必须显式调用 cancel 并提供任务编号。 */
     fun knowledge(action: String, data: JSONObject = JSONObject()): JSONObject {
@@ -146,8 +156,8 @@ class PolicyBridge(
                     nativeCalls["knowledge:${request.getString("knowledge")}"]?.complete(request)
                     continue
                 }
-                if (request.has("voice") || request.has("memory")) {
-                    val channel = if (request.has("memory")) "memory" else "voice"
+                if (request.has("voice") || request.has("memory") || request.has("hosting") || request.has("apps")) {
+                    val channel = if (request.has("apps")) "apps" else if (request.has("hosting")) "hosting" else if (request.has("memory")) "memory" else "voice"
                     if (channel == "voice" && request.has("event")) {
                         require(request.keys().asSequence().toSet() == setOf("voice", "event"))
                         val id = request.getString("voice")
@@ -171,8 +181,10 @@ class PolicyBridge(
                 try {
                     val method = request.getString("method")
                     val allowed = when (method) {
+                        "phone-status" -> setOf("id", "method")
                         "register" -> setOf("id", "method", "session", "title", "parent")
                         "phone" -> setOf("id", "method", "session", "action", "args")
+                        "apps" -> setOf("id", "method", "session", "action", "args")
                         "phone-cancel" -> setOf("id", "method", "session", "call")
                         "local-model" -> setOf("id", "method", "session", "messages", "model")
                         "local-cancel" -> setOf("id", "method", "session", "call")
@@ -180,6 +192,26 @@ class PolicyBridge(
                     }
                     require(request.keys().asSequence().all { it in allowed }) { "查询不接受额外字段" }
                     val session = request.optString("session")
+                    if (method == "apps") {
+                        require(frame.toByteArray().size <= AppPackage.MAX_BYTES + 16 * 1024) { "微应用请求过大。" }
+                        require(policy.mode(instance, session) == ToolPolicy.FULL)
+                        val owner = policy.state.sessions.first { it.id == session }
+                        val handler = requireNotNull(apps)
+                        val action = request.getString("action"); val args = request.getJSONObject("args")
+                        require(appSlots.tryAcquire()) { "微应用管理请求过多。" }
+                        thread(name = "dsh-app-call", isDaemon = true) {
+                            val result = JSONObject().put("id", id)
+                            try {
+                                require(!closed && policy.state.sessions.any { it === owner })
+                                result.put("result", handler(action, args)).put("ok", true)
+                            } catch (error: Exception) {
+                                result.put("ok", false).put("error", if (error is IllegalArgumentException) error.message?.take(180)
+                                    else "微应用操作未完成，请按原操作编号核实结果。")
+                            } finally { appSlots.release() }
+                            runCatching { send(socket, result) }
+                        }
+                        continue
+                    }
                     if (method == "local-model") {
                         policy.mode(instance, session)
                         val owner = policy.state.sessions.first { it.id == session }
@@ -234,6 +266,7 @@ class PolicyBridge(
                         continue
                     }
                     when (method) {
+                        "phone-status" -> response.put("result", requireNotNull(phoneStatus).invoke())
                         "register" -> policy.register(instance, session, request.getString("title"), if (request.isNull("parent")) null else request.getString("parent"))
                         "mode" -> policy.mode(instance, session)
                         "small-model" -> { policy.mode(instance, session); response.put("result", requireNotNull(smallModel).invoke()) }

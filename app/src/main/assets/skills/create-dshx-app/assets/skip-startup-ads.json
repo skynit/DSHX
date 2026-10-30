@@ -1,0 +1,27 @@
+{
+  "format": "web-v1",
+  "id": "skip-startup-ads",
+  "name": "广告跳过示例",
+  "version": "1.0.0",
+  "description": "通过后台 JavaScript 监听选定应用的界面变化，识别独立广告文字和唯一跳过入口。",
+  "entry": "index.html",
+  "background": "background.js",
+  "capabilities": [
+    "storage",
+    "screen.observe",
+    "screen.click"
+  ],
+  "settings": [
+    {
+      "id": "apps",
+      "type": "app-list",
+      "label": "适用应用",
+      "default": []
+    }
+  ],
+  "files": {
+    "index.html": "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><style>:root{color-scheme:light dark;--bg:#f8f7f5;--fg:#262523;--surface:#eeedea;--line:#dedcd8;--accent:#426ba2}*{box-sizing:border-box}body{margin:0;padding:20px 16px 40px;background:var(--bg);color:var(--fg);font:16px/1.6 system-ui,sans-serif}h1{font-size:22px;margin:0 0 8px}p{margin:8px 0}textarea,input,button{font:inherit;color:inherit}textarea,input{width:100%;padding:12px;background:var(--surface);border:1px solid var(--line);border-radius:10px}textarea{resize:vertical;min-height:220px}button{min-height:48px;padding:10px 20px;margin-top:12px;background:var(--surface);border:0;border-radius:10px}button:active{opacity:.7}button:focus-visible,textarea:focus-visible{outline:2px solid var(--accent);outline-offset:3px}.muted{opacity:.75}#status{min-height:1.6em} @media(prefers-color-scheme:dark){:root{--bg:#20201f;--fg:#e9e7e3;--surface:#2c2b29;--line:#42403d}}</style></head><body><h1>广告跳过示例</h1><p>仅作用于设置中选定的应用。需要手机操作总开关和无障碍服务。</p><p class=\"muted\">此示例使用可读取的组件树，不代表适配所有广告。</p><button id=\"refresh\">刷新最近结果</button><p id=\"status\" role=\"status\">正在读取…</p><script>async function refresh(){try{await dshx.ready;document.querySelector(\"#status\").textContent=await dshx.storage.get(\"lastResult\")||\"等待符合条件的界面\";}catch(e){document.querySelector(\"#status\").textContent=e.message;}}document.querySelector(\"#refresh\").onclick=refresh;refresh();</script></body></html>",
+    "match.js": "function findAdTargets(observation) {\n  if (observation.truncated || observation.nodes.some(n=>n.textTruncated)) return [];\n  const nodes=observation.nodes;\n  const candidates=nodes.filter(n=>n.visible!==false && n.enabled && n.clickTarget && /^(?:跳过(?:广告|\\s*\\d{1,2}\\s*[sS秒]?)?|\\d{1,2}\\s*[sS秒]?\\s*跳过)$/.test((n.text||n.description||'').trim()));\n  return [...new Set(candidates.filter(n=>nodes.some(ad=>ad.visible!==false && (ad.text||'').trim()==='广告' && ad.id!==n.id && ad.id!==n.clickTarget && (!ad.clickTarget || ad.clickTarget!==n.clickTarget))).map(n=>n.clickTarget))];\n}",
+    "background.js": "let busy=false, lastAttempt=0;\n(async()=>{\n  const script=document.createElement('script');script.src='/match.js';\n  await new Promise((resolve,reject)=>{script.onload=resolve;script.onerror=reject;document.head.append(script);});\n  await dshx.ready;\n  dshx.screen.onChange(async()=>{\n    if(busy || Date.now()-lastAttempt<5000)return;\n    busy=true;\n    try {\n      const observation=await dshx.screen.observe();\n      const targets=findAdTargets(observation);\n      if(targets.length!==1)return;\n      lastAttempt=Date.now();\n      const result=await dshx.screen.click(observation.snapshot,targets[0]);\n      await dshx.storage.set('lastResult',result.ok?'点击已返回，等待后续界面确认':'点击失败，未重试');\n    } catch(e) { await dshx.storage.set('lastResult',e.message).catch(()=>{}); }\n    finally {busy=false;}\n  });\n})();"
+  }
+}

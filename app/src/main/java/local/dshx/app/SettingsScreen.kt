@@ -43,6 +43,7 @@ import com.composables.icons.lucide.Upload
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.theme.MiuixTheme
@@ -54,6 +55,9 @@ internal fun SettingsContent(
     phone: PhoneControl, phoneRevision: Int, permission: (String) -> Unit,
     backupPicking: Boolean, onBackup: (Boolean) -> Unit,
     onPage: (AppPage) -> Unit, onLibrary: () -> Unit,
+    onHostingSession: (String) -> Unit,
+    onApps: (String, JSONObject) -> JSONObject,
+    onCreateApp: (JSONObject) -> JSONObject,
 ) {
     when (page) {
         AppPage.Settings -> {
@@ -68,6 +72,10 @@ internal fun SettingsContent(
                 LinkRow("任务分工", "${if (voice.local) "已开启" else "未开启"} · 简单语音任务与截图识别", { onPage(AppPage.Tasks) })
                 Divider()
                 LinkRow("手机操作与权限", "屏幕操作、悬浮提示与通知", { onPage(AppPage.Permissions) })
+                Divider()
+                LinkRow("实验体", "培养指令与后台探索", { onPage(AppPage.Hosting) })
+                Divider()
+                LinkRow("微应用", "添加功能、配置与运行记录", { onPage(AppPage.Apps) })
             }
             Section("应用")
             Panel(padding = 0) {
@@ -89,6 +97,8 @@ internal fun SettingsContent(
         AppPage.VoiceOptions -> VoiceSettings(voice, state, action)
         AppPage.Tasks -> SmallModelSettings(voice, state, action)
         AppPage.Permissions -> PhoneSettings(phone, phoneRevision, permission)
+        AppPage.Apps -> AppsSettings(engine.url != null, phoneRevision, onApps, onCreateApp, onHostingSession, permission,
+            back = { onPage(AppPage.Settings) })
         AppPage.Backup -> BackupSettings(engine, backupPicking, onStop, onBackup)
         else -> Unit
     }
@@ -98,9 +108,44 @@ internal fun SettingsContent(
 private fun SettingsTitle(text: String) = Text(text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold,
     modifier = Modifier.semantics { heading() })
 
+internal fun hostingSettings(enabled: Boolean, probability: String, session: String, prompt: String): JSONObject {
+    val chance = probability.trim().toIntOrNull()
+    require(chance != null && chance in 0..100) { "触发概率请填写 0 至 100 的整数。" }
+    val target = session.trim()
+    require(target.isEmpty() || target.matches(Regex("[A-Za-z0-9._:-]{1,128}"))) { "目标会话编号无效，可留空使用独立会话。" }
+    val task = prompt.trim()
+    require(task.length <= 4000) { "培养指令不能超过 4000 个 UTF-16 单位。" }
+    require(!enabled || task.isNotEmpty()) { "请先填写培养指令，再启用实验体。" }
+    return JSONObject().put("enabled", enabled).put("probability", chance).put("session", target).put("prompt", task)
+}
+
+internal fun hostingTime(time: Long): String = java.time.Instant.ofEpochMilli(time).atZone(java.time.ZoneId.systemDefault())
+    .format(java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss"))
+
+internal fun hostingResult(row: JSONObject): String = when (row.optString("outcome")) {
+    "completed" -> "本轮已结束"
+    "failed" -> "本轮执行失败"
+    "unknown" -> "操作结果未知，未重放"
+    else -> when (row.optString("reason")) {
+        "probability" -> "本次未命中"
+        "locked" -> "设备锁屏，已跳过"
+        "screen_off" -> "设备息屏，已跳过"
+        "phone_disabled" -> "手机操作已关闭，已跳过"
+        "accessibility_offline" -> "无障碍未连接，已跳过"
+        "busy" -> "已有任务或输入，已跳过"
+        "not_configured" -> "任务配置未完成"
+        "settings_changed" -> "设置已更改，本次已取消"
+        "user_input" -> "用户输入已接管"
+        "timeout" -> "本轮超时，已取消"
+        "stopped", "session_disposed" -> "本轮已停止"
+        "child_session" -> "目标不是普通会话，已跳过"
+        else -> if (row.optString("event") == "start") "概率命中，开始执行" else "本次未完成，请查看会话结果"
+    }
+}
+
 /** 折叠只控制内容是否显示；表单状态由调用者持有，收起不会丢弃草稿。 */
 @Composable
-private fun SettingsFold(
+internal fun SettingsFold(
     title: String, summary: String, expanded: MutableState<Boolean> = rememberSaveable { mutableStateOf(false) },
     content: @Composable ColumnScope.() -> Unit,
 ) {

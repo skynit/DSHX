@@ -3,6 +3,7 @@ import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 import { policyHost } from './host.mjs';
 import { memoryView } from './memory.mjs';
+import { memorySources } from './memory-extract.mjs';
 import { readBudget } from './read-budget.mjs';
 import { openKnowledge, knowledgeFailure } from './knowledge-store.mjs';
 import { keywordSearch, createKnowledgeSearch } from './knowledge-search.mjs';
@@ -271,10 +272,16 @@ export function knowledgeSession(ctx, options = {}) {
             const persistence = typeof ctx.get === 'function' ? ctx.get('sessionPersistence') : ctx.sessionPersistence;
             const handle = await persistence.open(entry.source.session, 'read', { signal });
             try {
-              result.sourceEvidenceAvailable = true;
-              for (const seq of entry.source.events) {
-                const page = await handle.read(seq, 1, { signal });
-                if (page.events?.[0]?.seq !== seq || page.events[0].type !== 'user/message') result.sourceEvidenceAvailable = false;
+              if (entry.source.origin === 'specimen') {
+                const page = await handle.read(undefined, undefined, { signal });
+                const sources = memorySources(page.events);
+                result.sourceEvidenceAvailable = entry.source.events.every(seq => sources.get(seq)?.origin === 'specimen');
+              } else {
+                result.sourceEvidenceAvailable = true;
+                for (const seq of entry.source.events) {
+                  const page = await handle.read(seq, 1, { signal });
+                  if (page.events?.[0]?.seq !== seq || page.events[0].type !== 'user/message') result.sourceEvidenceAvailable = false;
+                }
               }
             } finally { await handle.close(); }
           } catch { result.sourceEvidenceAvailable = false; }

@@ -9,7 +9,8 @@ DSHX 直接使用 DeepSeek 官方的 [deepseek-harness](https://github.com/deeps
 | 来源 | 用途 | 仓库中的核对入口 |
 |---|---|---|
 | DeepSeek dsh `0.2.1-rc.2` | 官方智能体引擎、聊天网页和插件 | [`core/package.json`](../core/package.json)、[`core/package-lock.json`](../core/package-lock.json) |
-| Termux Android 软件包 | Node、bash、rg、证书及运行库；不要求用户另装 Termux 应用 | [`core/termux.lock.json`](../core/termux.lock.json)、[`tools/core.py`](../tools/core.py) |
+| Termux Android 软件包 | Node、bash、rg、Git、证书及运行库；不要求用户另装 Termux 应用 | [`core/termux.lock.json`](../core/termux.lock.json)、[`tools/core.py`](../tools/core.py) |
+| Git `2.56.0`（GPL-2.0） | 仓库操作与插件 Git 来源解析，包含 HTTP/HTTPS 传输助手和仓库模板 | [`core/termux.lock.json`](../core/termux.lock.json)；运行包保留 `share/LICENSES/GPL-2.0.txt` |
 | Miuix `0.8.8`、Lucide 与 Compose | 原生管理页面和图标 | [`app/build.gradle.kts`](../app/build.gradle.kts) |
 | sherpa-onnx | 本机关键词唤醒 | [`tools/voice.py`](../tools/voice.py)、[语音第三方声明](../app/src/main/assets/voice/NOTICE.txt) |
 | Edge TTS（edge-tts 协议参考）与火山引擎 | 默认与自选在线播报 | [`VoiceOutput.kt`](../app/src/main/java/local/dshx/app/VoiceOutput.kt)、[`EdgeToken.kt`](../app/src/main/java/local/dshx/app/EdgeToken.kt)、[语音说明](voice.md) |
@@ -27,3 +28,6 @@ Android 本地运行环境的技术选型参考了 [Soodok / Deepseek-Harness-Lo
 ## 许可范围
 
 项目自有源码采用 [MIT License](../LICENSE)。打包依赖、模型与参考项目的声明继续适用，应用内的[语音许可目录](../app/src/main/assets/voice/licenses/)保留对应原文。构建与下载资源不因自有源码采用 MIT 而改换许可证；第三方材料的完整发行核对仍需单独完成。
+
+
+独立微应用 APK 组装使用 [REAndroid / ARSCLib](https://github.com/REAndroid/ARSCLib) 1.4.0（Apache-2.0）读取和修改安卓二进制清单及资源，签名与验证使用 [Android apksig](https://android.googlesource.com/platform/tools/apksig/) 8.5.2（Apache-2.0）。依赖版本在 `app/build.gradle.kts` 固定；精简运行壳由本仓库 `micro` 模块及共用运行源码构建，不下载第三方成品 APK。测试证书仅在本机测试中使用 Bouncy Castle 1.79 临时生成，不作为导出签名。

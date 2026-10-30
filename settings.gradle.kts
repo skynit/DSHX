@@ -8,3 +8,4 @@ dependencyResolutionManagement {
 rootProject.name = "DSHX"
 include(":prototype")
 include(":app")
+include(":micro")

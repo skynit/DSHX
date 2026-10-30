@@ -11,6 +11,8 @@ export class PolicyHost {
     this.memoryCalls = new Map();
     this.knowledgeCalls = new Map();
     this.voiceCalls = new Map();
+    this.hostingCalls = new Set();
+    this.appCalls = new Set();
     this.sequence = 0;
     this.revision = -1;
   }
@@ -50,6 +52,33 @@ export class PolicyHost {
   }
 
   receive(message) {
+    if (typeof message.apps === 'string') {
+      if (!this.connected || !/^[a-zA-Z0-9-]{1,80}$/.test(message.apps) || message.action !== 'create' ||
+          Object.keys(message).some(key => !['apps', 'action', 'data'].includes(key)) || this.appCalls.has(message.apps) || this.appCalls.size >= 4) {
+        throw new Error('原生微应用创建请求无效。');
+      }
+      this.appCalls.add(message.apps);
+      Promise.resolve().then(() => {
+        if (this.failure || !this.createApp) throw new Error('微应用创建尚未就绪。');
+        return this.createApp(message.data);
+      }).then(result => this.send({ apps: message.apps, ok: true, result }), () => {
+        this.send({ apps: message.apps, ok: false, error: '微应用会话未确认，请查看已有创建会话后再试。' });
+      }).finally(() => this.appCalls.delete(message.apps));
+      return;
+    }
+    if (typeof message.hosting === 'string') {
+      if (!this.connected || !/^[a-zA-Z0-9-]{1,80}$/.test(message.hosting) ||
+          !['status', 'settings', 'evidence', 'skill', 'prepare', 'applied', 'rejected', 'discard', 'retry', 'goal', 'resolve'].includes(message.action) || Object.keys(message).some(key => !['hosting', 'action', 'data'].includes(key)) ||
+          this.hostingCalls.has(message.hosting) || this.hostingCalls.size >= 8) throw new Error('原生托管请求无效。');
+      this.hostingCalls.add(message.hosting);
+      Promise.resolve().then(() => {
+        if (this.failure || !this.hosting) throw new Error('托管尚未就绪。');
+        return this.hosting(message.action, message.data ?? {});
+      }).then(result => this.send({ hosting: message.hosting, ok: true, result }), () => {
+        this.send({ hosting: message.hosting, ok: false, error: '托管请求未完成，请刷新核实设置和记录；配置已变化时请重新编辑。' });
+      }).finally(() => this.hostingCalls.delete(message.hosting));
+      return;
+    }
     if (this.failure) return;
     if (typeof message.knowledge === 'string') {
       if (!this.connected || !/^[a-zA-Z0-9-]{1,80}$/.test(message.knowledge) ||
@@ -148,7 +177,7 @@ export class PolicyHost {
       clearTimeout(pending.timer);
       pending.cleanup?.();
       this.pending.delete(message.id);
-      pending.reject(new Error(pending.phone || pending.local ? message.error ||
+      pending.reject(new Error(pending.phone || pending.local || pending.apps ? message.error ||
         (pending.phone ? '手机操作失败，请重新观察界面。' : '本机处理失败，请重新开始。') : '原生会话查询被拒绝，会话可能已结束。'));
       return;
     }
@@ -184,13 +213,14 @@ export class PolicyHost {
     return new Promise((resolve, reject) => {
       const phone = method === 'phone';
       const local = method === 'local-model';
-      const timer = setTimeout(() => this.fail(), local ? 170000 : phone ? (data.action === 'ask' ? 65000 : 25000) : 3000);
+      const apps = method === 'apps';
+      const timer = setTimeout(() => this.fail(), local ? 170000 : apps ? 30000 : phone ? (data.action === 'ask' ? 65000 : 25000) : 3000);
       const abort = () => {
         reject(new Error(local ? '本地模型生成已取消。' : '手机操作已取消；已发出的动作结果需重新观察，不能自动重试。' +
           (data.action === 'export' ? '导出可能已开始，授权目录可能残留不完整文件，请检查。' : '')));
-        this.query(local ? 'local-cancel' : 'phone-cancel', { session: data.session, call: id }).catch(() => {});
+        if (!apps) this.query(local ? 'local-cancel' : 'phone-cancel', { session: data.session, call: id }).catch(() => {});
       };
-      this.pending.set(id, { resolve, reject, timer, phone, local, cleanup: () => signal?.removeEventListener('abort', abort) });
+      this.pending.set(id, { resolve, reject, timer, phone, local, apps, cleanup: () => signal?.removeEventListener('abort', abort) });
       this.send({ id, method, ...data });
       signal?.addEventListener('abort', abort, { once: true });
       if (signal?.aborted) abort();
@@ -216,6 +246,7 @@ export class PolicyHost {
       Promise.resolve().then(() => call.voice('cancel', { interaction: call.data.interaction })).catch(() => {});
     }
     this.voiceCalls.clear();
+    this.hostingCalls.clear();
     for (const controller of this.memoryCalls.values()) controller.abort();
     this.memoryCalls.clear();
     this.stopMemory?.();

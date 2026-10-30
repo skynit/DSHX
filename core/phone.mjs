@@ -22,7 +22,7 @@ export const phoneTools = [
   { name: 'phone_status', description: '检查手机操作开关、无障碍连接、锁屏及截图支持状态。', parameters: {} },
   { name: 'phone_apps', description: '列出Android对本应用可见的已安装应用，标明系统应用与可启动状态；不是完整系统清单保证。', parameters: { query: optionalText('按名称或包名筛选，最多200字符。'), userOnly: { type: 'boolean', description: 'true仅显示用户应用，默认同时列出系统应用。' } } },
   { name: 'phone_open', description: '按真实包名打开手机应用，然后重新观察界面。', parameters: { package: text('phone_apps 返回的应用包名。') } },
-  { name: 'phone_observe', description: '首选的界面观察方式：读取 Android 无障碍组件树中的可见控件、文字和可执行动作，返回 snapshot 与控件 id。常规导航、操作前定位和操作后验证都先用它。', parameters: {} },
+  { name: 'phone_observe', description: '首选的界面观察方式：读取 Android 无障碍组件树中的可见控件、文字和可执行动作，返回 snapshot 与控件 id。tree=true 额外包含容器、父子关系和真实控件标识，供创建微应用使用。', parameters: { tree: { type: 'boolean', description: '创建微应用时读取完整层级，默认false。' } } },
   { name: 'phone_click', description: '点击最近观察中 actions 含 click 的控件；文字节点可使用同次返回的 clickTarget。执行后重新观察。', parameters: target },
   { name: 'phone_input', description: '替换可编辑控件的文字，支持中文；不向密码框输入。', parameters: { ...target, text: text('要设置的完整文字，空串表示清空。') } },
   { name: 'phone_scroll', description: '滚动最近观察中的可滚动控件，之后重新观察。', parameters: { ...target, direction: { type: 'string', enum: ['forward', 'backward'], required: true, description: 'forward 向后续内容滚动，backward 返回之前内容。' } } },

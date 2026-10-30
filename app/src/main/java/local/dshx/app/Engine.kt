@@ -47,6 +47,36 @@ class Engine(private val context: Context, private val worker: Executor = Execut
     fun memory(action: String, data: org.json.JSONObject = org.json.JSONObject()): org.json.JSONObject =
         (bridge ?: throw IllegalStateException("请先启动 dsh，再管理长期记忆。" )).memory(action, data)
 
+    fun hosting(action: String, data: org.json.JSONObject = org.json.JSONObject()): org.json.JSONObject {
+        val current = bridge ?: throw IllegalStateException("请先启动 dsh，再设置实验体。")
+        if (action != "adopt") return current.hosting(action, data)
+        val proposal = current.hosting("prepare", data).getJSONObject("skill")
+        val receipt = try { LibraryStore(context.filesDir).adoptSkill(proposal) }
+        catch (error: LibraryStore.SkillNotWritten) {
+            val rejection = org.json.JSONObject().put("id", proposal.getString("id"))
+                .put("operation", proposal.getString("operation")).put("digest", proposal.getString("digest"))
+            try { current.hosting("rejected", rejection) }
+            catch (_: Exception) { throw IllegalStateException("技能未写入，状态待同步；请再次采用以核对。") }
+            throw error
+        }
+        return try { current.hosting("applied", receipt) }
+        catch (_: Exception) { throw IllegalStateException("技能已写入，状态待同步；请再次采用以核对。") }
+    }
+
+    fun createApp(data: org.json.JSONObject): org.json.JSONObject =
+        (bridge ?: throw IllegalStateException("请先启动 dsh，再创建微应用。")).createApp(data)
+
+    fun apps(action: String, data: org.json.JSONObject = org.json.JSONObject()): org.json.JSONObject {
+        val store = (context.applicationContext as DshApp).apps
+        return store.call(action, data).also { result ->
+            if (action == "status" && !data.has("operationId")) {
+                result.put("phone", phone.status())
+                result.put("runtime", (context.applicationContext as DshApp).appHost.status())
+                store.error?.let { result.put("runtimeError", it) }
+            }
+        }
+    }
+
     fun knowledge(action: String, data: org.json.JSONObject = org.json.JSONObject()): org.json.JSONObject =
         (bridge ?: throw IllegalStateException("请先启动 dsh，再管理知识库。")).knowledge(action, data)
 
@@ -147,20 +177,22 @@ class Engine(private val context: Context, private val worker: Executor = Execut
         return true
     }
 
+    /** 完整收尾后通知服务；restart 表示子进程曾启动，且残留进程已清理，可以重新启动。 */
     @SuppressLint("UsableSpace") // Use already free space; do not evict other apps' caches to install.
-    @Synchronized fun start(onFinished: () -> Unit) {
-        if (state.backup.busy) { onFinished(); return }
+    @Synchronized fun start(onFinished: (restart: Boolean) -> Unit) {
+        if (state.backup.busy) { onFinished(false); return }
         launch(onFinished)
     }
 
     @SuppressLint("UsableSpace")
-    @Synchronized private fun launch(onFinished: () -> Unit) {
+    @Synchronized private fun launch(onFinished: (restart: Boolean) -> Unit) {
         if (active || state.busy) return
         active = true
         cancelled.set(false)
         update(EngineState("启动中", "正在打开已安装的运行环境", busy = true))
         worker.execute {
             var child: Process? = null
+            var restart = false
             var finished = EngineState("已停止", "会话和模型配置保留在本机，可重新启动")
             try {
                 if (cancelled.get()) throw InterruptedException()
@@ -180,6 +212,7 @@ class Engine(private val context: Context, private val worker: Executor = Execut
                 }
                 if (cancelled.get()) throw InterruptedException()
                 val home = File(context.filesDir, "home").apply { mkdirs() }
+                LibraryStore(context.filesDir).prepareSkills(context.assets)
                 StoragePaths(context.filesDir).prepare()
                 // Recover legacy settings before Node can read them, even if
                 // the user starts chat without opening the native settings page.
@@ -194,7 +227,8 @@ class Engine(private val context: Context, private val worker: Executor = Execut
                 patch.writeText(File(core, "android.patch.yml").readText().replace("@CORE@", core.path))
                 val instance = UUID.randomUUID().toString()
                 tools.begin(instance)
-                val policyBridge = PolicyBridge(tools, instance, phone::execute, phone::finish, LocalModel(context)::reply, SmallModel(context)::status) {
+                val policyBridge = PolicyBridge(tools, instance, phone::execute, phone::finish, LocalModel(context)::reply, SmallModel(context)::status, phone::status,
+                    apps = ::apps) {
                     main.post {
                         if (bridge?.instance == instance && !cancelled.get()) {
                             record("原生工具权限连接中断，已请求停止 dsh；旧会话权限不会恢复。")
@@ -230,6 +264,10 @@ class Engine(private val context: Context, private val worker: Executor = Execut
                     put("LD_LIBRARY_PATH", File(core, "lib").path)
                     put("NODE_EXTRA_CA_CERTS", File(core, "etc/tls/cert.pem").path)
                     put("SSL_CERT_FILE", File(core, "etc/tls/cert.pem").path)
+                    put("GIT_EXEC_PATH", File(core, "libexec/git-core").path)
+                    put("GIT_TEMPLATE_DIR", File(core, "share/git-core/templates").path)
+                    put("GIT_SSL_CAINFO", File(core, "etc/tls/cert.pem").path)
+                    put("GIT_PAGER", "cat")
                     put("LANG", "C.UTF-8")
                     put("DSHX_PARENT", android.os.Process.myPid().toString())
                     put("DSH_TELEMETRY_DISABLED", "1")
@@ -241,6 +279,7 @@ class Engine(private val context: Context, private val worker: Executor = Execut
                     throw error
                 }
                 process = child
+                restart = true
                 if (cancelled.get()) child.destroy()
                 val watched = child
                 val timeout = Runnable {
@@ -283,6 +322,7 @@ class Engine(private val context: Context, private val worker: Executor = Execut
                     recovery.stopProcesses()
                     child?.waitFor()
                 } catch (error: Exception) {
+                    restart = false
                     recovery.mark()
                     record(redact(error.message ?: "停止命令进程失败"))
                     finished = EngineState("需要恢复", "恢复未完成，工作区保持停止。请查看诊断并重试启动")
@@ -292,7 +332,7 @@ class Engine(private val context: Context, private val worker: Executor = Execut
                         process = null
                         active = false
                         update(finished)
-                        onFinished()
+                        onFinished(restart)
                     }
                 }
             }

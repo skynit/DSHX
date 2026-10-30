@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { policyHost } from './host.mjs';
+import { memoryInput } from './memory-extract.mjs';
 
 const contexts = new WeakMap();
 const bytes = value => Buffer.byteLength(JSON.stringify(value));
@@ -21,7 +22,7 @@ export function readBudget(ctx, { capacity: override, failure } = {}) {
     return { session, workspace };
   }
   function root(session) {
-    const event = session.snapshotEvents?.().findLast(row => row.type === 'user/message' && row.data.source?.kind === 'user');
+    const event = session.snapshotEvents?.().findLast(row => row.type === 'user/message' && memoryInput(row.data));
     if (!event || !Number.isSafeInteger(event.seq)) throw failure('NOT_READY');
     let budget = state.budgets.get(session.id);
     if (!budget || budget.request !== event.seq) {

@@ -41,8 +41,13 @@ def copy_libraries(usr, bundle):
     # Keep the exact names requested by Android's loader. Package symlinks
     # otherwise turn one ICU library into three full copies in the archive.
     system = {"libc.so", "libdl.so", "libm.so", "liblog.so", "libandroid.so"}
-    pending = [file for file in bundle.rglob("*") if file.is_file() and
-               (file.parent == bundle / "bin" or file.suffix == ".node")]
+    pending = []
+    for file in bundle.rglob("*"):
+        if file.is_file() and (file.parent == bundle / "bin" or
+                               file.is_relative_to(bundle / "libexec") or file.suffix == ".node"):
+            with file.open("rb") as handle:
+                if handle.read(4) == b"\x7fELF":
+                    pending.append(file)
     copied = set()
     while pending:
         file = pending.pop()
@@ -57,6 +62,46 @@ def copy_libraries(usr, bundle):
             shutil.copy2(source.resolve(), target)
             copied.add(name)
             pending.append(target)
+
+
+def copy_git(usr, bundle):
+    """安装 Git、传输助手和模板，适配 DSHX 的独立应用目录。"""
+    shell = b"/data/data/com.termux/files/usr/bin/sh\0"
+    replacement = b"/system/bin/sh\0".ljust(len(shell), b"\0")
+    git = usr / "bin/git"
+    data = git.read_bytes()
+    if data.count(shell) != 1:
+        raise ValueError("Git shell path anchor changed")
+    (bundle / "bin/git").write_bytes(data.replace(shell, replacement))
+    executables = {"bin/git"}
+    for source in (usr / "libexec/git-core").rglob("*"):
+        if not source.is_file():
+            continue
+        relative = source.relative_to(usr)
+        target = bundle / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if source.resolve() == git.resolve():
+            # 用轻量入口代替指向同一 Git 主程序的大量链接，避免重复打包。
+            command = "" if source.name == "git" else " " + source.name.removeprefix("git-")
+            target.write_text('#!/system/bin/sh\nexec "$GIT_EXEC_PATH/../../bin/git"' + command + ' "$@"\n')
+        else:
+            data = source.read_bytes()
+            if data.startswith(b"\x7fELF"):
+                data = data.replace(shell, replacement)
+            elif data.startswith(b"#!" + shell[:-1] + b"\n"):
+                data = data.replace(b"#!" + shell[:-1] + b"\n", b"#!/system/bin/sh\n", 1)
+            target.write_bytes(data)
+        if source.stat().st_mode & 0o111:
+            executables.add(relative.as_posix())
+    templates = usr / "share/git-core/templates"
+    shutil.copytree(templates, bundle / "share/git-core/templates", symlinks=False)
+    for source in templates.rglob("*"):
+        if source.is_file() and source.stat().st_mode & 0o111:
+            relative = source.relative_to(usr)
+            data = source.read_bytes().replace(b"#!" + shell[:-1] + b"\n", b"#!/system/bin/sh\n", 1)
+            (bundle / relative).write_bytes(data)
+            executables.add(relative.as_posix())
+    return executables
 
 
 def build(abi):
@@ -85,6 +130,7 @@ def build(abi):
         executables = {"bin/node", "bin/bash", "bin/rg", "bin/dshx-run"}
         for name in ("node", "bash", "rg"):
             shutil.copy2(usr / "bin" / name, bundle / "bin" / name)
+        executables.update(copy_git(usr, bundle))
         cert = bundle / "etc/tls/cert.pem"
         cert.parent.mkdir(parents=True)
         shutil.copy2(usr / "etc/tls/cert.pem", cert)
@@ -245,6 +291,61 @@ def build(abi):
         patch("@deepseek-ai/dsh-tool-bash/lib/index.js",
               'const backgroundEnabled = config.enableRunInBackground ?? true;',
               'const backgroundEnabled = process.platform === "android" ? false : config.enableRunInBackground ?? true;')
+        # Both upstream command implementations remain available. The PTY-backed
+        # implementation owns `bash`; bounded fresh-shell calls have an explicit name.
+        patch("@deepseek-ai/dsh-tool-bash/lib/index.js",
+              '\t\t\tname: "bash",',
+              '\t\t\tname: process.platform === "android" ? "bash_isolated" : "bash",')
+        patch("@deepseek-ai/dsh-tool-terminal/lib/index.js",
+              'const enableRunInBackground = config.enableRunInBackground ?? true;',
+              'const enableRunInBackground = process.platform === "android" ? false : config.enableRunInBackground ?? true;')
+        patch("@deepseek-ai/dsh-tool-terminal/lib/index.js",
+              'text: "Use a terminal session only when work needs persistent terminal state or interactive stdin; prefer shell/read/write/edit for bounded one-shot operations. Track every terminal session id and close sessions that no longer matter. An inferred_idle or timeout result does not prove the foreground command exited."',
+              'text: process.platform === "android" ? "普通命令默认使用持久 bash。bash_isolated 每次新建 shell；terminal_open 创建额外独立持久终端，使用 terminal_send 连续输入，terminal_read 读取输出，terminal_signal 中断，terminal_close 关闭。terminal_list 中 default 为默认 bash 终端，交互程序优先使用额外终端。终端的 inferred_idle、timeout 或 stdin_read 不代表命令成功；仅 bash 的完成标记给出命令退出码。记录终端编号并关闭不再需要的额外终端。" : "Use a terminal session only when work needs persistent terminal state or interactive stdin; prefer shell/read/write/edit for bounded one-shot operations. Track every terminal session id and close sessions that no longer matter. An inferred_idle or timeout result does not prove the foreground command exited."')
+        # All Android presets inherit the same default shell and terminal tools.
+        # Minimal's private PTY realm would otherwise create a second default.
+        patch("@deepseek-ai/dsh-web-app/presets/minimal.patch.yml",
+              '          - id: persistent-shell\n            name: cordis:group',
+              '          - id: persistent-shell\n            disabled: !!js process.platform === \'android\'\n            name: cordis:group')
+        persistent = "@deepseek-ai/dsh-tool-bash-persistent/lib/index.js"
+        patch(persistent,
+              'import { randomUUID } from "node:crypto";',
+              'import { randomUUID } from "node:crypto";\nimport { policyHost } from "../../../../../host.mjs";')
+        patch(persistent,
+              '\tconst get = (owner, signal) => {\n\t\tconst existing = pending.get(owner);',
+              '\tconst get = (owner, signal) => {\n'
+              '\t\tconst id = live.get(owner);\n'
+              '\t\tif (id !== void 0 && !ctx.terminals.list(owner).some(session => session.sessionId === id)) {\n'
+              '\t\t\tlive.delete(owner); pending.delete(owner);\n'
+              '\t\t}\n'
+              '\t\tconst existing = pending.get(owner);')
+        patch(persistent,
+              '\t\t\t\t\ttype: config.backendType,\n\t\t\t\t\tcwd',
+              '\t\t\t\t\ttype: config.backendType,\n'
+              '\t\t\t\t\t...(process.platform === "android" ? { name: "default" } : {}),\n\t\t\t\t\tcwd')
+        patch(persistent,
+              'function registerPersistentBash(ctx, config) {',
+              'async function registerPersistentBash(ctx, config) {')
+        patch(persistent,
+              '\tctx.tools.register(defineTool({\n\t\tname: "bash",',
+              '\tif (process.platform === "android") {\n'
+              '\t\tconst warm = async ({ agent, signal }) => {\n'
+              '\t\t\tif (await policyHost.mode(agent.session.id) !== "full") return;\n'
+              '\t\t\tawait serialized(agent, () => shells.get(agent, signal ?? AbortSignal.timeout(config.timeoutMs)));\n'
+              '\t\t};\n'
+              '\t\tctx.on("agent/created", warm);\n'
+              '\t\tfor (const agent of ctx.agents.list()) await warm({ agent });\n'
+              '\t}\n'
+              '\tctx.tools.register(defineTool({\n\t\tname: "bash",')
+        patch(persistent,
+              'const inject = [\n\t"tools",',
+              'const inject = [\n\t"agents",\n\t"tools",')
+        patch(persistent,
+              'function apply(ctx, config) {',
+              'async function apply(ctx, config) {')
+        patch(persistent,
+              '\tregisterPersistentBash(ctx, resolved);',
+              '\treturn registerPersistentBash(ctx, resolved);')
         # Android has no supported command sandbox. Use the deployment's Full
         # mode even when an old session recorded a narrower desktop preset.
         patch("@deepseek-ai/dsh-sandbox-policy/lib/index.js",
@@ -276,6 +377,21 @@ def build(abi):
         patch("@deepseek-ai/dsh-terminal-bash/lib/index.js",
               'const DEFAULT_BASH_SHELL = "/bin/bash";',
               'const DEFAULT_BASH_SHELL = process.platform === "android" ? process.execPath.replace(/node$/, "bash") : "/bin/bash";')
+        # Snapshot trusted engine variables once when a PTY starts. Passing them
+        # through spawn avoids echoing values into terminal scrollback; later
+        # commands keep the shell's own exported environment untouched.
+        patch("@deepseek-ai/dsh-terminal-bash/lib/index.js",
+              'const inject = [\n\t"terminals",',
+              'const inject = [\n\t...(process.platform === "android" ? ["shellEnv"] : []),\n\t"terminals",')
+        patch("@deepseek-ai/dsh-terminal-bash/lib/index.js",
+              '\t\t\tenv: childEnvironment(spec, this.config.shellDialect),',
+              '\t\t\tenv: {\n'
+              '\t\t\t\t...(process.platform === "android" ? this.ctx.shellEnv.collect({\n'
+              '\t\t\t\t\tagent: spec.owner, name: "terminal_open", arguments: { type: spec.type },\n'
+              '\t\t\t\t\tcallId: spec.sessionId, signal: spec.signal ?? AbortSignal.timeout(this.config.timeoutMs)\n'
+              '\t\t\t\t}) : {}),\n'
+              '\t\t\t\t...childEnvironment(spec, this.config.shellDialect)\n'
+              '\t\t\t},')
         patch("@deepseek-ai/dsh-plugin-manager/lib/index.js",
               'if (options?.approvedBuilds !== void 0) {',
               'if (process.platform === "android" && options?.approvedBuilds?.length > 0) throw new Error("Android 插件安装始终禁用构建脚本，请安装已构建的纯 JS/WASM 发布包");\n'
@@ -362,7 +478,7 @@ def build(abi):
         patch('@deepseek-ai/dsh-llm-pi-ai/lib/index.js',
               '\t\t\tyield {\n\t\t\t\ttype: "usage",\n\t\t\t\tusage: mapUsage(event.error.usage)\n\t\t\t};',
               '\t\t\tif (providerUsage() !== void 0) yield {\n\t\t\t\ttype: "usage",\n\t\t\t\tusage: providerUsage()\n\t\t\t};')
-        for filename in ("start.mjs", "plugins.mjs", "assistant.mjs", "compat.mjs", "guard.mjs", "policy.mjs", "files.mjs", "host.mjs", "phone.mjs", "voice.mjs", "memory.mjs", "memory-store.mjs", "memory-extract.mjs", "read-budget.mjs", "knowledge.mjs", "knowledge-store.mjs", "knowledge-search.mjs", "knowledge-model.mjs", "local-route.mjs", "local-routes.json", "recover.mjs", "android.patch.yml"):
+        for filename in ("start.mjs", "plugins.mjs", "assistant.mjs", "hosting.mjs", "specimen.mjs", "specimen-store.mjs", "background.mjs", "apps.mjs", "compat.mjs", "guard.mjs", "policy.mjs", "files.mjs", "host.mjs", "phone.mjs", "voice.mjs", "memory.mjs", "memory-store.mjs", "memory-extract.mjs", "read-budget.mjs", "knowledge.mjs", "knowledge-store.mjs", "knowledge-search.mjs", "knowledge-model.mjs", "local-route.mjs", "local-routes.json", "recover.mjs", "android.patch.yml"):
             shutil.copy2(SOURCE / filename, bundle / filename)
         ndk = Path(os.environ.get("ANDROID_NDK_HOME", "/home/skynit/Android/Sdk/ndk/28.2.13676358"))
         compiler = ndk / "toolchains/llvm/prebuilt/linux-x86_64/bin" / (
@@ -414,7 +530,7 @@ def build(abi):
             "format": 1, "version": "dsh-0.2.1-rc.2-android.1-" + abi,
             "abi": abi, "sha256": digest(archive), "archiveSize": archive.stat().st_size,
             "dsh": "0.2.1-rc.2", "node": packages["nodejs-lts"]["version"],
-            "tools": {name: packages[name]["version"] for name in ("bash", "ripgrep")},
+            "tools": {name: packages[name]["version"] for name in ("bash", "ripgrep", "git")},
             "nodePty": json.loads((SOURCE / "node_modules/node-pty/package.json").read_text())["version"],
             "pnpm": json.loads((SOURCE / "node_modules/pnpm/package.json").read_text())["version"],
             "npm": json.loads((SOURCE / "node_modules/npm/package.json").read_text())["version"],

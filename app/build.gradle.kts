@@ -14,8 +14,8 @@ android {
         applicationId = "local.dshx.app"
         minSdk = 26
         targetSdk = 28
-        versionCode = 1
-        versionName = "0.1.0-dev"
+        versionCode = 2
+        versionName = "0.1.0-dev.1"
         val info = file("src/main/assets/core-info.json")
         val abi = providers.gradleProperty("dshxAbi").orNull
             ?: if (info.isFile) Regex("\"abi\"\\s*:\\s*\"([^\"]+)\"").find(info.readText())?.groupValues?.get(1) else null
@@ -36,6 +36,8 @@ android {
 kotlin { compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17) } }
 
 dependencies {
+    implementation("io.github.reandroid:ARSCLib:1.4.0")
+    implementation("com.android.tools.build:apksig:8.5.2")
     implementation(files("libs/sherpa-onnx-1.13.2.aar"))
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("top.yukonga.miuix.kmp:miuix:0.8.8")
@@ -46,7 +48,19 @@ dependencies {
     testImplementation("junit:junit:4.13.2")
     testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
     testImplementation("org.robolectric:robolectric:4.15.1")
+    testImplementation("org.bouncycastle:bcpkix-jdk18on:1.79")
 }
+
+// 精简运行壳由同一份网页/存储/手机代码构建；手机导出无需下载 SDK 或调用服务器。
+val microAssets = layout.buildDirectory.dir("generated/microAssets")
+val prepareMicroApk by tasks.registering(Copy::class) {
+    dependsOn(":micro:assembleRelease")
+    from(project(":micro").layout.buildDirectory.file("outputs/apk/release/micro-release-unsigned.apk"))
+    into(microAssets.map { it.dir("micro-apk") })
+    rename { "runtime.apk" }
+}
+android.sourceSets.getByName("main").assets.srcDir(microAssets)
+tasks.matching { it.name == "preBuild" }.configureEach { dependsOn(prepareMicroApk) }
 
 tasks.matching { it.name == "preBuild" }.configureEach {
     doFirst {

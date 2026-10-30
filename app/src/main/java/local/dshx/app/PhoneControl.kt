@@ -25,7 +25,7 @@ class PhoneControl(context: Context) {
     internal val device = PhoneDevice.get(this.context)
     internal val window = PhoneWindow(this.context) { setEnabled(false) }
 
-    fun finish(session: String) { main.post { window.finish(session) } }
+    fun finish(session: String) { main.post { window.finish(session); PhoneService.current?.clear(session) } }
 
     fun enabled(): Boolean = settings.getBoolean("enabled", true)
 
@@ -48,6 +48,7 @@ class PhoneControl(context: Context) {
         check(Looper.myLooper() == Looper.getMainLooper()) { "手机开关必须在主线程修改" }
         settings.edit().putBoolean("enabled", value).apply()
         if (!value) {
+            PhoneService.current?.stopApps()
             PhoneWindow.current?.close()
             pending.get()?.let { call ->
                 call.finish(failure("disabled", "手机操作开关已关闭"))
@@ -90,6 +91,7 @@ class PhoneControl(context: Context) {
         if (method !in methods) return failure("unknown_method", "不支持的手机操作")
         if (session.isBlank() || !runCatching(valid).getOrDefault(false)) return failure("cancelled", "引擎或会话已失效")
         val fields = when (method) {
+            "observe" -> setOf("tree")
             "open" -> setOf("package")
             "click" -> setOf("snapshot", "node")
             "input" -> setOf("snapshot", "node", "text")
@@ -103,6 +105,9 @@ class PhoneControl(context: Context) {
             if (args.keys().asSequence().any { it !in setOf("query", "userOnly") } ||
                 args.has("query") && (args.opt("query") !is String || args.getString("query").length > 200) ||
                 args.has("userOnly") && args.opt("userOnly") !is Boolean) return failure("invalid_args", "应用筛选参数无效")
+        } else if (method == "observe") {
+            if (args.keys().asSequence().any { it != "tree" } || args.has("tree") && args.opt("tree") !is Boolean)
+                return failure("invalid_args", "组件树参数无效")
         } else if (method in PhoneDevice.methods) {
             try { device.validate(method, args) } catch (error: Exception) { return errorResult(error) }
         } else if (args.keys().asSequence().any { it !in fields } || fields.any {
@@ -129,7 +134,7 @@ class PhoneControl(context: Context) {
                 when (method) {
                     "apps" -> call.finish(apps(input, check))
                     "open" -> call.finish(open(input.getString("package"), service, dispatch))
-                    "observe" -> call.finish(service!!.observe(session, valid, check))
+                    "observe" -> call.finish(service!!.observe(session, valid, check, verifyTree = input.optBoolean("tree")))
                     "click", "input", "scroll" -> call.finish(service!!.act(method, input, session, check, dispatch))
                     "back", "home", "key" -> {
                         val key = if (method == "key") input.getString("name") else method
@@ -153,13 +158,14 @@ class PhoneControl(context: Context) {
                     else -> call.cleanup = device.execute(method, input, check, dispatch, { call.finish(it) }, { enabled() && runCatching(valid).getOrDefault(false) })
                 }
             } catch (error: Exception) {
-                PhoneService.current?.clear()
+                PhoneService.current?.clear(session)
                 call.finish(errorResult(error))
             }
         }
         val job = Runnable {
             try {
                 checkCall(call)
+                PhoneService.current?.stopApps()
                 window.show(session, method, valid) { work.run() }
             } catch (error: Exception) { call.finish(errorResult(error)) }
         }
@@ -188,10 +194,31 @@ class PhoneControl(context: Context) {
             main.post {
                 call.cleanup?.invoke()
                 reply?.let(window::result)
-                if (!delivered) PhoneService.current?.clear()
+                if (!delivered) PhoneService.current?.clear(session)
             }
             pending.compareAndSet(call, null)
         }
+    }
+
+    /** 原生规则不登记伪造会话；只在主线程短期借用空闲观察，并复用相同节点动作检查。 */
+    internal fun appCall(method: String, args: JSONObject, owner: String, valid: () -> Boolean): JSONObject {
+        check(Looper.myLooper() == Looper.getMainLooper())
+        require(method == "observe" || method == "click")
+        val service = PhoneService.current ?: throw PhoneFailure("accessibility_offline", "无障碍服务未连接")
+        val guard = {
+            if (!valid()) throw PhoneFailure("cancelled", "微应用执行已取消")
+            if (pending.get() != null || !service.available(owner)) throw PhoneFailure("busy", "聊天手机任务优先")
+            if (service !== PhoneService.current) throw PhoneFailure("accessibility_offline", "无障碍服务已更换")
+            requireReady()
+        }
+        guard()
+        return if (method == "observe") service.observe(owner, valid, guard, verifyTree = true) else service.act(method, args, owner, guard, guard)
+    }
+
+    private fun requireReady() {
+        if (!enabled()) throw PhoneFailure("disabled", "手机操作开关未开启")
+        if (locked()) throw PhoneFailure("locked", "设备已锁定，拒绝手机操作")
+        if (!interactive()) throw PhoneFailure("screen_off", "屏幕已关闭，拒绝手机操作")
     }
 
     private fun checkCall(call: Call, completed: Boolean = false) {
@@ -203,8 +230,7 @@ class PhoneControl(context: Context) {
         val service = PhoneService.current
         if (call.needsService && service == null) throw PhoneFailure("accessibility_offline", "无障碍服务未连接")
         if (call.needsService && call.service != null && call.service !== service) throw PhoneFailure("accessibility_offline", "无障碍服务连接已更换")
-        if (!completed && !(call.locking && call.dispatched) && locked()) throw PhoneFailure("locked", "设备已锁定，拒绝手机操作")
-        if (!completed && !(call.locking && call.dispatched) && !interactive()) throw PhoneFailure("screen_off", "屏幕已关闭，拒绝手机操作")
+        if (!completed && !(call.locking && call.dispatched)) requireReady()
     }
 
     private fun locked(): Boolean = runCatching {
@@ -273,23 +299,16 @@ class PhoneControl(context: Context) {
     }
 
     internal companion object {
-        const val SNAPSHOT_LIFETIME = 10_000L
+        const val SNAPSHOT_LIFETIME = PhoneReply.SNAPSHOT_LIFETIME
         private const val TIMEOUT = 8_000L
         private const val ASK_TIMEOUT = 60_000L
         private val main = Handler(Looper.getMainLooper())
         private val pending = AtomicReference<Call?>()
         private val screenMethods = setOf("observe", "click", "input", "scroll", "back", "home", "key", "screenshot", "tap", "swipe")
         private val methods = setOf("status", "apps", "open") + screenMethods + PhoneDevice.methods
-        fun success(): JSONObject = JSONObject().put("ok", true).put("execution_state", "completed")
-        fun failure(code: String, message: String): JSONObject = JSONObject().put("ok", false).put("code", code)
-            .put("error", message).put("execution_state", "not_started")
-        fun actionResult(accepted: Boolean): JSONObject = if (accepted) success().put("accepted", true)
-            else failure("action_failed", "Android 未接受该动作，请重新观察界面").put("accepted", false).put("execution_state", "completed")
-        fun errorResult(error: Exception): JSONObject = if (error is PhoneFailure) failure(error.code, error.message ?: "手机操作失败")
-            else if (error is SecurityException) failure("permission_required", "系统权限不可用，请在设置中检查对应授权")
-            else failure("operation_failed", "手机操作失败，请重新观察界面")
+        fun success() = PhoneReply.success()
+        fun failure(code: String, message: String) = PhoneReply.failure(code, message)
+        fun actionResult(accepted: Boolean) = PhoneReply.actionResult(accepted)
+        fun errorResult(error: Exception) = PhoneReply.errorResult(error)
     }
 }
-
-/** 只携带固定错误说明，避免将系统异常中的界面文字带入日志或响应。 */
-internal class PhoneFailure(val code: String, message: String) : RuntimeException(message)

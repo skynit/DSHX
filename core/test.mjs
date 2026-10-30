@@ -692,6 +692,82 @@ test('Android assistant refuses an unrecorded attempt when durable storage fails
   }
 });
 
+test('Android Git runtime creates commits and clones local and HTTP repositories', { timeout: 45000 }, async () => {
+  const { packageManager } = await import(pathToFileURL(join(core, 'plugins.mjs')));
+  const env = { ...process.env, ...packageManager(core).env };
+  const git = join(core, 'bin/git');
+  const run = (...args) => {
+    const result = spawnSync(git, args, { env, encoding: 'utf8', timeout: 10000 });
+    assert.equal(result.status, 0, result.error?.message ?? result.stderr);
+    return result.stdout;
+  };
+  assert.match(run('--version'), /^git version /);
+  assert.equal(run('--exec-path').trim(), join(core, 'libexec/git-core'));
+  const dir = await mkdtemp(join(directory, 'git-runtime-'));
+  const source = join(dir, 'source'), remote = join(dir, 'remote.git'), target = join(dir, 'clone');
+  run('init', source);
+  await writeFile(join(source, 'note.txt'), 'DSHX bundled Git\n');
+  run('-C', source, 'add', 'note.txt');
+  run('-C', source, '-c', 'user.name=DSHX Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'runtime check');
+  run('clone', '--bare', source, remote);
+  run('-C', remote, 'update-server-info');
+  assert.equal(run('ls-remote', remote, 'HEAD').trim().split(/\s/)[0], run('-C', source, 'rev-parse', 'HEAD').trim());
+  const server = createHttpServer(async (req, res) => {
+    const path = new URL(req.url, 'http://localhost').pathname;
+    if (path.includes('..')) { res.writeHead(400); res.end(); return; }
+    try {
+      const data = await readFile(join(remote, path));
+      res.writeHead(200, { 'Content-Type': 'application/octet-stream' }); res.end(data);
+    } catch { res.writeHead(404); res.end(); }
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    await new Promise((resolve, reject) => {
+      const child = spawn(git, ['clone', `http://127.0.0.1:${server.address().port}/`, target], { env });
+      let output = '';
+      child.stdout.on('data', chunk => { output += chunk; });
+      child.stderr.on('data', chunk => { output += chunk; });
+      const timeout = setTimeout(() => child.kill('SIGKILL'), 20000);
+      child.once('error', error => { clearTimeout(timeout); reject(error); });
+      child.once('exit', code => { clearTimeout(timeout); code === 0 ? resolve() : reject(new Error(output)); });
+    });
+    assert.equal(await readFile(join(target, 'note.txt'), 'utf8'), 'DSHX bundled Git\n');
+    assert.equal(run('-C', target, 'rev-parse', 'HEAD'), run('-C', source, 'rev-parse', 'HEAD'));
+    await stat(join(core, 'libexec/git-core/git-remote-https'));
+  } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
+});
+
+test('Android plugin GitHub installation preserves Git sources while scripts stay disabled', async () => {
+  const { runPnpm, packageManager } = await import(pathToFileURL(join(core, 'plugins.mjs')));
+  const runtime = await mkdtemp(join(directory, 'plugin-github-'));
+  const bin = join(runtime, 'lib/node_modules/pnpm/bin');
+  await mkdir(bin, { recursive: true });
+  const captured = join(runtime, 'arguments.json');
+  await writeFile(join(bin, 'pnpm.cjs'), `require('node:fs').writeFileSync(${JSON.stringify(captured)}, JSON.stringify(process.argv.slice(2)));`);
+  for (const source of ['github:Yuuyuko-uu/dsh-speak-up', 'github:owner/repo#main',
+    'github:owner/repo#feature/phone', 'github:owner/repo#semver:^1', 'github:owner/repo#' + 'a'.repeat(40),
+    'https://github.com/owner/repo', 'git+https://github.com/owner/repo.git',
+    'https://github.com/owner/repo/archive/main.tar.gz']) {
+    assert.equal(await runPnpm(runtime, ['add', source]), 0);
+    const args = JSON.parse(await readFile(captured, 'utf8'));
+    assert.deepEqual(args.slice(0, 2), ['add', source]);
+    for (const flag of ['--config.ignore-scripts=true', '--config.ignore-pnpmfile=true', '--save-exact']) {
+      assert.ok(args.includes(flag), flag);
+    }
+  }
+  const env = packageManager(core).env;
+  assert.equal(env.GIT_EXEC_PATH, join(core, 'libexec/git-core'));
+  assert.equal(env.GIT_TEMPLATE_DIR, join(core, 'share/git-core/templates'));
+  assert.equal(env.GIT_SSL_CAINFO, join(core, 'etc/tls/cert.pem'));
+  assert.ok(env.PATH.startsWith(join(core, 'bin') + ':'));
+  await rm(captured);
+  for (const source of ['gitlab:owner/repo', 'git@github.com:owner/repo.git',
+    'https://example.com/plugin.tgz', 'link:/tmp/plugin']) {
+    await assert.rejects(runPnpm(runtime, ['add', source]), /尚未适配/);
+  }
+  await assert.rejects(stat(captured), { code: 'ENOENT' });
+});
+
 test('Android plugin content checks follow selected transitive packages without scanning stale store entries', async () => {
   const { checkPlugins } = await import(pathToFileURL(join(core, 'plugins.mjs')));
   const modules = join(await mkdtemp(join(directory, 'plugin-tree-')), 'node_modules');
@@ -907,6 +983,67 @@ test('Android plugin registry downloads reject native dependencies and cancellat
     assert.equal((await manager.listBundles()).find(row => row.name === 'dshx-registry-good').enabled, true);
     const removed = await manager.removeBundle('dshx-registry-good');
     assert.equal(removed.application, 'restart-required', JSON.stringify(removed));
+  } finally { await ctx.fiber.dispose(); await registry.close(); }
+});
+
+test('Android plugin GitHub manager checks the repository with Git and preserves its source', { timeout: 45000 }, async () => {
+  const { packageManager } = await import(pathToFileURL(join(core, 'plugins.mjs')));
+  const { Context } = await load('@deepseek-ai/cordis');
+  const { default: PluginManager } = await load('@deepseek-ai/dsh-plugin-manager');
+  const registry = await pluginRegistry({
+    'dshx-github-bundle': {
+      'package.json': JSON.stringify({ name: 'dshx-github-bundle', version: '1.0.0', dsh: { bundle: { patch: './cordis.patch.yml' } } }),
+      'cordis.patch.yml': '[]\n'
+    }
+  });
+  const dir = await mkdtemp(join(directory, 'plugin-github-profile-'));
+  const runtime = join(dir, 'runtime');
+  const bin = join(runtime, 'lib/node_modules/pnpm/bin');
+  await mkdir(bin, { recursive: true });
+  await writeFile(join(runtime, 'plugins.mjs'), await readFile(join(core, 'plugins.mjs')));
+  const source = 'github:example/dshx-github-bundle';
+  const captured = join(dir, 'download-source');
+  // 用本地压缩包替代外网下载，保留真实 Git 连接检查及 pnpm 安装流程。
+  await writeFile(join(bin, 'pnpm.cjs'), `
+    const { spawn } = require('node:child_process');
+    const { writeFileSync } = require('node:fs');
+    const args = process.argv.slice(2);
+    if (args[0] === 'add') {
+      if (args[1] !== ${JSON.stringify(source)}) throw new Error('GitHub source was changed');
+      writeFileSync(${JSON.stringify(captured)}, args[1]);
+      args[1] = ${JSON.stringify(registry.url + 'dshx-github-bundle.tgz')};
+    }
+    const child = spawn(process.execPath, [${JSON.stringify(join(core, 'lib/node_modules/pnpm/bin/pnpm.cjs'))}, ...args], { stdio: 'inherit' });
+    child.once('error', error => { console.error(error.message); process.exitCode = 1; });
+    child.once('exit', code => { process.exitCode = code ?? 1; });
+    for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => child.kill(signal));
+  `);
+  await writeFile(join(dir, 'package.json'), '{"private":true,"dsh":{"profile":{"bundles":[]}}}');
+  await writeFile(join(dir, 'cordis.patch.yml'), '[]\n');
+  await writeFile(join(dir, '.npmrc'), `store-dir=${join(dir, 'store')}\n`);
+  const gitEnv = { ...process.env, ...packageManager(core).env };
+  const repo = join(dir, 'dshx-github-bundle');
+  const initialized = spawnSync(join(core, 'bin/git'), ['init', repo], { env: gitEnv, encoding: 'utf8' });
+  assert.equal(initialized.status, 0, initialized.stderr);
+  const config = join(dir, 'git.config');
+  await writeFile(config, `[url "${pathToFileURL(dir + '/').href}"]\n    insteadOf = https://github.com/example/\n`);
+  const invocation = packageManager(runtime);
+  const ctx = new Context();
+  ctx.provide('loader', { entries: () => [] });
+  ctx.provide('profileContext', {
+    name: 'github', dir, patchPath: join(dir, 'cordis.patch.yml'), cwd: dir, home: dir,
+    installAnchor: require.resolve('@deepseek-ai/dsh/package.json'), startedBundles: [], overlays: [],
+    packageManager: { ...invocation, env: { ...invocation.env, ...packageManager(core).env, GIT_CONFIG_GLOBAL: config } }
+  });
+  try {
+    await ctx.plugin(PluginManager, { registry: registry.url, fallbackRegistries: [] });
+    const installed = await ctx.pluginManager.installBundle('github:example/dshx-github-bundle');
+    assert.equal(installed.application, 'restart-required', JSON.stringify(installed));
+    assert.equal(await readFile(captured, 'utf8'), source);
+    assert.ok(registry.requests.includes('/dshx-github-bundle.tgz'));
+    assert.equal((await ctx.pluginManager.listBundles()).find(row => row.name === 'dshx-github-bundle').enabled, true);
+    const logs = await readdir(join(dir, '.plugin-manager/logs'));
+    assert.equal(logs.some(name => name.startsWith('github-connection-')), true, 'GitHub installs must use the bundled Git preflight');
   } finally { await ctx.fiber.dispose(); await registry.close(); }
 });
 
@@ -2297,7 +2434,8 @@ test('configured native modes constrain phone bridge catalogs, final execution a
       await ctx.plugin(Phone);
       await ctx.plugin(AndroidFiles, { cwd: process.env.DSHX_WORKSPACE });
       let writes = 0;
-      for (const name of ['read', 'write', 'edit', 'glob', 'grep', 'bash']) ctx.tools.register({
+      const commandNames = ['bash', 'bash_isolated', 'terminal_open', 'terminal_send', 'terminal_read', 'terminal_signal', 'terminal_close', 'terminal_list'];
+      for (const name of ['read', 'write', 'edit', 'glob', 'grep', ...commandNames]) ctx.tools.register({
         name, description: name, parameters: { type: 'object', properties: {} },
         output: { schema: { type: 'string' }, render: (_, value) => [{ type: 'text', text: value }] },
         execute: async () => { writes++; return 'done'; }
@@ -2320,7 +2458,7 @@ test('configured native modes constrain phone bridge catalogs, final execution a
         assert.deepEqual(catalog(read).map(t => t.name).sort(), ['glob', 'grep', 'read']);
         assert.deepEqual(catalog(childAgent).map(t => t.name).sort(), ['glob', 'grep', 'read']);
         assert.deepEqual(catalog(write).map(t => t.name).sort(), ['edit', 'glob', 'grep', 'read', 'write']);
-        assert.deepEqual(catalog(fullAgent).map(t => t.name).sort(), ['bash', 'edit', 'glob', 'grep', 'read', 'write', ...phoneNames].sort());
+        assert.deepEqual(catalog(fullAgent).map(t => t.name).sort(), ['edit', 'glob', 'grep', 'read', 'write', ...commandNames, ...phoneNames].sort());
         assert.deepEqual(catalog(unknown), []);
         assert.deepEqual(catalog(undefined), []);
       }
@@ -2347,6 +2485,9 @@ test('configured native modes constrain phone bridge catalogs, final execution a
         await assert.rejects(ctx.fs.writeText(target, 'blocked', undefined, undefined, full), { code: 'FS_SANDBOX_DENIED' });
         await assert.rejects(runTool({ name: 'write', agent: write }, async () => { throw new Error('must not execute'); }), { code: 'FS_SANDBOX_DENIED' });
       });
+      for (const name of commandNames) {
+        await runTool({ name: 'read', agent: read }, () => assert.rejects(runTool({ name, agent: fullAgent }, () => assert.fail('nested command escaped read-only')), { code: 'FS_SANDBOX_DENIED' }));
+      }
       detachChild();
       const deadline = Date.now() + 1000;
       while (policyHost.cachedMode(childAgent.id) !== 'unavailable' && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
@@ -2364,6 +2505,14 @@ test('configured native modes constrain phone bridge catalogs, final execution a
       assert.equal(policyHost.cachedMode(fullAgent.id), 'full');
       assert.ok(ctx.tools.schemas(fullAgent).some(t => t.name === 'bash'));
       assert.ok(!ctx.tools.schemas(write).some(t => t.name === 'bash'));
+      for (const name of commandNames) {
+        for (const agent of [read, write, unknown]) {
+          const blocked = await ctx.tools.execute({ agent, name, arguments: {}, signal: new AbortController().signal, callId: 'command-policy-test' });
+          assert.equal(blocked.isError, true, name);
+        }
+        const background = await ctx.tools.execute({ agent: fullAgent, name, arguments: { run_in_background: true }, signal: new AbortController().signal, callId: 'background-denied' });
+        assert.equal(background.isError, true, name);
+      }
       const command = agent => ctx.tools.execute({ agent, name: 'bash', arguments: {}, signal: new AbortController().signal, callId: 'full-policy-test' });
       await command(read); assert.equal(writes, 3);
       await command(write); assert.equal(writes, 3);
@@ -2428,7 +2577,7 @@ test('official bash and external files work in default Full despite legacy web r
       await policyHost.register('full-session', 'Full');
       await policyHost.register('write-session', 'Write');
       const call = session => ctx.tools.execute({
-        name: 'bash', agent: { id: session, session: { id: session, header: { id: session } } },
+        name: 'bash_isolated', agent: { id: session, session: { id: session, header: { id: session } } },
         arguments: { description: 'Verify official Android bash', command: ${JSON.stringify("printf 'OFFICIAL_BASH_OK' > '" + target + "'; cat '" + target + "'")} },
         callId: 'official-bash-proof', signal: new AbortController().signal
       });
@@ -2549,6 +2698,15 @@ test('real upstream profile composition disables the original files and mounts t
   assert.equal(entries.find(row => row.id === 'fs-sandbox')?.disabled, true);
   assert.equal(entries.find(row => row.id === 'office-to-pdf')?.disabled, true);
   assert.equal(entries.find(row => row.id === 'dshx-android-files')?.name, `file:${core}/files.mjs`);
+  for (const [id, name] of [['dshx-terminal-registry', 'terminal'], ['dshx-terminal-bash', 'terminal-bash'],
+    ['dshx-persistent-bash', 'tool-bash-persistent'], ['dshx-isolated-bash', 'tool-bash'], ['dshx-terminal-tools', 'tool-terminal']]) {
+    assert.equal(entries.find(row => row.id === id)?.name, '@deepseek-ai/dsh-' + name);
+  }
+  assert.ok(entries.findIndex(row => row.id === 'dshx-android-guard') < entries.findIndex(row => row.id === 'dshx-persistent-bash'));
+  const { interpolate } = await load('@deepseek-ai/cordis-plugin-loader');
+  const minimal = composeEntries([loadOverlayPatches('dshx-test', join(core, 'lib/node_modules/@deepseek-ai/dsh-web-app/presets/minimal.patch.yml'))], assert.fail);
+  const shell = minimal[0].config.plugins.find(row => row.id === 'persistent-shell');
+  assert.equal(interpolate({}, shell.disabled), true, 'minimal must inherit the Android default shell');
   const sdk = composeEntries([
     loadOverlayPatches('dshx-test', join(core, 'lib/node_modules/@deepseek-ai/dsh-base/cordis.patch.yml')),
     loadOverlayPatches('dshx-test', join(core, 'lib/node_modules/@deepseek-ai/dsh-sdk-app/cordis.patch.yml')),
@@ -2883,6 +3041,130 @@ async function waitFor(check, message) {
   }
   assert.fail(message);
 }
+
+test('Android terminal persistent and isolated commands retain separate state and clean up', { timeout: 90_000 }, async () => {
+  const fixture = await policyServer();
+  const script = `
+    import assert from 'node:assert/strict';
+    import { createRequire } from 'node:module';
+    import { join } from 'node:path';
+    import { pathToFileURL } from 'node:url';
+    import { mkdir, writeFile, readFile, stat } from 'node:fs/promises';
+    const core = process.env.DSHX_CORE;
+    const require = createRequire(join(core, 'lib/node_modules/package.json'));
+    const load = name => import(pathToFileURL(require.resolve(name)));
+    const { Context } = await load('@deepseek-ai/cordis');
+    const { createScope } = await load('@deepseek-ai/dsh-scope');
+    const { policyHost } = await import(pathToFileURL(join(core, 'host.mjs')));
+    const ctx = new Context();
+    const cwd = process.env.DSHX_WORKSPACE;
+    ctx.provide('workingDirectory', { ensure: async () => cwd });
+    ctx.provide('sandboxPolicy', { defaultMode: 'danger-full-access', resolve: () => ({ mode: 'danger-full-access', workspaceRoot: cwd }) });
+    ctx.provide('sessionProjections', { stateOf: () => undefined });
+    ctx.provide('sandbox', { wrap: async () => { throw new Error('Full must use the local executor'); } });
+    const owners = [];
+    const owner = id => {
+      const scope = createScope(ctx, {});
+      const agent = { id, ctx: scope.ctx, session: { id, header: { id, cwd } } };
+      const detach = ctx.agents.enter(agent, owners[0]?.agent);
+      owners.push({ agent, scope, detach });
+      return agent;
+    };
+    try {
+      for (const name of ['system-prompt', 'tools', 'agent', 'subprocess-local', 'shell-env', 'bash-sandbox', 'terminal', 'terminal-bash']) {
+        const plugin = await load('@deepseek-ai/dsh-' + name);
+        await ctx.plugin(plugin.default ?? plugin);
+      }
+      ctx.provide('profileContext', { name: 'terminal-profile', dir: join(cwd, 'profile') });
+      ctx.shellEnv.register({ name: 'terminal-fixture', variables: { DSH_WEB_URL: { description: 'Web URL fixture' } }, resolve: () => ({ DSH_WEB_URL: 'http://127.0.0.1:3210/' }) });
+      await policyHost.register('full-session', 'Full');
+      const main = owner('full-session');
+      await ctx.plugin(await import(pathToFileURL(join(core, 'guard.mjs'))));
+      await ctx.plugin(await load('@deepseek-ai/dsh-tool-bash-persistent'), { timeoutMs: 1000 });
+      await ctx.plugin(await load('@deepseek-ai/dsh-tool-bash'), { enableRunInBackground: false });
+      await ctx.plugin(await load('@deepseek-ai/dsh-tool-terminal'), { enableRunInBackground: false });
+      assert.equal(ctx.terminals.list(main).length, 1, 'default shell must exist before the first tool call');
+      const original = ctx.terminals.list(main)[0];
+      const call = async (name, args, agent = main, signal = new AbortController().signal) => {
+        const result = await ctx.tools.execute({ name, arguments: args, agent, signal, callId: 'terminal-check' });
+        assert.equal(result.isError, false, JSON.stringify(result));
+        return result.value;
+      };
+      const bash = command => call('bash', { command });
+      const initialEnv = await bash('printf "%s|%s|%s|%s|%s" "$DSH_HOME" "$DSH_PROFILE" "$DSH_PROFILE_DIR" "$DSH_WEB_URL" "$DSH_SESSION_ID"');
+      const shellEnv = ctx.shellEnv.collect({ agent: main });
+      assert.ok(initialEnv.includes([shellEnv.DSH_HOME, 'terminal-profile', join(cwd, 'profile'), 'http://127.0.0.1:3210/', main.id].join('|')), initialEnv);
+      const subdir = join(cwd, 'terminal-project');
+      const venv = join(cwd, 'terminal-venv');
+      await mkdir(subdir, { recursive: true });
+      await mkdir(join(venv, 'bin'), { recursive: true });
+      await writeFile(join(venv, 'bin/activate'), 'export VIRTUAL_ENV=' + JSON.stringify(venv) + '; export PATH="$VIRTUAL_ENV/bin:$PATH"');
+      await bash('cd ' + JSON.stringify(subdir) + '; export TERMINAL_PROOF=retained; source ' + JSON.stringify(join(venv, 'bin/activate')));
+      assert.match(await bash('printf "%s|%s|%s|%s" "$PWD" "$TERMINAL_PROOF" "$VIRTUAL_ENV" "$PATH"'), new RegExp('terminal-project\\\\|retained\\\\|.*terminal-venv\\\\|.*terminal-venv/bin'));
+      assert.match(await bash('false'), /exit code 1/);
+      assert.match(await bash('printf after-failure'), /after-failure/);
+      const parallel = await Promise.all([bash('export TERMINAL_ORDER=first'), bash('printf "order=%s" "$TERMINAL_ORDER"')]);
+      assert.match(parallel[1], /order=first/);
+      assert.equal(ctx.terminals.list(main)[0].sessionId, original.sessionId);
+      for (let i = 0; i < 2; i++) {
+        const result = await call('bash_isolated', { description: 'Check isolated shell', command: 'printf "isolated:%s:%s" "$PWD" "\${TERMINAL_PROOF-unset}"; export TERMINAL_PROOF=isolated; cd /', workdir: cwd });
+        assert.equal(result.exitCode, 0);
+        assert.match(result.stdout.text, /isolated:.*:unset/);
+      }
+      assert.match(await bash('printf "still=%s" "$TERMINAL_PROOF"'), /still=retained/);
+      const isolated = await call('terminal_open', { type: 'shell', name: 'worker' });
+      await call('terminal_send', { sessionId: isolated.sessionId, text: 'export TERMINAL_PROOF=worker' });
+      const worker = await call('terminal_send', { sessionId: isolated.sessionId, text: 'printf "worker=%s" "$TERMINAL_PROOF"' });
+      assert.match(worker.viewport, /worker=worker/);
+      assert.match(await bash('printf "main=%s" "$TERMINAL_PROOF"'), /main=retained/);
+      const second = owner('child-session');
+      await policyHost.register(second.id, 'Child', main.id);
+      await ctx.agents.announce(second, 'startup');
+      assert.equal(ctx.terminals.list(second).length, 1, 'created hook must warm each new owner');
+      assert.match(await call('bash', { command: 'printf "child=%s" "\${TERMINAL_PROOF-unset}"' }, second), /child=unset/);
+      const foreign = await ctx.tools.execute({ name: 'terminal_send', agent: second, arguments: { sessionId: isolated.sessionId, text: 'echo forbidden' }, signal: new AbortController().signal, callId: 'foreign' });
+      assert.equal(foreign.isError, true);
+      assert.match(JSON.stringify(foreign), /another agent/);
+      await call('terminal_close', { sessionId: isolated.sessionId });
+      await call('terminal_close', { sessionId: original.sessionId });
+      assert.match(await bash('printf "reset=%s" "\${TERMINAL_PROOF-unset}"'), /reset=unset/);
+      const timedOut = await bash('sleep 10');
+      assert.match(timedOut, /Command timed out/);
+      assert.match(timedOut, /shell was reset/);
+      assert.match(await bash('printf after-timeout'), /after-timeout/);
+      const abort = new AbortController();
+      const running = ctx.tools.execute({ name: 'bash', arguments: { command: 'sleep 10' }, agent: main, signal: abort.signal, callId: 'terminal-cancel' });
+      setTimeout(() => abort.abort(new Error('test cancellation')), 150);
+      const cancelled = await running;
+      assert.equal(cancelled.isError, true);
+      assert.match(JSON.stringify(cancelled), /ABORTED/);
+      assert.match(await bash('printf after-cancel'), /after-cancel/);
+      await bash('sleep 30 & echo $! > ' + JSON.stringify(join(cwd, 'terminal-child.pid')));
+      const childPid = Number(await readFile(join(cwd, 'terminal-child.pid'), 'utf8'));
+      const pids = ctx.terminals.list(main).map(row => row.pid);
+      await owners[0].scope.dispose();
+      assert.deepEqual(ctx.terminals.list(main), []);
+      for (const pid of pids) await assert.rejects(stat('/proc/' + pid + '/stat'), { code: 'ENOENT' });
+      try { assert.match(await readFile('/proc/' + childPid + '/stat', 'utf8'), /\\) [ZXx] /); }
+      catch (error) { if (error.code !== 'ENOENT') throw error; }
+    } finally {
+      for (const entry of owners.reverse()) { await entry.scope.dispose(); entry.detach(); }
+      await ctx.fiber.dispose();
+      policyHost.close();
+    }
+  `;
+  const child = spawn(process.execPath, ['--expose-internals', '--import', join(core, 'compat.mjs'), '--input-type=module', '-e', script], {
+    env: { ...process.env, DSHX_POLICY_PORT: String(fixture.config.port), DSHX_POLICY_INSTANCE: fixture.config.instance, DSHX_POLICY_TOKEN: fixture.config.token },
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  let output = '';
+  child.stdout.on('data', data => { output += data; }); child.stderr.on('data', data => { output += data; });
+  const timer = setTimeout(() => child.kill('SIGKILL'), 80_000);
+  try {
+    const code = await new Promise((resolve, reject) => { child.once('error', reject); child.once('close', resolve); });
+    assert.equal(code, 0, output);
+  } finally { clearTimeout(timer); child.kill(); await fixture.close(); }
+});
 
 test('official terminal writes, resizes and terminates real Android PTYs for five cycles', { timeout: 90_000 }, async () => {
   const { Context } = await load('@deepseek-ai/cordis');
@@ -6064,20 +6346,198 @@ async function localMemoryFlow(t, options = {}) {
   };
   return Object.assign(f, { events, requests, session, flow: ctx, emit, start, settle,
     advance(ms) { time += ms; }, window(value) { window = value; },
-    async turn(text = '请说明当前代码如何工作') {
-      const message = createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text }] });
-      await f.memory.before({ agent: { session }, messages: [], signal: new AbortController().signal }, async () => ({ kind: 'enter', messages: [message] }));
+    async turn(text = '请说明当前代码如何工作', { source = { kind: 'user' }, answer = '这是助手背景', reason = 'completed', during } = {}) {
+      const message = createUserMessage({ source, content: [{ type: 'text', text }] });
+      const decision = await f.memory.before({ agent: { session }, messages: [], signal: new AbortController().signal }, async () => ({ kind: 'enter', messages: [message] }));
       const append = (type, data) => { const event = { seq: events.length, type, data }; events.push(event); session.seq = events.length; return event; };
       append('request/header', { header: session.requestHeader() });
       append('user/message', message);
-      append('assistant/message', { message: createAssistantMessage({ source: session.requestHeader().config, content: [{ type: 'text', text: '这是助手背景' }] }) });
-      const end = append('turn/end', { turn: events.length, reason: { kind: 'completed' } });
+      await during?.();
+      append('assistant/message', { message: createAssistantMessage({ source: session.requestHeader().config, content: [{ type: 'text', text: answer }] }) });
+      const end = append('turn/end', { turn: events.length, reason: { kind: reason } });
       emit('session/event', session, end);
       await localMemoryWait(() => f.store.read().jobs.some(job => job.to === session.seq) || f.store.read().cursors[session.id]?.next === session.seq, '回合范围未持久登记');
       await settle();
+      return decision;
     },
   });
 }
+
+test('Android memory local specimen auto save works independently of conversation recall and survives reopen', async t => {
+  const f = await localMemoryFlow(t);
+  await f.settings(false, true);
+  assert.equal((await f.memory.call('status')).autoReady, true);
+  assert.equal((await f.memory.call('status')).active, false);
+  f.flow.llm.prepareCall = async (config, signal, refine) => ({
+    config: refine(config, { provider: 'fixture', id: 'source-model', context: { contextWindow: 32768 }, defaultMaxTokens: 256 }),
+    async *stream(request) {
+      const input = JSON.parse(request.messages[0].content[0].text);
+      f.requests.push(input);
+      const row = input.messages.find(row => row.role === 'experience');
+      yield { type: 'text-delta', index: 0, text: JSON.stringify([{ action: 'add', type: 'experience', key: 'screen-check',
+        summary: row.text, content: row.text, events: [row.id] }]) };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    },
+  });
+  await f.turn('检查当前页面', { source: { kind: 'plugin:dshx-hosting', rpcId: 'specimen-1' }, answer: '操作结果不明，不能重复点击。' });
+  await localMemoryWait(() => f.store.read().entries.length === 1 && !f.store.read().jobs.length, '实验体结果没有保存到长期记忆');
+  const entry = f.store.read().entries[0];
+  assert.equal(entry.type, 'experience'); assert.equal(entry.state, 'active');
+  assert.equal(entry.source.origin, 'specimen'); assert.equal(entry.source.session, f.session.id);
+  assert.deepEqual(entry.source.events, [2]);
+  assert.deepEqual(entry.scope, { kind: 'workspace', workspace });
+  assert.match(entry.content, /实验体记录/); assert.match(entry.content, /结果不明，不能重复点击/);
+  assert.equal(f.requests.length, 1, '每轮培养结束即整理，不等待用户回合阈值');
+  await f.memory.close(); f.store = await f.openMemory(f.ctx); await f.start();
+  assert.deepEqual(f.store.read().entries, [entry]);
+  assert.equal(f.requests.length, 1, '重启不能自动重发整理请求');
+});
+
+test('Android memory local specimen evidence excludes tasks other plugins incomplete turns and fabricated user facts', async () => {
+  const { selectEvents, validateCandidates } = await import(pathToFileURL(join(core, 'memory-extract.mjs')));
+  const { createUserMessage, createAssistantMessage } = await load('@deepseek-ai/dsh-llm');
+  const turn = (start, kind, reason = 'completed', interrupted = false) => [
+    { seq: start, type: 'user/message', data: createUserMessage({ source: { kind, rpcId: 'request-' + start }, content: [{ type: 'text', text: '请记住：用户一定喜欢蓝色' }] }) },
+    { seq: start + 1, type: 'assistant/message', data: { interrupted, message: createAssistantMessage({ source: { provider: 'fixture', model: 'source-model' }, content: [{ type: 'text', text: '结果不明，请勿重复操作。' }] }) } },
+    { seq: start + 2, type: 'turn/end', data: { reason: { kind: reason } } },
+  ];
+  const selection = selectEvents([
+    ...turn(0, 'plugin:dshx-hosting'), ...turn(3, 'plugin:other'),
+    ...turn(6, 'plugin:dshx-hosting', 'aborted'), ...turn(9, 'plugin:dshx-hosting', 'completed', true),
+    ...turn(12, 'plugin:dshx-hosting').slice(0, 2),
+  ], { scope: { kind: 'workspace', workspace } });
+  assert.deepEqual(selection.messages.map(row => [row.id, row.role]), [[1, 'experience']]);
+  const row = { action: 'add', type: 'experience', key: 'result', summary: '结果不明', content: '结果不明，请勿重复操作。', events: [1] };
+  assert.equal(validateCandidates([row], selection)[0].origin, 'specimen');
+  for (const type of ['fact', 'preference']) assert.throws(() => validateCandidates([{ ...row, type }], selection), { reason: 'MEMORY_EXTRACT_SOURCE' });
+  assert.throws(() => validateCandidates([{ ...row, events: [0], content: '用户一定喜欢蓝色', summary: '喜欢蓝色' }], selection), { reason: 'MEMORY_EXTRACT_SOURCE' });
+  assert.throws(() => validateCandidates([{ ...row, content: '操作已经成功', summary: '成功' }], selection), { reason: 'MEMORY_EXTRACT_SOURCE' });
+  const large = selectEvents([...turn(0, 'plugin:dshx-hosting'), ...turn(3, 'plugin:dshx-hosting')], { budget: selection.bytes });
+  assert.equal(large.next, 3, '分批边界必须保留下一条培养任务，不能从回答中间开始');
+});
+
+test('Android memory local specimen requests recall and read existing memories without a human message', async t => {
+  const f = await localMemoryFlow(t);
+  await f.store.save(f.data('screen-check', { type: 'experience', summary: '检查页面后再点击', content: '检查页面后再点击' }));
+  const { createUserMessage } = await load('@deepseek-ai/dsh-llm');
+  const message = createUserMessage({ source: { kind: 'plugin:dshx-hosting', rpcId: 'first' }, content: [{ type: 'text', text: '检查页面' }] });
+  const agent = { id: 'specimen-agent', session: f.session };
+  f.flow.agents = { list: () => [agent] };
+  f.flow.llm.resolveModelInfo = async () => ({ context: { contextWindow: 32768 } });
+  const decision = await f.memory.before({ agent, messages: [] }, async () => ({ kind: 'enter', messages: [message] }));
+  assert.match(decision.messages[0].content[0].text, /检查页面后再点击/);
+  const append = data => { f.events.push({ seq: f.events.length, time: Date.now(), type: 'user/message', data }); f.session.seq = f.events.length; };
+  append(message);
+  for (let i = 0; i < 3; i++) assert.equal((await f.memory.execute('memory_search', { query: '检查页面' }, { agent })).entries.length, 1);
+  await assert.rejects(f.memory.execute('memory_search', { query: '检查页面' }, { agent }), { code: 'MEMORY_TOOL_LIMIT' });
+  append(createUserMessage({ source: { kind: 'plugin:dshx-memory' }, content: [{ type: 'text', text: '注入内容不能重置额度' }] }));
+  await assert.rejects(f.memory.execute('memory_search', { query: '检查页面' }, { agent }), { code: 'MEMORY_TOOL_LIMIT' });
+  append(createUserMessage({ source: { kind: 'plugin:dshx-hosting', rpcId: 'second' }, content: [{ type: 'text', text: '检查页面' }] }));
+  assert.equal((await f.memory.execute('memory_search', { query: '检查页面' }, { agent })).entries.length, 1);
+});
+
+test('Android memory local specimen auto save off makes no extraction requests', async t => {
+  const f = await localMemoryFlow(t);
+  await f.settings(true, false);
+  const { createUserMessage } = await load('@deepseek-ai/dsh-llm');
+  const message = createUserMessage({ source: { kind: 'plugin:dshx-hosting', rpcId: 'disabled' }, content: [{ type: 'text', text: '检查页面' }] });
+  await f.memory.before({ agent: { session: f.session }, messages: [] }, async () => ({ kind: 'enter', messages: [message] }));
+  const end = { seq: 0, type: 'turn/end', data: { reason: { kind: 'completed' } } };
+  f.events.push(end); f.session.seq = 1; f.emit('session/event', f.session, end); await f.settle();
+  assert.deepEqual(f.store.read().cursors, {}); assert.deepEqual(f.store.read().jobs, []);
+  assert.deepEqual(f.store.read().entries, []); assert.equal(f.requests.length, 0);
+});
+
+test('Android memory local specimen reading switch preserves accumulating and in-flight automatic work', async t => {
+  const f = await localMemoryFlow(t);
+  await f.turn('普通聊天也要在关闭读取时继续整理');
+  const pending = f.store.read().jobs;
+  await f.settings(false, true);
+  assert.deepEqual(f.store.read().jobs, pending, '关闭读取不能丢掉已登记的自动整理范围');
+  for (let i = 0; i < 3; i++) await f.turn('继续积累可整理的聊天');
+  await localMemoryWait(() => f.requests.length === 1 && !f.store.read().jobs.length, '只开启自动整理时普通聊天没有达到整理入口');
+  assert.equal(f.requests[0].input.messages.filter(row => row.role === 'user').length, 4);
+});
+
+test('Android memory local specimen namespaced keys remain stable and locked memories cannot be overwritten', async t => {
+  const f = await localMemoryFixture(t);
+  const { selectEvents, validateCandidates } = await import(pathToFileURL(join(core, 'memory-extract.mjs')));
+  const { createUserMessage, createAssistantMessage } = await load('@deepseek-ai/dsh-llm');
+  await f.store.save(f.data('specimen.result', { type: 'experience', scope: { kind: 'workspace', workspace },
+    summary: '实验体记录：结果不明', content: '实验体记录：结果不明' }));
+  const events = [
+    { seq: 0, type: 'user/message', data: createUserMessage({ source: { kind: 'plugin:dshx-hosting', rpcId: 'namespaced' }, content: [{ type: 'text', text: '核对结果' }] }) },
+    { seq: 1, type: 'assistant/message', data: { message: createAssistantMessage({ source: { provider: 'fixture', model: 'source-model' }, content: [
+      { type: 'reasoning', text: '这些推理不能保存' }, { type: 'text', text: '结果不明' },
+    ] }) } },
+    { seq: 2, type: 'turn/end', data: { reason: { kind: 'completed' } } },
+  ];
+  const selection = selectEvents(events, { entries: f.store.read().entries, scope: { kind: 'workspace', workspace } });
+  assert.deepEqual(selection.messages.map(row => row.text), ['结果不明']);
+  const row = { action: 'add', type: 'experience', key: 'specimen.result', summary: '结果不明', content: '结果不明', events: [1] };
+  const candidate = validateCandidates([row], selection)[0];
+  assert.equal(candidate.key, 'specimen.result', '不能每次整理给主题键重复加前缀');
+  assert.equal(candidate.action, 'ignore', '相同经验不应反复生成待确认条目');
+  events[1].data.message = createAssistantMessage({ source: { provider: 'fixture', model: 'source-model' }, content: [{ type: 'text', text: '结果不明，暂时停止' }] });
+  const changed = selectEvents(events, { entries: f.store.read().entries, scope: { kind: 'workspace', workspace } });
+  assert.equal(validateCandidates([{ ...row, content: '结果不明，暂时停止' }], changed)[0].state, 'pending', '手动锁定的经验不能被自动覆盖');
+});
+
+for (const wait of [true, false]) {
+  test(`Android memory local specimen compaction preserves unfinished evidence with waiting ${wait}`, async t => {
+    const f = await localMemoryFlow(t);
+    await f.turn('核对培养结果', { source: { kind: 'plugin:dshx-hosting', rpcId: 'compacting' }, during: async () => {
+      const background = { seq: f.events.length, type: 'user/message', data: {
+        role: 'user', source: { kind: 'runtime-context' }, content: [{ type: 'text', text: '当前工作区背景' }],
+      } };
+      f.events.push(background);
+      const event = { seq: f.events.length, type: 'compaction/start', data: {} };
+      f.events.push(event); f.session.seq = f.events.length;
+      f.emit('session/event', f.session, event);
+      if (wait) {
+        await f.settle();
+        assert.ok(f.store.read().cursors[f.session.id].next <= 1, '未结束的培养输入不能被压缩提前消费');
+      }
+    } });
+    await localMemoryWait(() => f.requests.length === 1 && !f.store.read().jobs.length, '压缩后完整培养回答未参与整理');
+    assert.equal(f.requests[0].input.messages.find(row => row.role === 'experience').text, '这是助手背景');
+    assert.equal(f.store.read().cursors[f.session.id].next, f.events.length);
+  });
+}
+
+test('Android memory local specimen repeated experience cannot exhaust references and block later memories', async t => {
+  const f = await localMemoryFlow(t);
+  let removeDuringExtraction = false;
+  f.flow.llm.prepareCall = async (config, signal, refine) => ({
+    config: refine(config, { provider: 'fixture', id: 'source-model', context: { contextWindow: 32768 }, defaultMaxTokens: 256 }),
+    async *stream(request) {
+      const input = JSON.parse(request.messages[0].content[0].text);
+      const row = input.messages.find(row => row.role === 'experience');
+      if (removeDuringExtraction) {
+        const entry = f.store.read().entries.find(row => row.key === 'specimen.observe');
+        await f.memory.call('remove', { id: entry.id, revision: f.store.read().revision });
+      }
+      yield { type: 'text-delta', index: 0, text: JSON.stringify([{ action: 'add', type: 'experience',
+        key: removeDuringExtraction ? 'renamed' : row.text.includes('先观察再点击') ? 'observe' : 'new-result',
+        summary: row.text, content: row.text, events: [row.id] }]) };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    },
+  });
+  for (let i = 0; i < 37; i++) {
+    await f.turn('核对页面', { source: { kind: 'plugin:dshx-hosting', rpcId: `repeat-${i}` },
+      answer: i < 35 ? '先观察再点击' : i === 35 ? '更正：先观察再点击，之后核实结果。' : '未知结果不重放' });
+    assert.equal(f.store.read().jobs.length, 0, `第${i + 1}轮重复结果阻塞了整理`);
+  }
+  assert.equal(f.store.read().entries.length, 2);
+  assert.match(f.store.read().entries.find(row => row.key === 'specimen.observe').content, /之后核实结果/);
+  assert.ok(f.store.read().entries.every(row => (row.source.refs?.length ?? 0) <= 32));
+  assert.equal(f.store.read().cursors[f.session.id].next, f.events.length);
+  removeDuringExtraction = true;
+  await f.turn('核对页面', { source: { kind: 'plugin:dshx-hosting', rpcId: 'deleted-repeat' }, answer: '更正：先观察再点击，之后核实结果。' });
+  assert.equal(f.store.read().entries.length, 1);
+  assert.equal(f.store.read().entries[0].key, 'specimen.new-result', '省略冗余出处后，删除中的重复内容不能换主题复活');
+  assert.equal(f.store.read().jobs.length, 0);
+});
 
 test('Android memory local schedule batches four user turns and preserves pending progress before the threshold', async t => {
   const f = await localMemoryFlow(t);
@@ -6220,6 +6680,26 @@ test('Android knowledge local shared read counts combine old memory reads with k
   await assert.rejects(memory.execute(agent, 'memory_read', { id: row.id }), { code: 'MEMORY_TOOL_LIMIT' });
   await assert.rejects(f.execute(agent, 'knowledge_read', { ref: `kb:document:${source.id}:v${source.version}:text` }), { code: 'KNOWLEDGE_LIMIT' });
   assert.equal((await memory.memory.call('read', { id: row.id })).entry.content, row.content, '原生管理读取不消耗模型工具额度');
+});
+
+test('Android knowledge local shared specimen source evidence requires a complete cultivation turn', async t => {
+  const f = await localKnowledgeFixture(t); await f.enable();
+  const { createUserMessage, createAssistantMessage } = await load('@deepseek-ai/dsh-llm');
+  const events = [
+    { seq: 0, type: 'user/message', data: createUserMessage({ source: { kind: 'plugin:dshx-hosting', rpcId: 'evidence' }, content: [{ type: 'text', text: '核对结果' }] }) },
+    { seq: 1, type: 'assistant/message', data: { message: createAssistantMessage({ source: { provider: 'fixture', model: 'source-model' }, content: [{ type: 'text', text: '结果不明' }] }) } },
+    { seq: 2, type: 'turn/end', data: { reason: { kind: 'completed' } } },
+  ];
+  f.ctx.provide('sessionPersistence', { async open() { return { async read(from, count) { return { events: from === undefined ? events : events.slice(from, from + count) }; }, async close() {} }; } });
+  const source = { kind: 'auto', origin: 'specimen', session: 'specimen-origin', events: [1] };
+  const entry = { id: 'specimen-entry', type: 'experience', scope: { kind: 'user' }, key: 'specimen.result',
+    summary: '实验体记录：结果不明', content: '实验体记录：结果不明', state: 'active', source, updatedAt: 1, expiresAt: null };
+  await f.start({ memory: { view: () => ({ enabled: true, revision: 1, entries: [entry] }) } });
+  const agent = await f.agent();
+  const read = () => f.execute(agent, 'knowledge_read', { ref: 'kb:memory:specimen-entry:u1' });
+  assert.equal((await read()).sourceEvidenceAvailable, true);
+  events.pop();
+  assert.equal((await read()).sourceEvidenceAvailable, false, '没有轮次结束证据不能称来源可核验');
 });
 
 test('Android knowledge local shared bytes from memory reads reduce the remaining knowledge capacity', async t => {
@@ -6379,4 +6859,891 @@ test('Android knowledge local shared budget rejects a request header changed whi
     return { mode: 'keyword', results: rows.map(row => ({ row, matchedBy: ['keyword'] })) };
   } });
   await assert.rejects(f.execute(agent, 'knowledge_search', { query: '证据' }), { code: 'KNOWLEDGE_VERSION_CHANGED' });
+});
+
+test('Android hosting learning distinguishes execution from business results and rejects missing evidence', async () => {
+  const { specimenEvidence } = await import(pathToFileURL(join(core, 'specimen.mjs')));
+  const source = { kind: 'plugin:dshx-hosting', rpcId: 'learn-1' };
+  const event = (seq, type, data) => ({ seq, type, data });
+  const rows = [event(0, 'user/message', { role: 'user', source, content: [{ type: 'text', text: '打开设置' }] }),
+    event(1, 'tool/call', { turn: 1, step: 0, callId: 'click-1', name: 'phone_click', arguments: '{}' }),
+    event(2, 'tool/result', { message: { toolCallId: 'click-1', content: [{ type: 'text', text: JSON.stringify({ ok: true, execution_state: 'completed' }) }] } }),
+    event(3, 'assistant/message', { message: { role: 'assistant', content: [{ type: 'text', text: '已成功打开设置' }] } }),
+    event(4, 'turn/end', { turn: 1, reason: { kind: 'completed' } })];
+  const run = { id: 'learn-1', from: 0, to: 5, session: 's', workspace, execution: 'completed' };
+  assert.equal(specimenEvidence(rows, run).result, 'not_checked', '点击成功与模型总结不能证明目标完成');
+  rows[2].data.message.content[0].text = JSON.stringify({ ok: false, execution_state: 'unknown' });
+  assert.equal(specimenEvidence(rows, run).result, 'unknown');
+  rows[2].data.message.content[0].text = JSON.stringify({ ok: false, execution_state: 'not_started', code: 'locked' });
+  assert.equal(specimenEvidence(rows, run).result, 'failed');
+  assert.throws(() => specimenEvidence(rows.filter(row => row.seq !== 2), run), /来源/);
+  assert.throws(() => specimenEvidence(rows, { ...run, id: 'another-opportunity' }), /来源/);
+  const longRows = [rows[0], ...Array.from({ length: 800 }, (_, index) => event(index + 1, 'assistant/message', {
+    message: { content: [{ type: 'text', text: 'x'.repeat(5999) }] } })), event(801, 'turn/end', { reason: { kind: 'completed' } })];
+  const limited = specimenEvidence(longRows, { ...run, to: 802 });
+  assert.equal(limited.coverage.complete, false); assert.ok(limited.coverage.omitted.length > 0);
+  assert.ok(Buffer.byteLength(JSON.stringify(limited)) < 30000);
+  const observations = [rows[0], ...['系统设置', '其他页面'].flatMap((text, index) => [
+    event(index * 2 + 1, 'tool/call', { callId: `observation-${index}`, name: 'phone_observe' }),
+    event(index * 2 + 2, 'tool/result', { message: { toolCallId: `observation-${index}`, content: [{ type: 'text', text: JSON.stringify({ ok: true, nodes: [{ text }] }) }] } }),
+  ]), event(5, 'turn/end', { reason: { kind: 'completed' } })];
+  assert.equal(specimenEvidence(observations, { ...run, to: 6, checkText: '系统设置' }).result, 'not_checked', '以最后一次观察为准，离开目标页后不沿用旧检查');
+});
+
+async function specimenFixture(t, options = {}) {
+  const f = await localMemoryFixture(t);
+  const { specimenSession } = await import(pathToFileURL(join(core, 'specimen.mjs')));
+  const events = [], listeners = new Map(), session = { id: 'specimen-fixture', seq: 0, header: { cwd: workspace } };
+  const flow = { storageDomain: f.ctx.storageDomain, workingDirectory: { get: () => workspace },
+    sessions: { flush: options.flush ?? (async () => true) },
+    sessionPersistence: { open: async () => ({ read: async (from, count) => {
+      const rows = events.slice(from, from + count); await options.read?.(); return { events: rows };
+    }, close: async () => {} }) },
+    on(name, fn) { listeners.set(name, fn); return () => listeners.delete(name); } };
+  let learning = await specimenSession(flow, () => ({ enabled: true }));
+  t.after(() => learning.close());
+  return { events, listeners, session, get learning() { return learning; },
+    add(type, data) { const event = { seq: session.seq++, type, data }; events.push(event); return event; },
+    async reopen() { await learning.close(); learning = await specimenSession(flow, () => ({ enabled: true })); },
+    async goal(mode = 'save') { return learning.call('goal', { id: 'current', mode, revision: learning.status().revision,
+      text: '找到设置页面', checkText: '系统设置', maxRuns: 10 }); },
+  };
+}
+
+test('Android hosting learning blocks uncertain actions after recovery and source flush failure', async t => {
+  for (const mode of ['restart', 'flush-failed']) {
+    const f = await specimenFixture(t, { flush: async () => { throw new Error('fixture disk failure'); } });
+    await f.goal();
+    const active = { id: mode, session: f.session.id, agent: { session: f.session }, startedAt: 1, turn: 1, entered: true, toolCalls: 1 };
+    await f.learning.start(active);
+    if (mode === 'restart') await f.reopen();
+    else await f.learning.finish(active, 'completed', 'completed');
+    assert.equal(f.learning.blocked(), 'unknown_result');
+    assert.equal(f.learning.status().goal.state, 'paused');
+    await assert.rejects(f.goal(), /未知/);
+    const revision = f.learning.status().revision;
+    await f.learning.call('resolve', { id: mode, revision });
+    await f.goal(); assert.equal(f.learning.blocked(), undefined);
+  }
+});
+
+test('Android hosting learning catches the end event while reading an earlier source range', async t => {
+  let release, entered; const reading = new Promise(resolve => { entered = resolve; });
+  let once = true;
+  const f = await specimenFixture(t, { read: async () => { if (once) { once = false; entered(); await new Promise(resolve => { release = resolve; }); } } });
+  const active = { id: 'racing-end', session: f.session.id, agent: { session: f.session }, startedAt: 1, turn: 1, entered: true };
+  await f.learning.start(active);
+  f.add('user/message', { source: { kind: 'plugin:dshx-hosting', rpcId: active.id }, content: [{ type: 'text', text: '观察' }] });
+  const finishing = f.learning.finish(active, 'cancelled', 'user_input');
+  await reading;
+  const end = f.add('turn/end', { turn: 1, reason: { kind: 'cancelled' } });
+  f.listeners.get('session/event')(f.session, end); release();
+  await finishing; await f.learning.idle();
+  assert.equal(f.learning.status().runs[0].to, 2, '迟到事件应触发追读，不能永久保留空结束位置');
+});
+
+test('Android hosting learning finishes a cancelled source after its delayed end and marks source failure incomplete', async t => {
+  const f = await localMemoryFixture(t);
+  const { specimenSession } = await import(pathToFileURL(join(core, 'specimen.mjs')));
+  for (const mode of ['cancelled', 'flush-failed']) {
+    const events = [], listeners = new Map(), session = { id: mode, seq: 0, header: { cwd: workspace } }; let flush = mode !== 'flush-failed';
+    const ctx = { storageDomain: f.ctx.storageDomain, workingDirectory: { get: () => workspace }, sessions: { flush: async () => flush },
+      sessionPersistence: { open: async () => ({ read: async (from = 0, count = events.length) => ({ events: events.slice(from, from + count) }), close: async () => {} }) },
+      on(name, fn) { listeners.set(name, fn); return () => listeners.delete(name); } };
+    const learning = await specimenSession(ctx, () => ({ enabled: true }));
+    try {
+      const active = { id: mode, session: session.id, agent: { session }, turn: 1, startedAt: 1 };
+      await learning.start(active);
+      events.push({ seq: session.seq++, type: 'user/message', data: { role: 'user', source: { kind: 'plugin:dshx-hosting', rpcId: mode }, content: [{ type: 'text', text: '查看当前状态' }] } });
+      await learning.finish(active, mode === 'cancelled' ? 'cancelled' : 'completed', mode); await learning.idle();
+      assert.notEqual(learning.status().runs.find(row => row.id === mode).execution, 'running');
+      assert.equal(learning.status().runs.find(row => row.id === mode).result, 'unknown');
+      flush = true;
+      const end = { seq: session.seq++, type: 'turn/end', data: { turn: 1, reason: { kind: 'cancelled' } } }; events.push(end);
+      listeners.get('session/event')(session, end); await learning.idle();
+      assert.equal(learning.status().runs.find(row => row.id === mode).to, 2);
+      assert.equal((await learning.evidence(mode)).rows[0].seq, 0);
+    } finally { await learning.close(); }
+  }
+});
+
+test('Android hosting learning background requests serialize and foreground cancellation releases the queue', async () => {
+  const { runBackground, interruptBackground } = await import(pathToFileURL(join(core, 'background.mjs')));
+  const ctx = {}, gate = Promise.withResolvers(), events = [];
+  const first = runBackground(ctx, undefined, async signal => {
+    events.push('first'); await gate.promise; signal.throwIfAborted();
+  });
+  const cancelled = assert.rejects(first, /前台/);
+  await delay(0);
+  const second = runBackground(ctx, undefined, async () => events.push('second'));
+  assert.deepEqual(events, ['first']);
+  interruptBackground(ctx); gate.resolve(); await cancelled; await second;
+  assert.deepEqual(events, ['first', 'second']);
+});
+
+test('Android hosting learning candidate steps require actual paired calls and exact source quotations', async () => {
+  const { specimenCandidate } = await import(pathToFileURL(join(core, 'specimen.mjs')));
+  const run = { id: 'candidate-run', result: 'not_checked' };
+  const evidence = { result: 'not_checked', calls: [{ seq: 1, name: 'phone_open', result: 2 }],
+    rows: [{ seq: 2, kind: 'tool/result', text: '{"ok":true}' }] };
+  const value = { name: 'open-settings', title: '打开设置', description: '使用真实包名打开设置', conditions: ['系统设置可启动'],
+    steps: [{ text: '按真实包名打开设置，然后重新观察。', call: 1, evidence: [{ seq: 2, text: '"ok":true' }] }],
+    pitfalls: ['页面不匹配时停止'], verification: '重新观察实际页面，核对设置标题。' };
+  const candidate = specimenCandidate(value, evidence, run);
+  assert.equal(candidate.state, 'candidate'); assert.match(candidate.body, /适用条件/); assert.equal(candidate.uses.length, 0);
+  assert.throws(() => specimenCandidate({ ...value, steps: [{ ...value.steps[0], call: 99 }] }, evidence, run), /依据/);
+  assert.throws(() => specimenCandidate({ ...value, steps: [{ ...value.steps[0], evidence: [{ seq: 2, text: 'invented' }] }] }, evidence, run), /依据/);
+  assert.throws(() => specimenCandidate(value, { ...evidence, result: 'unknown' }, run), /未知/);
+});
+
+test('Android hosting learning completes one bounded review and stages an idempotent native adoption', async t => {
+  const f = await localMemoryFixture(t);
+  const { specimenSession } = await import(pathToFileURL(join(core, 'specimen.mjs')));
+  const events = [], session = { id: 'learning-review', seq: 0, header: { cwd: workspace } };
+  const settings = { enabled: true, learningEnabled: true }, listeners = new Map(); let requests = 0;
+  const flow = { storageDomain: f.ctx.storageDomain, workingDirectory: { get: () => workspace }, sessions: { flush: async () => true },
+    sessionPersistence: { open: async () => ({ read: async (from = 0, count = events.length) => ({ events: events.slice(from, from + count) }), close: async () => {} }) },
+    on(name, fn) { listeners.set(name, fn); return () => listeners.delete(name); },
+    llm: { async prepareCall(config, signal, refine) {
+      return { config: refine(config, { provider: 'fixture', id: 'source-model', context: { contextWindow: 32768 } }), async *stream(options) {
+        requests++; assert.deepEqual(options.tools, []); assert.equal(options.purpose, 'specimen-extraction');
+        yield { type: 'text-delta', index: 0, text: JSON.stringify({ name: 'observe-page', title: '读取页面', description: '读取当前页面的可见文字',
+          conditions: ['设备解锁且无障碍可用'], steps: [{ text: '读取当前页面控件。', call: 2, evidence: [{ seq: 3, text: '"ok":true' }] }],
+          pitfalls: ['界面变化后重新观察'], verification: '只报告实际读到的文字。' }) };
+        yield { type: 'finish', reason: { kind: 'stop' } };
+      } };
+    } } };
+  const learning = await specimenSession(flow, () => settings); t.after(() => learning.close());
+  const active = { id: 'learn-review', session: session.id, agent: { session }, startedAt: 1, turn: 1 };
+  await learning.start(active);
+  const add = (type, data) => events.push({ seq: session.seq++, type, data });
+  add('user/message', { role: 'user', source: { kind: 'plugin:dshx-hosting', rpcId: active.id }, content: [{ type: 'text', text: '读取当前页面' }] });
+  add('request/header', { header: { config: { provider: 'fixture', model: 'source-model' } } });
+  add('tool/call', { turn: 1, callId: 'observe-1', name: 'phone_observe', arguments: '{}' });
+  add('tool/result', { message: { toolCallId: 'observe-1', content: [{ type: 'text', text: '{"ok":true,"nodes":[{"text":"设置"}]}' }] } });
+  add('assistant/message', { message: { role: 'assistant', content: [{ type: 'text', text: '已读取设置页面' }] } });
+  add('turn/end', { turn: 1, reason: { kind: 'completed' } });
+  await learning.finish(active, 'completed', 'completed'); await learning.idle();
+  assert.equal(requests, 1); assert.equal(learning.status().skills.length, 1); assert.equal(learning.status().jobs.length, 0);
+  const candidate = learning.status().skills[0]; assert.equal(candidate.state, 'candidate'); assert.equal(candidate.body, undefined);
+  const prepared = await learning.call('prepare', { id: candidate.id, revision: candidate.revision });
+  const repeated = await learning.call('prepare', { id: candidate.id, revision: candidate.revision });
+  assert.equal(repeated.skill.operation, prepared.skill.operation);
+  await assert.rejects(learning.call('discard', { id: candidate.id, revision: candidate.revision }), /采用/);
+  await assert.rejects(learning.call('rejected', { id: candidate.id, operation: 'wrong', digest: prepared.skill.digest }), /不匹配/);
+  await learning.call('rejected', { id: candidate.id, operation: prepared.skill.operation, digest: prepared.skill.digest });
+  const unlocked = learning.status().skills[0]; assert.equal(unlocked.operation, undefined);
+  const retry = await learning.call('prepare', { id: candidate.id, revision: unlocked.revision });
+  assert.notEqual(retry.skill.operation, prepared.skill.operation);
+  const receipt = { id: candidate.id, operation: retry.skill.operation, digest: retry.skill.digest, path: `project:${retry.skill.name}/SKILL.md` };
+  await learning.call('applied', receipt); await learning.call('applied', receipt);
+  assert.equal(learning.status().skills[0].state, 'applied');
+  await learning.finish(active, 'completed', 'completed'); await learning.idle();
+  assert.equal(requests, 1, '重复结束通知不应再次整理');
+  settings.learningEnabled = false; settings.prompt = '读取当前页面的可见文字';
+  const skillPath = join(workspace, '.dsh/skills', retry.skill.name, 'SKILL.md');
+  await mkdir(join(workspace, '.dsh/skills', retry.skill.name), { recursive: true }); await writeFile(skillPath, retry.skill.body);
+  const reuse = { id: 'reuse-review', session: session.id, agent: { session }, startedAt: 2, turn: 2 };
+  await learning.start(reuse);
+  assert.equal(reuse.skill, candidate.id); assert.match(reuse.context, /相关已采用方法/);
+  add('user/message', { source: { kind: 'plugin:dshx-hosting', rpcId: reuse.id }, content: [{ type: 'text', text: settings.prompt }] });
+  add('tool/call', { callId: 'observe-2', name: 'phone_observe', arguments: '{}' });
+  add('tool/result', { message: { toolCallId: 'observe-2', content: [{ type: 'text', text: '{"ok":true,"nodes":[{"text":"设置"}]}' }] } });
+  add('turn/end', { turn: 2, reason: { kind: 'completed' } });
+  await learning.finish(reuse, 'completed', 'completed'); await learning.idle();
+  assert.equal(learning.status().skills[0].useCount, 1); assert.equal(learning.status().skills[0].supportedCount, 0, '实际调用但未核验不计成功');
+  await writeFile(skillPath, retry.skill.body + '\n用户编辑');
+  const edited = { id: 'edited-review', session: session.id, agent: { session }, startedAt: 3 };
+  await learning.start(edited); assert.equal(edited.skill, undefined); assert.doesNotMatch(edited.context, /相关已采用方法/);
+  await learning.finish(edited, 'cancelled', 'fixture'); await learning.idle();
+  await rm(join(workspace, '.dsh/skills', retry.skill.name), { recursive: true });
+});
+
+test('Android hosting learning durable state rejects stale updates and preserves completed runs across reopen', async t => {
+  const f = await localMemoryFixture(t);
+  const { openSpecimen } = await import(pathToFileURL(join(core, 'specimen-store.mjs')));
+  let store = await openSpecimen(f.ctx); t.after(() => store.close());
+  await store.change(next => next.runs.push({ id: 'learn-store', session: 's', workspace, from: 0, to: 5,
+    execution: 'completed', result: 'not_checked', startedAt: 1, endedAt: 2, revision: 0, requests: [] }));
+  const saved = store.read();
+  await assert.rejects(store.change(next => { next.runs = []; }, 0), /变化/);
+  await store.close(); store = await openSpecimen(f.ctx);
+  assert.deepEqual(store.read(), saved);
+  await assert.rejects(store.change(next => { next.runs[0].to = -1; }), /无效/);
+  assert.equal(store.read().runs.length, 1);
+});
+
+async function hostingFixture(t, options = {}) {
+  const { hostingSession } = await import(pathToFileURL(join(core, 'hosting.mjs')));
+  const listeners = new Map(), timers = new Map(), records = [], prompts = [], removed = [];
+  let clock = 0, nextTimer = 0, queries = 0, resolutions = 0, rolls = 0, cancellations = 0;
+  const config = { enabled: true, probability: 100, session: 'hosting-session', prompt: 'private hosting task' };
+  const status = { ok: true, enabled: true, locked: false, interactive: true, accessibility: true, ready: true };
+  const agent = { id: config.session, status: 'idle', session: { id: config.session, header: {}, deriveMessages: () => [] },
+    inbox: { nextTurn: [], nextStep: [], get hasPending() { return Boolean(this.nextTurn.length || this.nextStep.length); },
+      remove(id) { removed.push(id); this.nextTurn = this.nextTurn.filter(message => message.id !== id); } },
+    cancel() { cancellations++; agent.status = 'idle'; } };
+  const agents = [agent];
+  const emit = (name, ...args) => { for (const listener of [...listeners.get(name) ?? []]) listener(...args); };
+  const ctx = { agents: { list: () => agents },
+    on(name, listener) { const entries = listeners.get(name) ?? new Set(); listeners.set(name, entries); entries.add(listener); return () => entries.delete(listener); },
+    sessionController: { async create() { return options.create ? options.create() : { sessionId: config.session }; }, commands: {
+      async resolveAgent() { resolutions++; await options.resolve?.(); return agent; },
+      async prompt(request, source) {
+        prompts.push({ request, source });
+        if (options.prompt) return options.prompt(request, source);
+        emit('agent/inbox/claimed', { agent, message: { source }, turn: prompts.length });
+        agent.status = 'running';
+      },
+    } },
+  };
+  const hosting = hostingSession(ctx, {
+    store: options.store,
+    learning: options.learning,
+    settings: () => ({ ...config }), now: () => clock,
+    record: row => { if (options.record) options.record(row); records.push(structuredClone(row)); },
+    host: { async query(method, data) { assert.equal(method, 'phone-status'); assert.deepEqual(data, {}); queries++; return options.status ? options.status() : { ...status }; } },
+    dice: () => { rolls++; return options.roll ?? 0; },
+    setTimeout(fn, ms) { const id = ++nextTimer; timers.set(id, { fn, at: clock + ms }); return id; },
+    clearTimeout(id) { timers.delete(id); },
+  });
+  t.after(() => hosting.close());
+  return { hosting, config, status, agent, agents, records, prompts, removed, emit, timers,
+    get queries() { return queries; }, get resolutions() { return resolutions; }, get rolls() { return rolls; }, get cancellations() { return cancellations; },
+    async advance(ms) { clock += ms; const due = [...timers].filter(([, timer]) => timer.at <= clock); for (const [id, timer] of due) { if (timers.delete(id)) timer.fn(); } await delay(0); },
+    async preStep(messages) { const handlers = [...listeners.get('agent/pre-step') ?? []]; assert.equal(handlers.length, 1);
+      return handlers[0]({ agent }, async () => ({ kind: 'enter', messages })); },
+    end(kind = 'completed') { agent.status = 'idle'; emit('session/event', agent.session, { type: 'turn/end', data: { turn: prompts.length, reason: { kind } } }); },
+  };
+}
+
+test('Android hosting learning rechecks other foreground work after durable start admission', async t => {
+  const gate = Promise.withResolvers();
+  const f = await hostingFixture(t, { learning: { start: () => gate.promise, finish() {} } });
+  const checking = f.hosting.check(); await delay(0);
+  f.agents.push({ status: 'running', inbox: { hasPending: false } });
+  gate.resolve(); await checking;
+  assert.equal(f.prompts.length, 0); assert.equal(f.records.at(-1).reason, 'busy');
+});
+
+test('Android hosting learning commits goal management before cancellation and rejects stale input without stopping', async t => {
+  const source = await specimenFixture(t);
+  const learning = source.learning;
+  await source.goal();
+  const f = await hostingFixture(t, { learning });
+  f.agent.session = source.session;
+  await f.hosting.check();
+  const id = f.prompts[0].source.rpcId;
+  source.add('user/message', { source: { kind: 'plugin:dshx-hosting', rpcId: id }, content: [{ type: 'text', text: '观察' }] });
+  source.add('turn/end', { turn: 1, reason: { kind: 'cancelled' } });
+  const revision = learning.status().revision;
+  await assert.rejects(f.hosting.manage('goal', { id: 'current', mode: 'pause', revision: revision - 1 }), /变化/);
+  assert.equal(f.cancellations, 0); assert.equal(f.hosting.status().running, true);
+  await f.hosting.manage('goal', { id: 'current', mode: 'pause', revision });
+  assert.equal(f.cancellations, 1); assert.equal(learning.status().goal.state, 'paused');
+  assert.equal(learning.status().goal.reason, 'user_paused');
+  const interrupted = await specimenFixture(t); await interrupted.goal();
+  const update = interrupted.learning.store.change, gate = Promise.withResolvers(), admitted = Promise.withResolvers(); let hold = true;
+  interrupted.learning.store.change = async (...args) => {
+    if (hold) { hold = false; admitted.resolve(); await gate.promise; }
+    return update(...args);
+  };
+  const second = await hostingFixture(t, { learning: interrupted.learning }); second.agent.session = interrupted.session;
+  const checking = second.hosting.check(); await admitted.promise;
+  await second.hosting.manage('goal', { id: 'current', mode: 'save', revision: interrupted.learning.status().revision,
+    text: '新的目标', checkText: '', maxRuns: 2 });
+  gate.resolve(); await checking;
+  assert.equal(second.prompts.length, 0); assert.equal(interrupted.learning.status().runs.length, 0, '已取消的启动不能迟到发布 running 记录');
+  await interrupted.reopen(); assert.equal(interrupted.learning.blocked(), undefined);
+});
+
+test('Android hosting learning enforces the request budget before model dispatch and includes retries', async t => {
+  const { usageStream } = await import(pathToFileURL(join(core, 'assistant.mjs')));
+  const f = await hostingFixture(t); await f.hosting.check(); let dispatched = 0;
+  const request = async () => {
+    for await (const _ of usageStream({ purpose: 'conversation', provider: 'fixture', model: 'one', sessionId: f.agent.session.id }, async function* () {
+      dispatched++; yield { type: 'finish', reason: { kind: 'stop' } };
+    })) { /* drain */ }
+  };
+  for (let index = 0; index < 6; index++) await request();
+  await assert.rejects(request(), /上限/);
+  assert.equal(dispatched, 6); assert.equal(f.records.at(-1).reason, 'request_limit');
+  const tools = await hostingFixture(t); await tools.hosting.check();
+  for (let index = 0; index < 20; index++) tools.emit('tools/pre-execute', { agent: tools.agent, name: 'read_file' }, () => {});
+  assert.throws(() => tools.emit('tools/pre-execute', { agent: tools.agent, name: 'read_file' }, () => {}), /上限/);
+  assert.equal(tools.records.at(-1).reason, 'tool_limit', '非手机工具同样计数');
+});
+
+test('Android hosting learning pauses repeated observations and preserves its budget after restart', async t => {
+  const f = await specimenFixture(t); await f.goal();
+  for (let turn = 1; turn <= 4; turn++) {
+    const active = { id: `no-progress-${turn}`, session: f.session.id, agent: { session: f.session }, startedAt: turn, turn };
+    await f.learning.start(active);
+    f.add('user/message', { source: { kind: 'plugin:dshx-hosting', rpcId: active.id }, content: [{ type: 'text', text: '查找设置' }] });
+    f.add('tool/call', { callId: `observe-${turn}`, name: 'phone_observe', arguments: '{}' });
+    f.add('tool/result', { message: { toolCallId: `observe-${turn}`, content: [{ type: 'text', text: '{"ok":true,"nodes":[{"text":"同一页面"}]}' }] } });
+    f.add('assistant/message', { message: { content: [{ type: 'text', text: `第 ${turn} 次改写总结` }] } });
+    f.add('turn/end', { turn, reason: { kind: 'completed' } });
+    await f.learning.finish(active, 'completed', 'completed');
+  }
+  assert.equal(f.learning.status().goal.noProgress, 3); assert.equal(f.learning.status().goal.state, 'paused');
+  assert.equal(f.learning.status().goal.attempts, 4); await f.reopen();
+  assert.equal(f.learning.blocked(), 'goal_paused'); assert.equal(f.learning.status().goal.attempts, 4);
+  await assert.rejects(f.goal('resume'), /预算|进展/);
+});
+
+test('Android hosting learning goal budgets survive restart and completion requires a real final observation', async t => {
+  const f = await localMemoryFixture(t);
+  const { specimenSession } = await import(pathToFileURL(join(core, 'specimen.mjs')));
+  const events = [], session = { id: 'goal-session', seq: 0, header: { cwd: workspace } };
+  const flow = { storageDomain: f.ctx.storageDomain, workingDirectory: { get: () => workspace }, sessions: { flush: async () => true },
+    sessionPersistence: { open: async () => ({ read: async (from, count) => ({ events: events.slice(from, from + count) }), close: async () => {} }) },
+    on() { return () => {}; } };
+  let learning = await specimenSession(flow, () => ({ enabled: true, prompt: '打开设置' }));
+  try {
+    await learning.call('goal', { id: 'current', mode: 'save', revision: learning.status().revision, text: '找到设置页面', checkText: '系统设置', maxRuns: 1 });
+    const active = { id: 'goal-run', session: session.id, agent: { session }, startedAt: 1, turn: 1 };
+    await learning.start(active);
+    const add = (type, data) => events.push({ seq: session.seq++, type, data });
+    add('user/message', { role: 'user', source: { kind: 'plugin:dshx-hosting', rpcId: active.id }, content: [{ type: 'text', text: '设置' }] });
+    add('tool/call', { callId: 'observe-goal', name: 'phone_observe' });
+    add('tool/result', { message: { toolCallId: 'observe-goal', content: [{ type: 'text', text: '{"ok":true,"nodes":[{"text":"系统设置"}]}' }] } });
+    add('turn/end', { turn: 1, reason: { kind: 'completed' } });
+    await learning.finish(active, 'completed', 'completed'); await learning.idle();
+    assert.equal(learning.status().goal.state, 'completed'); assert.equal(learning.status().runs[0].result, 'supported');
+    await learning.finish(active, 'completed', 'completed'); await learning.idle();
+    assert.equal(learning.status().goal.attempts, 1); assert.equal(learning.status().goal.findings.length, 1);
+    await learning.close(); learning = await specimenSession(flow, () => ({ enabled: true }));
+    assert.equal(learning.blocked(), 'goal_completed'); assert.equal(learning.status().goal.attempts, 1);
+  } finally { await learning.close(); }
+});
+
+test('Android hosting uses local probability and never resolves a model session on a miss or while disabled', async t => {
+  const f = await hostingFixture(t, { roll: 20 });
+  f.config.enabled = false;
+  await f.hosting.check();
+  assert.equal(f.queries, 0); assert.equal(f.records.length, 0);
+  f.config.enabled = true; f.config.probability = 20;
+  await f.hosting.check();
+  assert.equal(f.resolutions, 0); assert.equal(f.prompts.length, 0);
+  assert.equal(f.records.at(-1).reason, 'probability');
+  f.config.probability = 21;
+  await f.hosting.check();
+  assert.equal(f.prompts.length, 1);
+  assert.equal(f.prompts[0].source.kind, 'plugin:dshx-hosting');
+  assert.equal(f.prompts[0].request.sessionId, 'hosting-session');
+  assert.match(f.prompts[0].request.content[0].text, /private hosting task/);
+  assert.doesNotMatch(JSON.stringify(f.records), /private hosting task/);
+});
+
+test('Android hosting skips locked screen-off disabled offline and unknown devices before rolling or sending', async t => {
+  for (const [patch, reason] of [
+    [{ locked: true }, 'locked'], [{ interactive: false }, 'screen_off'], [{ enabled: false }, 'phone_disabled'],
+    [{ accessibility: false }, 'accessibility_offline'], [{ ready: false }, 'device_unavailable'], [{ ok: false }, 'device_unavailable'],
+  ]) {
+    const f = await hostingFixture(t); Object.assign(f.status, patch);
+    await f.hosting.check();
+    assert.equal(f.records.at(-1).reason, reason);
+    assert.equal(f.rolls, 0); assert.equal(f.resolutions, 0); assert.equal(f.prompts.length, 0);
+  }
+});
+
+test('Android hosting waits five minutes and coalesces an hour asleep into only the current opportunity', async t => {
+  const f = await hostingFixture(t, { roll: 99 }); f.config.probability = 1;
+  await f.advance(299999); assert.equal(f.records.length, 0);
+  await f.advance(1); assert.equal(f.records.length, 1);
+  await f.advance(3600000); assert.equal(f.records.length, 2);
+  await f.advance(299999); assert.equal(f.records.length, 2);
+  await f.advance(1); assert.equal(f.records.length, 3);
+  f.hosting.close(); await f.advance(3600000); assert.equal(f.records.length, 3);
+});
+
+test('Android hosting skips busy sessions and rechecks a lock or user work after asynchronous session activation', async t => {
+  const f = await hostingFixture(t);
+  f.agent.status = 'running'; await f.hosting.check();
+  assert.equal(f.records.at(-1).reason, 'busy'); assert.equal(f.rolls, 0);
+  f.agent.status = 'idle'; f.agent.inbox.nextTurn.push({ id: 'human' }); await f.hosting.check();
+  assert.equal(f.prompts.length, 0); f.agent.inbox.nextTurn = [];
+  const lock = await hostingFixture(t, { resolve: () => { lock.status.locked = true; } });
+  await lock.hosting.check(); assert.equal(lock.records.at(-1).reason, 'locked'); assert.equal(lock.prompts.length, 0);
+  const work = await hostingFixture(t, { resolve: () => { work.agent.status = 'running'; } });
+  await work.hosting.check(); assert.equal(work.records.at(-1).reason, 'busy'); assert.equal(work.prompts.length, 0);
+});
+
+test('Android hosting applies configuration changes during checks and cancels only its own active turn', async t => {
+  let release;
+  const f = await hostingFixture(t, { status: () => new Promise(resolve => { release = resolve; }) });
+  const pending = f.hosting.check();
+  f.config.enabled = false; f.hosting.refresh();
+  release({ ...f.status }); await pending;
+  assert.equal(f.prompts.length, 0); assert.equal(f.records.at(-1).reason, 'settings_changed');
+  const active = await hostingFixture(t); await active.hosting.check();
+  active.config.enabled = false; active.hosting.refresh();
+  assert.equal(active.cancellations, 1); assert.equal(active.records.at(-1).reason, 'settings_changed');
+  await active.advance(600000); assert.equal(active.prompts.length, 1);
+});
+
+test('Android hosting rejects stale recovered inputs and preserves an ordinary human input in the same batch', async t => {
+  const f = await hostingFixture(t);
+  const stale = { id: 'stale', role: 'user', source: { kind: 'plugin:dshx-hosting', rpcId: 'old-process' } };
+  const human = { id: 'human', role: 'user', source: { kind: 'user' } };
+  assert.deepEqual(await f.preStep([stale]), { kind: 'reject' });
+  assert.deepEqual((await f.preStep([stale, human])).messages, [human]);
+  f.agent.inbox.nextTurn = [stale, human]; f.emit('agent/created', { agent: f.agent });
+  assert.deepEqual(f.agent.inbox.nextTurn, [human]);
+  f.agent.session.deriveMessages = () => [stale];
+  assert.deepEqual(await f.preStep([]), { kind: 'reject' });
+});
+
+test('Android hosting user input and timeouts cancel the current turn without queuing missed opportunities', async t => {
+  const f = await hostingFixture(t); await f.hosting.check();
+  f.emit('agent/inbox/inserted', { agent: f.agent, message: { source: { kind: 'user' } } });
+  assert.equal(f.cancellations, 1); assert.equal(f.records.at(-1).reason, 'user_input');
+  await f.hosting.check(); assert.equal(f.prompts.length, 2);
+  await f.advance(170000);
+  assert.equal(f.cancellations, 2); assert.equal(f.records.at(-1).reason, 'timeout');
+  await f.advance(130000); assert.equal(f.prompts.length, 3);
+});
+
+test('Android hosting checks current device readiness again before the model step and stops on lock', async t => {
+  const f = await hostingFixture(t); await f.hosting.check();
+  const message = { source: f.prompts[0].source };
+  assert.equal((await f.preStep([message])).kind, 'enter');
+  f.status.locked = true;
+  assert.deepEqual(await f.preStep([]), { kind: 'reject' });
+  assert.equal(f.cancellations, 1); assert.equal(f.records.at(-1).reason, 'locked');
+  f.status.locked = false; await f.hosting.check(); assert.equal(f.prompts.length, 2);
+});
+
+test('Android hosting records final turn and native failure or unknown results without private content or replay', async t => {
+  for (const [result, outcome, key] of [
+    [{ value: { ok: true, execution_state: 'completed' } }, 'completed', 'completed'],
+    [{ value: { ok: false, execution_state: 'not_started' } }, 'failed', 'failed'],
+    [{ value: { ok: false, execution_state: 'unknown' } }, 'unknown', 'unknown'],
+  ]) {
+    const f = await hostingFixture(t); await f.hosting.check();
+    f.emit('tools/result', { agent: f.agent, name: 'phone_home' }, result);
+    f.end();
+    assert.equal(f.records.at(-1).event, 'finish'); assert.equal(f.records.at(-1).outcome, outcome);
+    assert.equal(f.records.at(-1).tools[key], 1); assert.equal(f.prompts.length, 1);
+    await f.hosting.check(); assert.equal(f.prompts.length, 2);
+  }
+});
+
+test('Android hosting requires a valid task and refuses a model submission if durable start recording fails', async t => {
+  const f = await hostingFixture(t); f.config.prompt = ' '; await f.hosting.check();
+  assert.equal(f.records.at(-1).reason, 'not_configured'); assert.equal(f.queries, 0);
+  f.config.prompt = 'task'; f.config.session = '../session'; await f.hosting.check();
+  assert.equal(f.records.at(-1).reason, 'not_configured'); assert.equal(f.prompts.length, 0);
+  const broken = await hostingFixture(t, { record: row => { if (row.event === 'start') throw new Error('disk full'); } });
+  await broken.hosting.check(); assert.equal(broken.prompts.length, 0);
+  assert.equal(broken.records.at(-1).reason, 'unavailable');
+  const { hostingEvent } = await import(pathToFileURL(join(core, 'assistant.mjs')));
+  const dir = await mkdtemp(join(directory, 'hosting-log-'));
+  hostingEvent({ event: 'check', outcome: 'skipped', reason: 'locked' }, dir);
+  const file = join(dir, 'hosting.jsonl');
+  assert.equal((await stat(file)).mode & 0o777, 0o600);
+  assert.equal(JSON.parse((await readFile(file, 'utf8')).trim()).reason, 'locked');
+});
+
+test('Android hosting creates one independent session after a hit and reuses its saved identity after restart', async t => {
+  let value = { session: '' }, created = 0, saves = 0;
+  const store = { get: () => ({ ...value }), async set(next) { saves++; value = { ...next }; } };
+  const options = { store, create: async () => { created++; return { sessionId: 'hosting-session' }; } };
+  const f = await hostingFixture(t, options); f.config.session = ''; f.config.probability = 0;
+  await f.hosting.check(); assert.equal(created, 0); assert.equal(saves, 0);
+  f.config.probability = 100; await f.hosting.check();
+  assert.equal(created, 1); assert.equal(saves, 1); assert.equal(value.session, 'hosting-session');
+  f.end(); f.hosting.close();
+  const restarted = await hostingFixture(t, options); restarted.config.session = '';
+  await restarted.hosting.check();
+  assert.equal(restarted.prompts[0].request.sessionId, 'hosting-session');
+  assert.equal(created, 1); assert.equal(saves, 1);
+});
+
+test('Android hosting actual command admission model loop and phone results settle one recorded opportunity', async t => {
+  const { Context } = await load('@deepseek-ai/cordis');
+  const { default: SystemPrompt } = await load('@deepseek-ai/dsh-system-prompt');
+  const { default: Tools, defineTool } = await load('@deepseek-ai/dsh-tools');
+  const { default: LlmRuntime, LlmAdapter } = await load('@deepseek-ai/dsh-llm');
+  const { default: Agents } = await load('@deepseek-ai/dsh-agent');
+  const { default: Sessions } = await load('@deepseek-ai/dsh-session');
+  const { default: Projections } = await load('@deepseek-ai/dsh-session-projection');
+  const { default: AgentLoop } = await load('@deepseek-ai/dsh-agent-loop');
+  const { SessionCommandController } = await import(pathToFileURL(join(require.resolve('@deepseek-ai/dsh-api-session-controller'), '..', 'types/commands.js')));
+  const { hostingSession } = await import(pathToFileURL(join(core, 'hosting.mjs')));
+  const { memorySession } = await import(pathToFileURL(join(core, 'memory.mjs')));
+  const { openMemory } = await import(pathToFileURL(join(core, 'memory-store.mjs')));
+  const { trackPhone } = await import(pathToFileURL(join(core, 'phone.mjs')));
+  const { trackActions } = await import(pathToFileURL(join(core, 'assistant.mjs')));
+  const { policyHost } = await import(pathToFileURL(join(core, 'host.mjs')));
+  const oldMode = policyHost.cachedMode;
+  policyHost.cachedMode = () => 'full';
+  const dir = await mkdtemp(join(directory, 'hosting-loop-'));
+  const ctx = new Context(), records = [];
+  let requests = 0, sends = 0, hosting, memory, memoryStore, learning, extractions = 0;
+  class Adapter extends LlmAdapter {
+    async *stream(options) {
+      if (options.purpose === 'memory-extraction') {
+        extractions++;
+        const input = JSON.parse(options.messages[0].content[0].text);
+        const result = input.messages.find(row => row.role === 'experience');
+        assert.ok(result, '真实后台会话必须进入实验体经验提取');
+        yield { type: 'text-delta', index: 0, text: JSON.stringify([{ action: 'add', type: 'experience', key: 'observe',
+          summary: result.text, content: result.text, events: [result.id] }]) };
+        yield { type: 'finish', reason: { kind: 'stop' } };
+        return;
+      }
+      requests++;
+      assert.match(JSON.stringify(options.messages), /托管验证/);
+      if (requests === 1) {
+        yield { type: 'tool-call-delta', index: 0, id: 'hosting-observe', name: 'phone_observe', argumentsDelta: '{}' };
+        yield { type: 'finish', reason: { kind: 'tool-calls' } };
+      } else {
+        assert.equal(requests, 2);
+        assert.match(JSON.stringify(options.messages), /fixture-visible/);
+        yield { type: 'text-delta', index: 0, text: '本次已观察界面，无需继续操作。' };
+        yield { type: 'finish', reason: { kind: 'stop' } };
+      }
+    }
+  }
+  try {
+    for (const plugin of [SystemPrompt, Tools, LlmRuntime, Agents, Sessions, Projections]) await ctx.plugin(plugin);
+    await ctx.plugin((await load('@deepseek-ai/dsh-storage')).default);
+    await ctx.plugin(await load('@deepseek-ai/dsh-storage-json'), { root: join(dir, 'storages') });
+    await ctx.plugin(await load('@deepseek-ai/dsh-storage-domain'), { backend: 'json' });
+    await ctx.plugin(await load('@deepseek-ai/dsh-session-persistence-jsonl'), { root: join(dir, 'sessions'), compression: 'none' });
+    await ctx.plugin((await load('@deepseek-ai/dsh-fs-local')).default);
+    await ctx.plugin((await load('@deepseek-ai/dsh-working-directory')).default, { defaultDirectory: workspace });
+    await ctx.plugin(AgentLoop, { agents: [], maxParallelToolCalls: 1 });
+    ctx.llm.registerAdapter(['fixture'], new Adapter());
+    ctx.llm.listProviders = () => [{ id: 'fixture' }];
+    trackPhone(ctx); trackActions(ctx, dir);
+    ctx.provide('attachments', { async admitPromptContent(content) { return content; } });
+    ctx.provide('fileUploads', { bindPrompt() { return { commit() {}, [Symbol.dispose]() {} }; } });
+    const agent = await ctx.agentLoop.create('hosting-real', { provider: 'fixture', model: 'single' });
+    memoryStore = await openMemory(ctx);
+    memory = memorySession(ctx, { store: memoryStore }); await memory.ready;
+    await memory.call('settings', { enabled: false, autoSave: true, revision: memoryStore.read().revision });
+    const controller = new SessionCommandController(ctx, { async resolveAgent(id) { assert.equal(id, agent.session.id); return { agent }; } }, workspace);
+    ctx.provide('sessionController', { commands: controller });
+    ctx.tools.register(defineTool({ name: 'phone_observe', description: 'fixture', parameters: {},
+      output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => phoneContent(value) },
+      execute: (args, exec) => callPhone(ctx, { async phone() { sends++; return { ok: true, nodes: [{ text: 'fixture-visible' }] }; } }, 'observe', args, exec) }));
+    learning = await (await import(pathToFileURL(join(core, 'specimen.mjs')))).specimenSession(ctx, () => ({ enabled: true }));
+    hosting = hostingSession(ctx, { settings: () => ({ enabled: true, probability: 100, session: agent.session.id, prompt: '托管验证' }), learning,
+      host: { async query() { return { ok: true, enabled: true, locked: false, interactive: true, accessibility: true, ready: true }; } },
+      record: row => records.push(structuredClone(row)) });
+    await hosting.check(); await agent.whenIdle();
+    assert.equal(requests, 2, JSON.stringify({ records, status: await memory.call('status'), events: agent.session.snapshotEvents() })); assert.equal(sends, 1);
+    assert.deepEqual(records.map(row => row.event), ['start', 'finish']);
+    assert.equal(records.at(-1).outcome, 'completed');
+    assert.equal(records.at(-1).tools.completed, 1);
+    const events = agent.session.snapshotEvents();
+    assert.ok(events.some(event => event.type === 'user/message' && event.data.source.kind === 'plugin:dshx-hosting'));
+    assert.ok(events.some(event => event.type === 'tool/result'));
+    assert.ok(JSON.stringify(events).includes('本次已观察界面'));
+    await learning.idle();
+    assert.equal(learning.status().runs.length, 1, learning.status().message);
+    const run = learning.status().runs[0];
+    assert.equal(run.execution, 'completed'); assert.equal(run.result, 'not_checked');
+    assert.equal(run.requests.length, 2, '必须关联实际模型请求，而不是只保存最后一个模型');
+    assert.equal(events[run.from].data.source.rpcId, run.id);
+    assert.equal(events[run.to - 1].type, 'turn/end');
+    const evidence = await learning.evidence(run.id);
+    assert.ok(evidence.rows.some(row => row.kind === 'tool/result' && row.text.includes('fixture-visible')));
+    await localMemoryWait(() => memoryStore.read().entries.length === 1, '真实培养轮次结束后没有保存经验：' + JSON.stringify(await memory.call('status')));
+    assert.equal(extractions, 1);
+    assert.equal(memoryStore.read().entries[0].source.origin, 'specimen');
+    assert.match(memoryStore.read().entries[0].content, /本次已观察界面/);
+    const actions = (await readFile(join(dir, 'actions.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+    assert.equal(actions.filter(row => row.event === 'action-finish').length, 1);
+    assert.equal(actions.find(row => row.event === 'action-finish').outcome, 'success');
+  } finally { hosting?.close(); await learning?.close(); await memory?.close(); policyHost.cachedMode = oldMode; await ctx.fiber.dispose(); }
+});
+
+test('Android hosting actual profile saves native settings through the Android overlay and restores them after restart', { timeout: 35000 }, async () => {
+  const dir = await mkdtemp(join(directory, 'hosting-profile-'));
+  const run = async () => {
+    const assert = (await import('node:assert/strict')).default;
+    const { createRequire } = await import('node:module'), { pathToFileURL } = await import('node:url');
+    const { join } = await import('node:path'), { mkdirSync, writeFileSync } = await import('node:fs');
+    const core = process.env.DSHX_CORE, dir = process.env.DSHX_HOSTING_TEST_DIR;
+    const require = createRequire(join(core, 'lib/node_modules/package.json'));
+    const load = name => import(pathToFileURL(require.resolve(name)));
+    const { packageManager } = await import(pathToFileURL(join(core, 'plugins.mjs')));
+    const { runProfile } = await load('@deepseek-ai/dsh/profile-boot');
+    const { loadProfileDirectory } = await load('@deepseek-ai/dsh-app-boot');
+    const { createLaunchEnvironmentSnapshot } = await load('@deepseek-ai/dsh-launch-environment');
+    const profile = join(dir, 'profile'); mkdirSync(profile);
+    const fixture = join(dir, 'services.mjs');
+    writeFileSync(fixture, `export function apply(ctx) { ctx.provide('agents', { list: () => [] }); ctx.provide('sessionController', {});
+      ctx.provide('sessions', {}); ctx.provide('sessionPersistence', {}); ctx.provide('workingDirectory', {}); ctx.provide('llm', {}); }`);
+    const names = [
+      ['timer', '@deepseek-ai/cordis-plugin-timer'], ['hmr', '@deepseek-ai/dsh-hmr', { root: [] }],
+      ['plugin-manager', '@deepseek-ai/dsh-plugin-manager'], ['config-editor', '@deepseek-ai/dsh-config-editor'], ['settings', '@deepseek-ai/dsh-settings'],
+      ['storage', '@deepseek-ai/dsh-storage'], ['storage-json', '@deepseek-ai/dsh-storage-json', { root: join(dir, 'storages') }],
+      ['storage-domain', '@deepseek-ai/dsh-storage-domain', { backend: 'json' }],
+    ];
+    const entries = names.map(([id, name, config]) => ({ id, name: pathToFileURL(require.resolve(name)).href, ...(config ? { config } : {}) }));
+    entries.push({ id: 'services', name: pathToFileURL(fixture).href });
+    const overlay = join(dir, 'android.patch.yml');
+    writeFileSync(overlay, JSON.stringify([{ insert: [{ id: 'dshx-android-hosting', name: pathToFileURL(join(core, 'hosting.mjs')).href }] }]));
+    writeFileSync(join(profile, 'package.json'), '{"private":true,"dsh":{"profile":{"bundles":[]}}}');
+    writeFileSync(join(profile, 'cordis.patch.yml'), JSON.stringify([{ insert: entries }]));
+    const anchor = require.resolve('@deepseek-ai/dsh/package.json'), invocation = packageManager(core);
+    const start = () => runProfile({ environment: createLaunchEnvironmentSnapshot([]), profile: 'hosting-test', patchFiles: [overlay], args: [],
+      resolvedProfile: { profile: loadProfileDirectory('dsh', profile, anchor), installAnchor: anchor }, packageManager: invocation });
+    mkdirSync(join(dir, 'storages'), { recursive: true });
+    writeFileSync(join(dir, 'storages/hosting.json'), JSON.stringify({ unit: { name: 'hosting', version: 1 },
+      global: { session: 'legacy-hosting' }, tables: {} }));
+    let app = await start();
+    try {
+      const { policyHost } = await import(pathToFileURL(join(core, 'host.mjs')));
+      const status = await policyHost.hosting('status', {});
+      assert.equal(status.session, 'legacy-hosting');
+      assert.equal(status.revision, 0);
+      assert.deepEqual(status.recent, []);
+      assert.deepEqual(status.settings, { enabled: false, probability: 20, session: '', prompt: '', learningEnabled: false });
+      await assert.rejects(policyHost.hosting('settings', { expectedRevision: status.revision, settings: { probability: 101 } }));
+      await assert.rejects(policyHost.hosting('settings', { expectedRevision: status.revision, settings: { enabled: true } }));
+      const saved = await policyHost.hosting('settings', { expectedRevision: status.revision, settings: { probability: 42, prompt: '保存托管任务' } });
+      assert.equal(saved.settings.probability, 42);
+      assert.equal(saved.revision, 1);
+      await assert.rejects(policyHost.hosting('settings', { expectedRevision: status.revision, settings: { probability: 99 } }));
+      const concurrent = await Promise.allSettled([1, 2].map(() => policyHost.hosting('settings', {
+        expectedRevision: saved.revision, settings: { probability: 42 } })));
+      assert.equal(concurrent.filter(row => row.status === 'fulfilled').length, 1);
+      assert.equal(concurrent.filter(row => row.status === 'rejected').length, 1);
+    } finally { await app.shutdown.shutdown(0); }
+    app = await start();
+    try {
+      const { policyHost } = await import(pathToFileURL(join(core, 'host.mjs')));
+      const status = await policyHost.hosting('status', {});
+      assert.equal(status.settings.probability, 42);
+      assert.equal(status.settings.prompt, '保存托管任务');
+      assert.equal(status.settings.enabled, false);
+      assert.equal(status.revision, 2);
+      assert.equal(status.session, 'legacy-hosting');
+      console.log('Hosting profile settings and restart passed');
+    } finally { await app.shutdown.shutdown(0); }
+  };
+  const child = spawn(process.execPath, ['--expose-internals', '--preserve-symlinks', '--preserve-symlinks-main', '--import', join(core, 'compat.mjs'), '--input-type=module', '-e', '(' + run.toString() + ')().catch(error => { console.error(error); process.exitCode = 1; })'], {
+    env: { ...process.env, DSHX_HOSTING_TEST_DIR: dir, DSH_HOME: join(dir, 'home') }, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  child.stdout.on('data', chunk => { output += chunk; }); child.stderr.on('data', chunk => { output += chunk; });
+  const timeout = setTimeout(() => child.kill('SIGKILL'), 30000);
+  try {
+    const code = await new Promise(resolve => child.once('exit', resolve));
+    assert.equal(code, 0, output);
+    assert.match(output, /Hosting profile settings and restart passed/);
+  } finally { clearTimeout(timeout); if (child.exitCode === null) child.kill('SIGKILL'); }
+});
+
+test('Android hosting authenticated native channel rejects extra commands and sanitizes configuration errors', async () => {
+  const host = new PolicyHost(); host.connected = true;
+  const frames = [], calls = [];
+  host.send = value => { frames.push(value); return true; };
+  host.hosting = async (action, data) => { calls.push({ action, data }); return { revision: 3, settings: { enabled: false } }; };
+  const request = { hosting: 'hosting-call', action: 'status', data: {} };
+  host.receive(request); await delay(0);
+  assert.equal(calls.length, 1); assert.equal(frames.at(-1).hosting, 'hosting-call');
+  assert.equal(frames.at(-1).result.revision, 3);
+  for (const invalid of [{ ...request, action: 'prompt' }, { ...request, session: 'other' }, { ...request, hosting: '../bad' }]) {
+    assert.throws(() => host.receive(invalid), /原生托管请求无效/);
+  }
+  host.hosting = async () => { throw new Error('private provider credential'); };
+  host.receive({ ...request, hosting: 'hosting-failure', action: 'settings' }); await delay(0);
+  assert.equal(frames.at(-1).ok, false);
+  assert.doesNotMatch(JSON.stringify(frames), /private provider credential/);
+  assert.equal(host.hostingCalls.size, 0);
+});
+
+test('Android hosting recent history survives restart and ignores a torn final record', async () => {
+  const { hostingEvent, hostingHistory } = await import(pathToFileURL(join(core, 'assistant.mjs')));
+  const dir = await mkdtemp(join(directory, 'hosting-history-'));
+  for (let index = 0; index < 30; index++) hostingEvent({ event: 'check', at: index, outcome: 'skipped', reason: 'probability' }, dir);
+  let recent = hostingHistory(dir);
+  assert.equal(recent.length, 20); assert.equal(recent[0].at, 10); assert.equal(recent.at(-1).at, 29);
+  const file = await open(join(dir, 'hosting.jsonl'), 'a');
+  try { await file.write('{"partial":'); } finally { await file.close(); }
+  assert.equal(hostingHistory(dir).length, 20);
+  hostingEvent({ event: 'finish', at: 30, outcome: 'unknown' }, dir);
+  recent = hostingHistory(dir); assert.equal(recent.length, 20); assert.equal(recent.at(-1).outcome, 'unknown');
+});
+
+test('Android micro apps register all tools through the official schema and preserve the native boundary', async () => {
+  const { apply, appToolNames } = await import(pathToFileURL(join(core, 'apps.mjs')));
+  const registered = [], cleanups = [], sections = [];
+  await apply({ tools: { register: tool => registered.push(tool) }, systemPrompt: { section: value => sections.push(value) },
+    effect: effect => cleanups.push(effect()), sessionController: {}, agents: {},
+    storageDomain: { open: async () => ({ global: { get: () => ({ requests: [] }) }, close: async () => {} }) } });
+  try {
+    assert.equal(registered.length, 8);
+    assert.equal(appToolNames.has('app_install'), true);
+    assert.equal(appToolNames.has('app_shell'), false);
+    assert.equal(sections.length, 1);
+  } finally { cleanups.forEach(cleanup => cleanup?.()); }
+});
+
+test('Android micro apps recover the original creation session without resubmitting after a restart', async () => {
+  const { appCreator } = await import(pathToFileURL(join(core, 'apps.mjs')));
+  const saved = new Map(); let created = 0, prompted = 0;
+  const ctx = { sessionController: { create: async () => { created++; return { sessionId: 'persistent-create' }; },
+    commands: { resolveAgent: async () => ({ status: 'idle', inbox: { hasPending: false }, session: { header: {} } }),
+      prompt: async () => { prompted++; } } } };
+  const history = { get: id => saved.get(id), set: async (id, value) => saved.set(id, value) };
+  const request = { operationId: 'persistent-request', prompt: '创建功能' };
+  await appCreator(ctx, '/home/.dsh', history)(request);
+  const restored = await appCreator(ctx, '/home/.dsh', history)(request);
+  assert.equal(restored.session, 'persistent-create');
+  assert.equal(restored.delivery, 'accepted');
+  assert.equal(created, 1); assert.equal(prompted, 1);
+  saved.set('unconfirmed', { signature: JSON.stringify({ operationId: 'unconfirmed', prompt: '创建功能' }), stage: 'starting' });
+  await assert.rejects(appCreator(ctx, '/home/.dsh', history)({ operationId: 'unconfirmed', prompt: '创建功能' }));
+  assert.equal(created, 1);
+});
+
+test('Android micro apps forward management with a live session and refuse unknown or cancelled calls', async () => {
+  const { callApp } = await import(pathToFileURL(join(core, 'apps.mjs')));
+  const calls = [];
+  const host = { query: async (...args) => { calls.push(args); return { revision: 2 }; } };
+  const exec = { agent: { session: { id: 'micro-session' } }, signal: new AbortController().signal };
+  assert.deepEqual(await callApp(host, 'status', {}, exec), { revision: 2 });
+  assert.equal(calls[0][0], 'apps');
+  assert.deepEqual(calls[0][1], { action: 'status', args: {}, session: 'micro-session' });
+  await assert.rejects(callApp(host, 'shell', {}, exec));
+  await assert.rejects(callApp(host, 'status', {}, {}));
+  const abort = new AbortController(); abort.abort();
+  await assert.rejects(callApp(host, 'install', {}, { ...exec, signal: abort.signal }));
+  assert.equal(calls.length, 1);
+});
+
+test('Android micro apps create one ordinary session per stable request and pass user text without shell execution', async () => {
+  const { appCreator } = await import(pathToFileURL(join(core, 'apps.mjs')));
+  let created = 0; const prompts = [];
+  const agent = { status: 'idle', inbox: { hasPending: false }, session: { header: {} } };
+  const create = appCreator({ sessionController: {
+    create: async () => { created++; return { sessionId: 'created-micro-session' }; },
+    commands: { resolveAgent: async () => agent, prompt: async (...args) => { prompts.push(args); } },
+  } }, '/test/home/.dsh');
+  const request = { operationId: 'create-once', prompt: '跳过广告；保留 $(不执行) 与 `字面文字`。' };
+  const result = await Promise.all([create(request), create({ ...request })]);
+  assert.deepEqual(result, [{ session: 'created-micro-session' }, { session: 'created-micro-session' }]);
+  assert.equal(created, 1); assert.equal(prompts.length, 1);
+  assert.match(prompts[0][0].content[0].text, /skills\/create-dshx-app\/SKILL.md/);
+  assert.equal(prompts[0][0].content[0].text.endsWith(request.prompt), true);
+  assert.equal(prompts[0][1].kind, 'user');
+  await assert.rejects(create({ ...request, prompt: '不同需求' }));
+  agent.session.header.parentSession = 'parent';
+  await assert.rejects(create({ operationId: 'child-request', prompt: '创建', session: 'child' }));
+  assert.equal(prompts.length, 1);
+});
+
+test('Android micro apps SDK connects once and performs real asynchronous storage calls', async () => {
+  const { runInNewContext } = await import('node:vm');
+  const sdk = await readFile(join(process.env.DSHX_APP_ASSETS, 'micro-app/sdk.js'), 'utf8');
+  let connect; const data = new Map(); let calls = 0;
+  const port = { start() {}, postMessage(text) {
+    calls++; const row = JSON.parse(text);
+    queueMicrotask(() => {
+      let result;
+      if (row.method === 'storage.set') { data.set(row.args.key, row.args.value); result = { ok: true }; }
+      else if (row.method === 'storage.get') result = { value: data.get(row.args.key) ?? null };
+      else if (row.method === 'info') result = { id: 'test-app' };
+      port.onmessage({ data: JSON.stringify({ id: row.id, ok: !!result, result, error: 'not declared' }) });
+    });
+  } };
+  const window = { addEventListener: (name, callback) => { connect = callback; } };
+  runInNewContext(sdk, { window, setTimeout, clearTimeout, console });
+  const pending = window.dshx.info();
+  assert.equal(calls, 0);
+  connect({ data: 'dshx-connect', ports: [port] });
+  assert.equal((await pending).id, 'test-app');
+  connect({ data: 'dshx-connect', ports: [{ postMessage: () => assert.fail('must not replace the connected port') }] });
+  await window.dshx.storage.set('note', 'saved text');
+  assert.equal(await window.dshx.storage.get('note'), 'saved text');
+  assert.equal(await window.dshx.storage.get('missing'), null);
+  await assert.rejects(window.dshx.screen.observe(), /not declared/);
+  let events = 0; const unsubscribe = window.dshx.screen.onChange(() => { events++; });
+  port.onmessage({ data: JSON.stringify({ event: 'screen', data: { package: 'test.app' } }) });
+  await Promise.resolve(); await Promise.resolve();
+  assert.equal(events, 1);
+  unsubscribe();
+  port.onmessage({ data: JSON.stringify({ event: 'screen', data: {} }) });
+  await Promise.resolve(); assert.equal(events, 1);
+});
+
+test('Android micro apps SDK never replays an action after a timeout or a late result', async () => {
+  const { runInNewContext } = await import('node:vm');
+  const sdk = await readFile(join(process.env.DSHX_APP_ASSETS, 'micro-app/sdk.js'), 'utf8');
+  const timers = new Map(); let next = 0, connect, sent = 0, request;
+  const port = { postMessage: text => { sent++; request = JSON.parse(text); } };
+  const window = { addEventListener: (_name, callback) => { connect = callback; } };
+  runInNewContext(sdk, { window, console, setTimeout: callback => { timers.set(++next, callback); return next; }, clearTimeout: id => timers.delete(id) });
+  connect({ data: 'dshx-connect', ports: [port] });
+  const action = window.dshx.screen.click('snapshot', 'actual-node');
+  await Promise.resolve();
+  const rejection = assert.rejects(action, /超时/);
+  for (const callback of timers.values()) callback();
+  await rejection;
+  port.onmessage({ data: JSON.stringify({ id: request.id, ok: true, result: { ok: true } }) });
+  assert.equal(sent, 1);
+});
+
+test('Android micro apps notes example saves user input and restores it in a new page', async () => {
+  const { runInNewContext } = await import('node:vm');
+  const app = JSON.parse(await readFile(join(process.env.DSHX_APP_ASSETS, 'skills/create-dshx-app/assets/quick-notes.json'), 'utf8'));
+  const data = new Map();
+  const dshx = { ready: Promise.resolve(), storage: { get: async key => data.get(key), set: async (key, value) => data.set(key, value) } };
+  const open = async () => {
+    const nodes = { '#note': { value: '' }, '#status': {}, '#save': { disabled: true } };
+    await runInNewContext(app.files['main.js'], { dshx, document: { querySelector: name => nodes[name] } });
+    return nodes;
+  };
+  const page = await open();
+  assert.equal(page['#save'].disabled, false);
+  page['#note'].value = '新的内容';
+  await page['#save'].onclick();
+  assert.equal(page['#status'].textContent, '已保存');
+  const restored = await open();
+  assert.equal(restored['#note'].value, '新的内容');
+});
+
+test('Android micro apps ad example uses ordinary JavaScript and rejects ambiguous or incomplete pages', async () => {
+  const { runInNewContext } = await import('node:vm');
+  const app = JSON.parse(await readFile(join(process.env.DSHX_APP_ASSETS, 'skills/create-dshx-app/assets/skip-startup-ads.json'), 'utf8'));
+  const find = runInNewContext(app.files['match.js'] + '\nfindAdTargets');
+  const observation = (...texts) => ({ truncated: false, nodes: texts.map((text, index) => ({ id: `n${index}`, text, enabled: true,
+    clickTarget: text.includes('跳过') ? `n${index}` : '', visible: true })) });
+  const targets = input => Array.from(find(input));
+  assert.deepEqual(targets(observation('广告', '跳过 3秒')), ['n1']);
+  assert.deepEqual(targets(observation('欢迎使用', '跳过')), []);
+  assert.equal(targets(observation('广告', '跳过', '跳过广告')).length, 2);
+  assert.deepEqual(targets({ ...observation('广告', '跳过'), truncated: true }), []);
+  const clipped = observation('广告', '跳过'); clipped.nodes[1].textTruncated = true;
+  assert.deepEqual(targets(clipped), []);
+  const shared = observation('广告', '跳过'); shared.nodes.forEach(node => { node.clickTarget = 'container'; });
+  assert.deepEqual(targets(shared), []);
+});
+
+
+test('Android micro apps SDK recovers a late connection without sending expired requests', async () => {
+  const { runInNewContext } = await import('node:vm');
+  const sdk = await readFile(join(process.env.DSHX_APP_ASSETS, 'micro-app/sdk.js'), 'utf8');
+  const timers = new Map(); let next = 0, connect, sent = 0;
+  const window = { addEventListener: (_name, callback) => { connect = callback; } };
+  runInNewContext(sdk, { window, console, setTimeout: callback => { timers.set(++next, callback); return next; }, clearTimeout: id => timers.delete(id) });
+  const expired = window.dshx.screen.click('old-snapshot', 'old-node');
+  const rejection = assert.rejects(expired, /超时/);
+  for (const callback of timers.values()) callback();
+  await rejection;
+  const port = { postMessage: text => {
+    sent++; const request = JSON.parse(text);
+    port.onmessage({ data: JSON.stringify({ id: request.id, ok: true, result: { id: 'late-app' } }) });
+  } };
+  connect({ data: 'dshx-connect', ports: [port] });
+  assert.equal((await window.dshx.info()).id, 'late-app');
+  assert.equal(sent, 1, 'expired click must not be sent after connecting');
 });

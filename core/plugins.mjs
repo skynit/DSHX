@@ -10,9 +10,15 @@ export function packageManager(core) {
     command: process.execPath,
     args: [join(core, 'plugins.mjs')],
     env: {
+      PATH: `${join(core, 'bin')}:${process.env.PATH ?? '/system/bin'}`,
       LD_LIBRARY_PATH: join(core, 'lib'),
       NODE_EXTRA_CA_CERTS: join(core, 'etc/tls/cert.pem'),
-      SSL_CERT_FILE: join(core, 'etc/tls/cert.pem')
+      SSL_CERT_FILE: join(core, 'etc/tls/cert.pem'),
+      GIT_EXEC_PATH: join(core, 'libexec/git-core'),
+      GIT_TEMPLATE_DIR: join(core, 'share/git-core/templates'),
+      GIT_SSL_CAINFO: join(core, 'etc/tls/cert.pem'),
+      GIT_TERMINAL_PROMPT: '0',
+      GIT_PAGER: 'cat'
     }
   };
 }
@@ -81,8 +87,10 @@ export async function runPnpm(core, args) {
   }
   if (command === 'add' && args.slice(1).some(arg => !arg.startsWith('-') &&
       !/^(?:@[a-z0-9._-]+\/)?[a-z0-9._-]+(?:@[^\s/:]+)?$/i.test(arg) &&
+      !/^(?:github:|(?:git\+)?https:\/\/github\.com\/)[a-z0-9-]+\/[a-z0-9_.-]+\/?(?:#[^\s]+)?$/i.test(arg) &&
+      !/^https:\/\/github\.com\/[a-z0-9-]+\/[a-z0-9_.-]+\/archive\/[^/?#\s]+\.tar\.gz$/i.test(arg) &&
       !arg.startsWith('file:') && !isAbsolute(arg))) {
-    throw new Error('当前支持 npm 发布包和本地已构建的包；Git 仓库、远程压缩包和链接安装尚未适配');
+    throw new Error('当前支持 npm 发布包、GitHub 仓库和本地已构建的包；其他 Git 来源、远程压缩包和链接安装尚未适配');
   }
   // Keep the engine's private connection facts and Node injection flags out of pnpm.
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) =>

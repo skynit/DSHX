@@ -3,8 +3,9 @@ import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 import { policyHost } from './host.mjs';
 import { openMemory, memoryFailure, searchMemory, accessible, normalize, sameScope } from './memory-store.mjs';
-import { extract, selectEvents, memoryRequest } from './memory-extract.mjs';
+import { extract, selectEvents, memoryRequest, memoryInput, memorySources, memoryBoundary } from './memory-extract.mjs';
 import { readBudget } from './read-budget.mjs';
+import { runBackground } from './background.mjs';
 
 export const name = 'dshx-android-memory';
 export const inject = ['storageDomain', 'sessions', 'sessionPersistence', 'workingDirectory', 'tools', 'agents', 'llm'];
@@ -27,8 +28,7 @@ export function memoryError(error) {
 export const isMemoryTool = tool => tool === 'memory_search' || tool === 'memory_read';
 export const memoryToolAvailable = tool => isMemoryTool(tool) && Boolean(owner?.active());
 export const memoryView = workspace => owner?.view(workspace) ?? { enabled: false, revision: 0, entries: [] };
-const userMessage = message => message?.role === 'user' && message.source?.kind === 'user';
-const userEvent = event => event.type === 'user/message' && event.data.source?.kind === 'user';
+const inputEvent = event => event.type === 'user/message' && memoryInput(event.data);
 const messageText = message => message.content.filter(part => part.type === 'text').map(part => part.text).join('\n');
 const rootSession = session => !session.header.parentSession && session.header.origin !== 'subagent' && !(session.header.delegationDepth > 0);
 const routeFor = session => session.requestHeader?.()?.config;
@@ -37,7 +37,8 @@ const sourceRows = source => [...(source.kind === 'auto' ? [{ session: source.se
 const revision = data => { if (!Number.isSafeInteger(data?.revision) || data.revision < 0) throw memoryFailure('MEMORY_INPUT'); };
 
 export function memorySession(ctx, options = {}) {
-  let store, error, message, timer, closed = false, barrier = false, generation = 0, serviceRevision = 0, run, wake = false, background = Promise.resolve();
+  let store, error, message, timer, closed = false, barrier = false, readBarrier = false, readGeneration = 0,
+    generation = 0, serviceRevision = 0, run, wake = false, background = Promise.resolve();
   const now = options.now ?? Date.now;
   const schedule = { turns: 4, bytes: 4096, cooldown: 120000, ...options.schedule };
   const budget = readBudget(ctx, { capacity: options.capacity, failure: code => memoryFailure(code === 'LIMIT' ? 'MEMORY_TOOL_LIMIT' : `MEMORY_${code}`) });
@@ -50,8 +51,9 @@ export function memorySession(ctx, options = {}) {
       await recover();
     } catch (cause) { error = memoryError({ code: cause.code === 'MEMORY_LIMIT' ? cause.code : 'MEMORY_READ' }); }
   })();
-  const active = () => !closed && !barrier && !error && Boolean(store?.read().settings.enabled);
-  const automatic = () => active() && store.read().settings.autoSave;
+  const available = () => !closed && !barrier && !error && Boolean(store);
+  const active = () => available() && !readBarrier && store.read().settings.enabled;
+  const automatic = () => available() && store.read().settings.autoSave;
   const dueAt = (job, snapshot) => job.urgent === false
     ? Math.max(job.notBefore ?? 0, (snapshot.cursors[job.session]?.lastRun ?? 0) + schedule.cooldown) : job.notBefore ?? 0;
   const providers = () => new Set((ctx.llm.listProviders?.() ?? []).map(provider => provider.id));
@@ -65,7 +67,7 @@ export function memorySession(ctx, options = {}) {
       jobs: snapshot.jobs.map(job => ({ id: job.id, state: run?.job.id === job.id ? 'running' : job.state,
         attempts: job.attempts, modelReady: available.has(job.route.provider),
         message: available.has(job.route.provider) ? job.message ?? (job.ready === false ? '等待新增内容；可继续立即整理' : dueAt(job, snapshot) > now() ? '等待整理间隔；可继续立即整理' : '待继续') : memoryError({ code: 'MEMORY_MODEL' }) })),
-      ...barrier ? { message: '当前记忆操作已暂停，请重新保存设置或重启引擎。' } : message ? { message } : {} };
+      ...barrier || readBarrier ? { message: '当前记忆操作已暂停，请重新保存设置或重启引擎。' } : message ? { message } : {} };
   };
   function watch(promise) {
     pending.add(promise);
@@ -85,7 +87,7 @@ export function memorySession(ctx, options = {}) {
   async function register(session) {
     if (!automatic() || !rootSession(session) || !scopeFor(ctx, session)) return;
     await store.change(next => {
-      if (!next.settings.enabled || !next.settings.autoSave || barrier || closed) return false;
+      if (!next.settings.autoSave || barrier || closed) return false;
       const cursor = next.cursors[session.id];
       if (cursor?.epoch === next.epoch && cursor.workspace === scopeFor(ctx, session)) return false;
       next.cursors[session.id] = { epoch: next.epoch, start: session.seq, next: session.seq, workspace: scopeFor(ctx, session) };
@@ -97,9 +99,12 @@ export function memorySession(ctx, options = {}) {
     if (!cursor || cursor.epoch !== snapshot.epoch || end <= cursor.next) return;
     // A notification alone does not prove disk durability, and false means no writer participated.
     if (!resume && !await ctx.sessions.flush(session)) throw memoryFailure('MEMORY_SOURCE');
-    const events = await readEvents(session.id, cursor.next, end);
+    let events = await readEvents(session.id, cursor.next, end);
+    end = memoryBoundary(events, end);
+    if (end <= cursor.next) return;
+    events = events.filter(event => event.seq < end);
     const route = session.snapshotEvents?.().slice(0, end).findLast(event => event.type === 'request/header')?.data.header.config ?? routeFor(session);
-    if (!events.some(userEvent) || !route?.provider || !route?.model) return;
+    if (!events.some(inputEvent) || !route?.provider || !route?.model) return;
     await store.change(next => {
       const current = next.cursors[session.id];
       if (!automatic() || next.epoch !== snapshot.epoch || current?.epoch !== next.epoch) return false;
@@ -112,7 +117,7 @@ export function memorySession(ctx, options = {}) {
       const merge = last && last.id !== run?.job.id && last.state === 'waiting' && last.to <= end &&
         last.workspace === current.workspace && last.route.provider === route.provider && last.route.model === route.model;
       const from = merge ? last.from : Math.max(current.next, ...jobs.map(job => job.to));
-      if (from >= end || !events.some(event => event.seq >= from && userEvent(event))) return false;
+      if (from >= end || !events.some(event => event.seq >= from && inputEvent(event))) return false;
       const id = `${next.epoch}:${session.id}:${from}:${end}`;
       const duplicate = next.jobs.find(job => job.id === id);
       if (duplicate) {
@@ -123,7 +128,8 @@ export function memorySession(ctx, options = {}) {
       const own = events.filter(event => event.seq >= from);
       const selected = selectEvents(own, { scope: { kind: 'workspace', workspace: current.workspace } });
       const users = selected.messages.filter(row => row.role === 'user');
-      const urgent = force || selected.next !== undefined || users.some(row => memoryRequest(row.text));
+      const urgent = force || own.some(event => inputEvent(event) && event.data.source.kind === 'plugin:dshx-hosting') ||
+        selected.next !== undefined || users.some(row => memoryRequest(row.text));
       const userIds = new Set(users.map(row => row.id));
       let turns = 0, hasUser = false;
       for (const event of own) {
@@ -142,7 +148,7 @@ export function memorySession(ctx, options = {}) {
     if (wake && !resume) drain();
   }
   async function recover() {
-    if (!store.read().settings.enabled || !store.read().settings.autoSave) return;
+    if (!store.read().settings.autoSave) return;
     // Only ids already registered in this epoch are read; no whole-library scan or model send.
     for (const [id, cursor] of Object.entries(store.read().cursors)) {
       if (cursor.epoch !== store.read().epoch) continue;
@@ -201,14 +207,14 @@ export function memorySession(ctx, options = {}) {
         });
         const events = await readEvents(job.session, job.from, job.to, controller.signal);
         const snapshot = store.read();
-        const candidates = await (options.extract ?? extract)(ctx, { session: job.session, events, ...job.route,
-          signal: controller.signal, entries: snapshot.entries.filter(row => accessible(row, job.workspace)), scope: { kind: 'workspace', workspace: job.workspace },
-          onSelected: value => { selection = value; }, onSkipped: rows => { skipped = rows.slice(0, 32); } });
+        const candidates = await runBackground(ctx, controller.signal, signal => (options.extract ?? extract)(ctx, { session: job.session, events, ...job.route,
+          signal, entries: snapshot.entries.filter(row => accessible(row, job.workspace)), scope: { kind: 'workspace', workspace: job.workspace },
+          onSelected: value => { selection = value; }, onSkipped: rows => { skipped = rows.slice(0, 32); } }));
         controller.signal.throwIfAborted();
         const end = selection?.next ?? job.to;
         if (!Number.isSafeInteger(end) || end <= job.from || end > job.to) throw memoryFailure('MEMORY_CAPACITY');
         await store.change(next => {
-          if (closed || barrier || controller.signal.aborted || !next.settings.enabled || !next.settings.autoSave || next.epoch !== job.epoch) return false;
+          if (closed || barrier || controller.signal.aborted || !next.settings.autoSave || next.epoch !== job.epoch) return false;
           const current = next.jobs.find(row => row.id === job.id);
           if (!current) return false;
           for (const candidate of candidates) merge(next, candidate, job, events, snapshot);
@@ -229,7 +235,13 @@ export function memorySession(ctx, options = {}) {
           if (closed || next.epoch !== job.epoch) return false;
           const current = next.jobs.find(row => row.id === job.id);
           if (!current) return false;
-          current.state = 'failed'; current.message = memoryError(cause.reason === 'MEMORY_EXTRACT_BUDGET' ? { code: 'MEMORY_CAPACITY' } : cause); current.skipped = skipped;
+          if (cause.code === 'BACKGROUND_PREEMPTED') {
+            current.state = 'waiting'; current.ready = false; current.attempts = Math.max(0, current.attempts - 1);
+            current.message = '已让位前台请求，可继续整理。';
+          } else {
+            current.state = 'failed'; current.message = memoryError(cause.reason === 'MEMORY_EXTRACT_BUDGET' ? { code: 'MEMORY_CAPACITY' } : cause);
+          }
+          current.skipped = skipped;
         }).catch(() => {});
       } finally { run = undefined; }
       if (wake && automatic()) queueMicrotask(() => drain());
@@ -242,7 +254,7 @@ export function memorySession(ctx, options = {}) {
     const decision = await next();
     if (decision.kind !== 'enter') return decision;
     signal?.throwIfAborted();
-    const latest = decision.messages.findLast(userMessage);
+    const latest = decision.messages.findLast(memoryInput);
     if (!latest) return decision;
     if (automatic() && rootSession(agent.session)) { await register(agent.session); wake = true; drain(); }
     if (!active()) return decision;
@@ -355,11 +367,20 @@ export function memorySession(ctx, options = {}) {
       if (['save', 'remove', 'clear', 'settings'].includes(action)) revision(data);
       if (action === 'settings') {
         if (typeof data.enabled !== 'boolean' || typeof data.autoSave !== 'boolean') throw memoryFailure('MEMORY_INPUT');
+        serviceRevision++;
+        const readStamp = ++readGeneration;
+        readBarrier = true;
+        if (!barrier && store.read().settings.autoSave === data.autoSave) {
+          await store.change(next => { next.settings.enabled = data.enabled; }, data.revision, signal);
+          if (readStamp === readGeneration) readBarrier = false;
+          return status();
+        }
         // Raise the runtime barrier synchronously, before waiting for any write queue slot.
         const stamp = cancel();
         try {
           await store.change(next => { next.settings = { enabled: data.enabled, autoSave: data.autoSave }; next.epoch++; next.cursors = {}; next.jobs = []; }, data.revision, signal);
           if (stamp === generation) barrier = false;
+          if (readStamp === readGeneration) readBarrier = false;
         } catch (cause) { throw cause; }
       } else if (action === 'save') {
         const snapshot = await store.save(data, signal);
@@ -425,19 +446,25 @@ export function memorySession(ctx, options = {}) {
 function merge(next, candidate, job, events, base) {
   const scope = candidate.scope === 'user' ? { kind: 'user' } : { kind: 'workspace', workspace: job.workspace };
   const key = normalize(candidate.key);
-  const sources = events.filter(userEvent).map(row => row.seq);
-  if (!candidate.events?.length || candidate.events.some(seq => !sources.includes(seq))) throw memoryFailure('MEMORY_EXTRACT');
+  const sources = memorySources(events);
+  if (!candidate.events?.length || candidate.events.some(seq => !sources.has(seq))) throw memoryFailure('MEMORY_EXTRACT');
+  const specimen = candidate.events.some(seq => sources.get(seq).origin === 'specimen');
+  if (specimen && (candidate.origin !== 'specimen' || candidate.type !== 'experience' || candidate.scope !== 'workspace' ||
+      candidate.events.some(seq => sources.get(seq).origin !== 'specimen'))) throw memoryFailure('MEMORY_EXTRACT');
   if (next.blocked.some(row => sameScope(row.scope, scope) && (
     row.sources.some(source => source.session === job.session && source.events.some(seq => candidate.events.includes(seq))) ||
     row.key === key && !candidate.explicit && row.epoch === job.epoch))) return;
   const old = next.entries.find(row => row.state === 'active' && sameScope(row.scope, scope) && row.key === key) ??
     next.entries.find(row => row.id === candidate.corrects && row.state === 'active' && sameScope(row.scope, scope));
   const now = Math.max(Date.now(), (old?.updatedAt ?? 0) + 1);
+  // 提取等待期间被删除的相同正文不能换主题重新写回，包括已省略冗余出处的重复轮次。
+  const previousDuplicate = base.entries.find(row => sameScope(row.scope, scope) && normalize(row.content) === normalize(candidate.content));
+  if (previousDuplicate && !next.entries.some(row => row.id === previousDuplicate.id)) return;
   const duplicate = next.entries.find(row => sameScope(row.scope, scope) && normalize(row.content) === normalize(candidate.content));
   if (duplicate) {
     const refs = sourceRows(duplicate.source);
     if (!refs.some(ref => ref.session === job.session && candidate.events.every(seq => ref.events.includes(seq)))) {
-      if (refs.length >= 32) throw memoryFailure('MEMORY_LIMIT');
+      if (refs.length >= 32) return;
       duplicate.source = { ...duplicate.source, refs: [...(duplicate.source.refs ?? []), { session: job.session, events: candidate.events }] };
     }
     return;
@@ -447,9 +474,9 @@ function merge(next, candidate, job, events, base) {
   const changed = old && (!previous || previous.updatedAt !== old.updatedAt || previous.content !== old.content);
   const state = candidate.state === 'pending' || candidate.explicit || old && (old.locked || changed || candidate.corrects !== old.id) ? 'pending' : 'active';
   if (next.entries.some(row => sameScope(row.scope, scope) && row.key === key && normalize(row.content) === normalize(candidate.content))) return;
-  if (old && state === 'active' && sourceRows(old.source).length >= 32) throw memoryFailure('MEMORY_LIMIT');
   const entry = { id: old && state === 'active' ? old.id : randomUUID(), type: candidate.type, scope, key,
-    summary: candidate.summary, content: candidate.content, source: { kind: 'auto', session: job.session, events: candidate.events, ...(old && state === 'active' ? { refs: sourceRows(old.source) } : {}) }, state, locked: false,
+    summary: candidate.summary, content: candidate.content, source: { kind: 'auto', session: job.session, events: candidate.events,
+      ...(specimen ? { origin: 'specimen' } : {}), ...(old && state === 'active' ? { refs: sourceRows(old.source).slice(0, 31) } : {}) }, state, locked: false,
     createdAt: old && state === 'active' ? old.createdAt : now, updatedAt: now, expiresAt: null };
   next.entries = next.entries.filter(row => row.id !== entry.id); next.entries.push(entry);
 }

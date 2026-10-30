@@ -34,6 +34,20 @@
       name: 'file:@CORE@/files.mjs'
     - id: dshx-android-guard
       name: 'file:@CORE@/guard.mjs'
+    - id: dshx-terminal-registry
+      name: '@deepseek-ai/dsh-terminal'
+    - id: dshx-terminal-bash
+      name: '@deepseek-ai/dsh-terminal-bash'
+    - id: dshx-persistent-bash
+      name: '@deepseek-ai/dsh-tool-bash-persistent'
+    - id: dshx-isolated-bash
+      name: '@deepseek-ai/dsh-tool-bash'
+      config:
+        enableRunInBackground: false
+    - id: dshx-terminal-tools
+      name: '@deepseek-ai/dsh-tool-terminal'
+      config:
+        enableRunInBackground: false
     - id: dshx-android-phone
       name: 'file:@CORE@/phone.mjs'
     - id: dshx-android-voice
@@ -42,3 +56,7 @@
       name: 'file:@CORE@/memory.mjs'
     - id: dshx-android-knowledge
       name: 'file:@CORE@/knowledge.mjs'
+    - id: dshx-android-hosting
+      name: 'file:@CORE@/hosting.mjs'
+    - id: dshx-android-apps
+      name: 'file:@CORE@/apps.mjs'

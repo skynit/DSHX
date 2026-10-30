@@ -33,8 +33,9 @@ class PhoneService : AccessibilityService() {
     private data class Screen(val name: String, val window: Int, val orientation: Int, val width: Int, val height: Int, val windows: List<Window>)
     private data class Target(val node: AccessibilityNodeInfo, val bounds: Rect, val signature: List<Any?>,
         val children: MutableList<Target> = mutableListOf())
+    private data class ReadNode(val node: AccessibilityNodeInfo, val bounds: Rect, val signature: List<Any?>, val parent: ReadNode?)
     private data class Frame(val id: String, val session: String, val valid: () -> Boolean, val expires: Long,
-        val screen: Screen, val root: AccessibilityNodeInfo, val targets: Map<String, Target>, val revision: Long)
+        val screen: Screen, val root: AccessibilityNodeInfo, val targets: Map<String, Target>, val revision: Long, val reads: List<ReadNode>)
 
     private val main = Handler(Looper.getMainLooper())
     private var frame: Frame? = null
@@ -44,47 +45,68 @@ class PhoneService : AccessibilityService() {
     private var revision = 0L
     private var screenshotBusy = false
     private var expiry: Runnable? = null
+    private val events get() = application as? PhoneEvents
 
     override fun onServiceConnected() {
-        current?.takeIf { it !== this }?.clear()
+        current?.takeIf { it !== this }?.offline()
         clear()
         current = this
+        events?.phoneConnected()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
         // 小窗中的进度文字不会改变目标页面；小窗移动、缩放等窗口结构变化仍使观察失效。
-        if (event.eventType != AccessibilityEvent.TYPE_WINDOWS_CHANGED && PhoneWindow.current?.owns(event.windowId) == true) return
+        if (event.eventType != AccessibilityEvent.TYPE_WINDOWS_CHANGED && events?.ownsPhoneWindow(event.windowId) == true) return
         // 即使应用跳走又返回原窗口，旧凭证也不能复用；同窗口内容改变同样作废。
         revision++
         clear()
+        events?.phoneChanged()
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         revision++
         clear()
+        events?.phoneStopped()
     }
 
-    override fun onInterrupt() { revision++; clear() }
+    override fun onInterrupt() { revision++; clear(); events?.phoneStopped() }
     override fun onUnbind(intent: Intent?): Boolean { offline(); return super.onUnbind(intent) }
     override fun onDestroy() { offline(); super.onDestroy() }
 
     private fun offline() {
+        events?.phoneStopped()
         clear()
-        if (current === this) { current = null; PhoneWindow.current?.close() }
+        if (current === this) { current = null; events?.closePhoneWindow() }
     }
 
-    internal fun clear() {
+    internal fun clear(owner: String? = null) {
         check(Looper.myLooper() == Looper.getMainLooper())
+        if (owner != null && frame?.session != owner && image?.session != owner) return
         expiry?.let(main::removeCallbacks)
         expiry = null
         image = null
         val old = frame
         frame = null
         old?.targets?.values?.forEach { it.node.recycle() }
+        old?.reads?.forEach { it.node.recycle() }
         old?.root?.recycle()
     }
+
+    internal fun available(owner: String): Boolean {
+        check(Looper.myLooper() == Looper.getMainLooper())
+        val now = SystemClock.elapsedRealtime()
+        return !screenshotBusy && frame?.let { it.session != owner && now < it.expires && runCatching(it.valid).getOrDefault(false) } != true &&
+            image?.let { it.session != owner && now < it.expires && runCatching(it.valid).getOrDefault(false) } != true
+    }
+
+    internal fun foreground(): String? {
+        val root = rootInActiveWindow ?: return null
+        return try { screen(root).name } catch (_: Exception) { null } finally { root.recycle() }
+    }
+
+    internal fun stopApps() { events?.phoneStopped() }
 
     private fun requireState(value: Boolean, code: String = "stale_snapshot", message: String = "观测已失效，请重新观察界面") {
         if (!value) throw PhoneFailure(code, message)
@@ -100,7 +122,7 @@ class PhoneService : AccessibilityService() {
             val visible = windows.filter { Build.VERSION.SDK_INT < 30 || it.displayId == Display.DEFAULT_DISPLAY }
             val target = visible.singleOrNull { it.id == root.windowId }
                 ?: throw PhoneFailure("no_window", "活动窗口不在主屏幕")
-            requireState(PhoneWindow.current?.owns(target.id) != true, "protected_window", "操作小窗由你控制，请收起小窗后重新观察目标应用")
+            requireState(events?.ownsPhoneWindow(target.id) != true, "protected_window", "操作小窗由你控制，请收起小窗后重新观察目标应用")
             requireState(target.type == AccessibilityWindowInfo.TYPE_APPLICATION && (target.isActive || target.isFocused) &&
                 !target.isInPictureInPictureMode, "no_window", "当前活动窗口不是可操作的前台应用")
             val bounds = Rect().also(target::getBoundsInScreen)
@@ -137,7 +159,7 @@ class PhoneService : AccessibilityService() {
     private fun signature(node: AccessibilityNodeInfo): List<Any?> = listOf(node.text?.toString(), node.contentDescription?.toString(), stateDescription(node),
         node.className?.toString(), node.viewIdResourceName, node.isEditable, node.isFocused, node.isAccessibilityFocused,
         node.textSelectionStart, node.textSelectionEnd,
-        node.isEnabled, node.isClickable, node.isScrollable, node.isCheckable, node.isChecked, node.isSelected, node.childCount,
+        node.isEnabled, node.isClickable, node.isVisibleToUser, node.isPassword, node.isScrollable, node.isCheckable, node.isChecked, node.isSelected, node.childCount,
         node.actionList.map { it.id }.sorted())
 
     private fun visible(node: AccessibilityNodeInfo, screen: Screen, bounds: Rect): Boolean {
@@ -170,11 +192,14 @@ class PhoneService : AccessibilityService() {
         return screen.windows.none { it.id != target.id && it.layer >= target.layer && Rect.intersects(it.bounds, bounds) }
     }
 
-    internal fun observe(session: String, valid: () -> Boolean, check: () -> Unit): JSONObject {
+    internal fun observe(session: String, valid: () -> Boolean, check: () -> Unit): JSONObject = observe(session, valid, check, false)
+
+    internal fun observe(session: String, valid: () -> Boolean, check: () -> Unit, verifyTree: Boolean): JSONObject {
         check()
         clear()
         val root = rootInActiveWindow ?: throw PhoneFailure("no_window", "没有可读取的前台界面")
         val targets = linkedMapOf<String, Target>()
+        val reads = mutableListOf<ReadNode>()
         var retained = false
         try {
             val screen = screen(root)
@@ -185,7 +210,7 @@ class PhoneService : AccessibilityService() {
             var visited = 0
             var truncated = false
             var bytes = 1024 // 为观测元数据预留空间；按最终 JSON 的 UTF-8 字节数累计。
-            fun visit(node: AccessibilityNodeInfo, depth: Int, clickParent: String) {
+            fun visit(node: AccessibilityNodeInfo, depth: Int, clickParent: String, parent: ReadNode? = null, parentId: String = "", childIndex: Int = 0) {
                 // 完整状态检查包含系统查询，每16节点执行一次；入口与返回前仍强制检查。
                 if (++visited % 16 == 0) check()
                 if (visited > 2048 || depth > 32 || targets.size >= 200 || SystemClock.elapsedRealtime() >= deadline) {
@@ -193,27 +218,33 @@ class PhoneService : AccessibilityService() {
                     return
                 }
                 if (protected(node) || node.windowId != screen.window ||
-                    !node.packageName.isNullOrEmpty() && node.packageName.toString() != screen.name) return
+                    !node.packageName.isNullOrEmpty() && node.packageName.toString() != screen.name) { if (verifyTree) truncated = true; return }
                 val bounds = Rect().also(node::getBoundsInScreen)
+                val read = if (verifyTree) ReadNode(AccessibilityNodeInfo.obtain(node), bounds, signature(node), parent).also(reads::add) else null
                 val actions = actions(node).filter { actionable(node, screen, bounds, it) }
                 var clickTarget = clickParent
                 val text = node.text?.toString().orEmpty()
                 val description = node.contentDescription?.toString().orEmpty()
                 val state = stateDescription(node)
-                if (visible(node, screen, bounds) && (actions.isNotEmpty() || text.isNotEmpty() || description.isNotEmpty() || state.isNotEmpty() || node.isCheckable || node.isSelected)) {
+                var childParentId = parentId
+                if (verifyTree || visible(node, screen, bounds) && (actions.isNotEmpty() || text.isNotEmpty() || description.isNotEmpty() || state.isNotEmpty() || node.isCheckable || node.isSelected)) {
                     val id = "n${targets.size + 1}"
                     if ("click" in actions) clickTarget = id
                     val entry = JSONObject().put("id", id).put("text", text.take(256)).put("description", description.take(256))
+                        .put("viewId", node.viewIdResourceName.orEmpty().take(256))
                         .put("type", node.className?.toString().orEmpty().take(128)).put("bounds", boundsJson(bounds))
                         .put("editable", node.isEditable).put("focused", node.isFocused).put("enabled", node.isEnabled)
                         .put("checkable", node.isCheckable).put("checked", node.isChecked).put("selected", node.isSelected)
                         .put("stateDescription", state.take(256))
                         .put("selectionStart", node.textSelectionStart).put("selectionEnd", node.textSelectionEnd)
                         .put("clickTarget", clickTarget).put("actions", JSONArray(actions))
-                        .put("textTruncated", text.length > 256 || description.length > 256 || state.length > 256)
+                        .put("textTruncated", text.length > 256 || description.length > 256 || state.length > 256 || node.viewIdResourceName.orEmpty().length > 256)
                     val size = entry.toString().toByteArray(Charsets.UTF_8).size + 1
                     if (bytes + size > 256 * 1024) { truncated = true; return }
                     bytes += size
+                    if (verifyTree) entry.put("parent", parentId).put("index", childIndex).put("depth", depth)
+                        .put("childCount", node.childCount).put("clickable", node.isClickable).put("visible", visible(node, screen, bounds))
+                    childParentId = id
                     nodes.put(entry)
                     val target = Target(AccessibilityNodeInfo.obtain(node), bounds, signature(node))
                     targets[id] = target
@@ -221,8 +252,9 @@ class PhoneService : AccessibilityService() {
                 }
                 for (index in 0 until node.childCount) {
                     if (visited >= 2048 || targets.size >= 200 || SystemClock.elapsedRealtime() >= deadline) { truncated = true; break }
-                    val child = node.getChild(index) ?: continue
-                    try { visit(child, depth + 1, clickTarget) } finally { child.recycle() }
+                    val child = node.getChild(index)
+                    if (child == null) { truncated = true; continue }
+                    try { visit(child, depth + 1, clickTarget, read, childParentId, index) } finally { child.recycle() }
                 }
             }
             visit(root, 0, "")
@@ -231,16 +263,16 @@ class PhoneService : AccessibilityService() {
             try { requireState(currentRoot == root && screen(currentRoot) == screen && this.revision == revision) }
             finally { currentRoot.recycle() }
             val id = UUID.randomUUID().toString()
-            val result = PhoneControl.success().put("snapshot", id).put("package", screen.name).put("window", screen.window)
-                .put("expiresInMs", PhoneControl.SNAPSHOT_LIFETIME).put("nodes", nodes).put("truncated", truncated)
+            val result = PhoneReply.success().put("snapshot", id).put("package", screen.name).put("window", screen.window)
+                .put("expiresInMs", PhoneReply.SNAPSHOT_LIFETIME).put("nodes", nodes).put("truncated", truncated)
             requireState(result.toString().toByteArray(Charsets.UTF_8).size <= 256 * 1024,
                 "result_too_large", "观测结果超过大小限制")
-            frame = Frame(id, session, valid, SystemClock.elapsedRealtime() + PhoneControl.SNAPSHOT_LIFETIME, screen, root, targets, revision)
+            frame = Frame(id, session, valid, SystemClock.elapsedRealtime() + PhoneReply.SNAPSHOT_LIFETIME, screen, root, targets, revision, reads)
             retained = true
-            expiry = Runnable { clear() }.also { main.postDelayed(it, PhoneControl.SNAPSHOT_LIFETIME) }
+            expiry = Runnable { clear() }.also { main.postDelayed(it, PhoneReply.SNAPSHOT_LIFETIME) }
             return result
         } finally {
-            if (!retained) { targets.values.forEach { it.node.recycle() }; root.recycle() }
+            if (!retained) { targets.values.forEach { it.node.recycle() }; reads.forEach { it.node.recycle() }; root.recycle() }
         }
     }
 
@@ -306,10 +338,29 @@ class PhoneService : AccessibilityService() {
             requireState(node.refresh())
             val currentBounds = Rect().also(node::getBoundsInScreen)
             requireState(currentBounds == target.bounds && signature(node) == target.signature && actionable(node, saved.screen, currentBounds, requestedAction))
+            // 原生规则的证据可能在目标外部；刷新整份已遍历树，包含无文字父节点和候选的父链。
+            val deadline = SystemClock.elapsedRealtime() + 1000
+            for (read in saved.reads) {
+                check()
+                requireState(SystemClock.elapsedRealtime() < deadline && read.node.refresh(), "stale_snapshot", "规则证据无法及时复核")
+                val latest = Rect().also(read.node::getBoundsInScreen)
+                requireState(!protected(read.node) && latest == read.bounds && signature(read.node) == read.signature)
+                read.parent?.let { expected ->
+                    val parent = read.node.parent
+                    try { requireState(parent != null && parent == expected.node) } finally { parent?.recycle() }
+                }
+            }
+            check()
+            val dispatchRoot = rootInActiveWindow ?: throw PhoneFailure("window_changed", "派发前窗口已改变")
+            try { requireState(dispatchRoot == saved.root && screen(dispatchRoot) == saved.screen) }
+            finally { dispatchRoot.recycle() }
+            requireState(saved.revision == revision && SystemClock.elapsedRealtime() < saved.expires && node.refresh())
+            val dispatchBounds = Rect().also(node::getBoundsInScreen)
+            requireState(dispatchBounds == target.bounds && signature(node) == target.signature && actionable(node, saved.screen, dispatchBounds, requestedAction))
             // 不用坐标兜底、不尝试祖先点击、不粘贴剪贴板；返回系统原始接受结果。
             dispatch()
             val accepted = node.performAction(action, extras)
-            return PhoneControl.actionResult(accepted)
+            return PhoneReply.actionResult(accepted)
         } finally { clear() }
     }
 
@@ -333,7 +384,7 @@ class PhoneService : AccessibilityService() {
                             val hardware = Bitmap.wrapHardwareBuffer(result.hardwareBuffer, result.colorSpace)
                                 ?: throw PhoneFailure("screenshot_failed", "无法读取截图缓冲区")
                             try { encode(hardware, check) } finally { hardware.recycle() }
-                        } catch (error: Exception) { PhoneControl.errorResult(error) }
+                        } catch (error: Exception) { PhoneReply.errorResult(error) }
                         finally { result.hardwareBuffer.close() }
                         main.post {
                             screenshotBusy = false
@@ -345,22 +396,22 @@ class PhoneService : AccessibilityService() {
                                 check()
                                 if (value.optBoolean("ok")) {
                                     val saved = Image(UUID.randomUUID().toString(), session, valid,
-                                        SystemClock.elapsedRealtime() + PhoneControl.SNAPSHOT_LIFETIME, screen, revision,
+                                        SystemClock.elapsedRealtime() + PhoneReply.SNAPSHOT_LIFETIME, screen, revision,
                                         value.getInt("width"), value.getInt("height"))
                                     image = saved
-                                    expiry = Runnable { clear() }.also { main.postDelayed(it, PhoneControl.SNAPSHOT_LIFETIME) }
-                                    value.put("screenshot", saved.id).put("expiresInMs", PhoneControl.SNAPSHOT_LIFETIME)
+                                    expiry = Runnable { clear() }.also { main.postDelayed(it, PhoneReply.SNAPSHOT_LIFETIME) }
+                                    value.put("screenshot", saved.id).put("expiresInMs", PhoneReply.SNAPSHOT_LIFETIME)
                                 }
                                 complete(value.put("package", screen.name))
-                            } catch (error: Exception) { complete(PhoneControl.errorResult(error)) }
+                            } catch (error: Exception) { complete(PhoneReply.errorResult(error)) }
                         }
                     }
                 }
                 override fun onFailure(errorCode: Int) {
                     screenshotBusy = false
                     val code = if (errorCode == ERROR_TAKE_SCREENSHOT_INTERVAL_TIME_SHORT) "screenshot_throttled" else "screenshot_failed"
-                    try { check(); complete(PhoneControl.failure(code, "系统拒绝截图，可能涉及安全窗口、请求频率或服务权限")) }
-                    catch (error: Exception) { complete(PhoneControl.errorResult(error)) }
+                    try { check(); complete(PhoneReply.failure(code, "系统拒绝截图，可能涉及安全窗口、请求频率或服务权限")) }
+                    catch (error: Exception) { complete(PhoneReply.errorResult(error)) }
                 }
             })
         } catch (error: Exception) { screenshotBusy = false; throw error }
@@ -412,12 +463,12 @@ class PhoneService : AccessibilityService() {
             clear()
             dispatch()
             val accepted = dispatchGesture(gesture, object : GestureResultCallback() {
-                override fun onCompleted(gestureDescription: GestureDescription?) { complete(PhoneControl.success().put("accepted", true)) }
+                override fun onCompleted(gestureDescription: GestureDescription?) { complete(PhoneReply.success().put("accepted", true)) }
                 override fun onCancelled(gestureDescription: GestureDescription?) {
-                    complete(PhoneControl.failure("gesture_cancelled", "系统中断手势，请重新观察界面").put("execution_state", "unknown"))
+                    complete(PhoneReply.failure("gesture_cancelled", "系统中断手势，请重新观察界面").put("execution_state", "unknown"))
                 }
             }, main)
-            if (!accepted) complete(PhoneControl.actionResult(false))
+            if (!accepted) complete(PhoneReply.actionResult(false))
         } catch (error: Exception) { clear(); throw error }
     }
 
@@ -435,7 +486,7 @@ class PhoneService : AccessibilityService() {
                     val output = ByteArrayOutputStream()
                     requireState(bitmap.compress(Bitmap.CompressFormat.JPEG, 80 - attempt * 10, output), "screenshot_failed", "截图编码失败")
                     check()
-                    if (output.size() <= 256 * 1024) return PhoneControl.success().put("mime", "image/jpeg")
+                    if (output.size() <= 256 * 1024) return PhoneReply.success().put("mime", "image/jpeg")
                         .put("data", Base64.encodeToString(output.toByteArray(), Base64.NO_WRAP))
                         .put("width", bitmap.width).put("height", bitmap.height)
                 } finally { if (bitmap !== copy) bitmap.recycle() }

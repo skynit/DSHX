@@ -3,12 +3,14 @@ import { lstat, realpath } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { policyHost } from './host.mjs';
 import { phoneToolNames } from './phone.mjs';
+import { appToolNames } from './apps.mjs';
 import { isMemoryTool, memoryToolAvailable } from './memory.mjs';
 import { isKnowledgeTool, knowledgeToolAvailable } from './knowledge.mjs';
 
 // The workspace is the default directory, not a sandbox for Full sessions.
 const workspace = process.env.DSHX_WORKSPACE;
 const fileTools = new Set(['read', 'write', 'edit', 'glob', 'grep']);
+const commandTools = new Set(['bash', 'bash_isolated', 'terminal_open', 'terminal_send', 'terminal_read', 'terminal_signal', 'terminal_close', 'terminal_list']);
 const access = new AsyncLocalStorage();
 
 export function inFileTool() { return access.getStore() !== undefined; }
@@ -16,15 +18,15 @@ export function fileMode() { return access.getStore()?.androidMode; }
 
 export async function runTool(exec, callback) {
   let scope = access.getStore();
-  if (fileTools.has(exec.name) || exec.name === 'bash') {
+  if (fileTools.has(exec.name) || commandTools.has(exec.name)) {
     const mode = await policyHost.mode(exec.agent?.session?.id);
-    if (mode === 'unavailable' || exec.name === 'bash' && mode !== 'full' || mode === 'read-only' && ['write', 'edit'].includes(exec.name)) {
+    if (mode === 'unavailable' || commandTools.has(exec.name) && mode !== 'full' || mode === 'read-only' && ['write', 'edit'].includes(exec.name)) {
       throw Object.assign(new Error('原生会话权限不允许当前文件操作。'), { code: 'FS_SANDBOX_DENIED' });
     }
     if (exec.signal?.aborted) throw exec.signal.reason ?? new Error('当前调用已取消。');
     scope = { ...exec, androidMode: mode === 'read-only' || scope?.androidMode === 'read-only' ? 'read-only' : mode };
     if (scope.androidMode === 'read-only' && ['write', 'edit'].includes(exec.name)) throw denied();
-    if (exec.name === 'bash' && scope.androidMode !== 'full') throw denied();
+    if (commandTools.has(exec.name) && scope.androidMode !== 'full') throw denied();
   }
   return access.run(scope, callback);
 }
@@ -61,7 +63,7 @@ export async function modelPath(path, cwd = workspace, signal) {
 
 export function toolAvailable(name, agent) {
   const mode = policyHost.cachedMode(agent?.session?.id);
-  return Boolean(workspace) && (fileTools.has(name) || memoryToolAvailable(name) || knowledgeToolAvailable(name, agent) || (name === 'bash' || phoneToolNames.has(name)) && mode === 'full') && mode !== 'unavailable' &&
+  return Boolean(workspace) && (fileTools.has(name) || memoryToolAvailable(name) || knowledgeToolAvailable(name, agent) || (commandTools.has(name) || phoneToolNames.has(name) || appToolNames.has(name)) && mode === 'full') && mode !== 'unavailable' &&
     !(mode === 'read-only' && ['write', 'edit'].includes(name));
 }
 
@@ -69,10 +71,10 @@ export function toolReason(exec) {
   if (!workspace) return 'Android 工作区尚未配置，工具不可用。';
   if (isMemoryTool(exec.name) && !memoryToolAvailable(exec.name)) return '记忆功能尚未启用或尚未生效。';
   if (isKnowledgeTool(exec.name) && !knowledgeToolAvailable(exec.name, exec.agent)) return '知识来源未启用、尚未就绪或无法确认当前用户请求。';
-  if (!fileTools.has(exec.name) && exec.name !== 'bash' && !phoneToolNames.has(exec.name) && !isMemoryTool(exec.name) && !isKnowledgeTool(exec.name)) return '此 Android 开发版尚未适配该模型工具。';
+  if (!fileTools.has(exec.name) && !commandTools.has(exec.name) && !phoneToolNames.has(exec.name) && !appToolNames.has(exec.name) && !isMemoryTool(exec.name) && !isKnowledgeTool(exec.name)) return '此 Android 开发版尚未适配该模型工具。';
   if (!toolAvailable(exec.name, exec.agent)) return '当前会话尚未连接，工具暂不可用。';
   if (exec.arguments?.sandbox_permissions !== undefined) return 'Android 当前默认完全权限，不支持单次沙箱提权参数。';
-  if (exec.name === 'bash' && exec.arguments?.run_in_background === true) return 'Android 当前仅开放前台命令。';
+  if (commandTools.has(exec.name) && exec.arguments?.run_in_background === true) return 'Android 当前仅开放前台命令。';
 }
 
 function denied() {

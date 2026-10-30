@@ -228,7 +228,8 @@ class CoreStore(private val root: File) {
 
     companion object {
         private val startupFiles = listOf(
-            "bin/node", "start.mjs", "plugins.mjs", "assistant.mjs",
+            "bin/node", "bin/git", "libexec/git-core/git-remote-http", "libexec/git-core/git-remote-https",
+            "share/git-core/templates/info/exclude", "start.mjs", "plugins.mjs", "assistant.mjs", "hosting.mjs", "specimen.mjs", "specimen-store.mjs", "background.mjs", "apps.mjs",
             "memory.mjs", "memory-store.mjs", "memory-extract.mjs", "read-budget.mjs", "knowledge.mjs", "knowledge-store.mjs", "knowledge-search.mjs", "knowledge-model.mjs", "phone.mjs",
             "lib/node_modules/@deepseek-ai/dsh/lib/bin.js",
             "lib/node_modules/pnpm/bin/pnpm.cjs", "lib/node_modules/pnpm/dist/pnpm.cjs",

@@ -31,14 +31,14 @@ body {
 }
 
 body[data-ds-dark-theme] {
-    --dshx-background: #171917;
-    --dshx-surface: #202320;
-    --dshx-elevated: #252925;
-    --dshx-muted: #2a2e2a;
-    --dshx-border: #363b36;
-    --dshx-border-subtle: #2a2f2a;
-    --dshx-text: #ecefeb;
-    --dshx-text-muted: #a6aca5;
+    --dshx-background: #0e0e0e;
+    --dshx-surface: #181818;
+    --dshx-elevated: #202020;
+    --dshx-muted: #292929;
+    --dshx-border: #333333;
+    --dshx-border-subtle: #262626;
+    --dshx-text: #ececec;
+    --dshx-text-muted: #a6a6a6;
     --dshx-primary: #78a7ef;
     --dshx-on-primary: #172336;
     --dshx-success: #63b58b;

@@ -64,11 +64,41 @@ export function localUsage(event, directory = process.env.DSHX_ASSISTANT_DIR) {
   if (directory) append(directory, event, 'local-usage.jsonl');
 }
 
+export function hostingEvent(event, directory = process.env.DSHX_ASSISTANT_DIR) {
+  if (!directory) throw new Error('后台托管记录目录不可用。');
+  append(directory, event, 'hosting.jsonl');
+}
+
+export function hostingHistory(directory = process.env.DSHX_ASSISTANT_DIR) {
+  if (!directory) return [];
+  let file;
+  try {
+    file = openSync(join(directory, 'hosting.jsonl'), 'r');
+    const size = fstatSync(file).size;
+    const buffer = Buffer.alloc(Math.min(size, 65536));
+    readSync(file, buffer, 0, buffer.length, size - buffer.length);
+    const lines = buffer.toString('utf8').split('\n');
+    if (size > buffer.length) lines.shift();
+    return lines.flatMap(line => {
+      try {
+        const row = JSON.parse(line);
+        return row.version === 1 && ['check', 'start', 'finish'].includes(row.event) && Number.isSafeInteger(row.at) ? [row] : [];
+      } catch { return []; }
+    }).slice(-20);
+  } catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+  finally { if (file !== undefined) closeSync(file); }
+}
+
 // Built-in adapters opt in only when their model send path is instrumented.
 export const modelTransport = Symbol('android-model-transport');
 const calls = new AsyncLocalStorage();
 // Only the current conversation step is retained; accounting on disk is durable.
 const actionRequests = new Map();
+const requestObservers = new Map();
+export function observeRequests(session, observer) {
+  requestObservers.set(session, observer);
+  return () => { if (requestObservers.get(session) === observer) requestObservers.delete(session); };
+}
 const actionKey = (directory, sessionId) => JSON.stringify([directory, sessionId]);
 
 export function forgetActions(sessionId, directory = process.env.DSHX_ASSISTANT_DIR) {
@@ -178,7 +208,7 @@ export function trackActions(ctx, directory = process.env.DSHX_ASSISTANT_DIR) {
 }
 
 function write(state, event) {
-  if (state.directory) append(state.directory, event);
+  if (state.directory) append(state.directory, { ...event, ...(state.hostingId ? { hostingId: state.hostingId } : {}) });
 }
 
 function finish(state, outcome) {
@@ -189,6 +219,7 @@ function finish(state, outcome) {
   if (!state.transport && outcome === 'success' && request.reported) request.usageFinal = true;
   write(state, { event: 'finish', id: request.id, outcome, usageFinal: request.usageFinal === true, endedAt: Date.now() });
   request.finished = true;
+  state.observer?.({ event: 'finish', id: request.id, outcome });
   if (state.directory && state.options.purpose === 'conversation' && state.options.sessionId) {
     const plans = new Map();
     for (const { id: callId, name: tool } of plannedTools(request)) {
@@ -212,10 +243,14 @@ function start(state, dispatch) {
   const { options } = state;
   if (options.purpose === 'conversation') forgetActions(options.sessionId, state.directory);
   const id = randomUUID();
+  if (options.purpose === 'conversation') {
+    state.observer ??= requestObservers.get(options.sessionId);
+    state.hostingId = state.observer?.({ event: 'start', id, provider: options.provider, model: options.model });
+  }
   write(state, {
     event: 'start', id, provider: options.provider, model: options.model,
     ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
-    purpose: ['conversation', 'compaction', 'session-title', 'memory-extraction', 'knowledge-summary', 'knowledge-embedding', 'screenshot-recognition'].includes(options.purpose) ? options.purpose : 'other',
+    purpose: ['conversation', 'compaction', 'session-title', 'memory-extraction', 'specimen-extraction', 'knowledge-summary', 'knowledge-embedding', 'screenshot-recognition'].includes(options.purpose) ? options.purpose : 'other',
     dispatch, startedAt: Date.now(),
     // Tool results (including images) are billed when a subsequent request reads
     // them. Keep all input references, rather than charging an image to its capture.
@@ -242,6 +277,7 @@ function report(state, value, source, replace = false, anomaly, final = false) {
   request.usageSource = source;
   request.anomaly = anomaly;
   request.usageFinal = usageFinal;
+  state.observer?.({ event: 'usage', id: request.id, usage: next });
 }
 
 // Called only at the fixed built-in model fetch seams. No URL/body inspection,
@@ -356,7 +392,12 @@ export function piOptions(model) {
 // with another call or writing after its terminal record.
 export async function* usageStream(options, stream, directory = process.env.DSHX_ASSISTANT_DIR, transport = false) {
   // Native inference owns a separate measured local ledger; it is never a remote request attempt.
-  if (options.provider === 'dshx-local') { yield* stream(); return; }
+  if (options.provider === 'dshx-local') {
+    const observer = options.purpose === 'conversation' ? requestObservers.get(options.sessionId) : null, id = randomUUID();
+    observer?.({ event: 'start', id, provider: options.provider, model: options.model });
+    try { yield* stream(); } finally { observer?.({ event: 'finish', id, outcome: 'unknown' }); }
+    return;
+  }
   const state = { options, directory, transport, request: undefined, closed: false };
   let iterator;
   let outcome = 'incomplete';

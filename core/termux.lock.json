@@ -84,6 +84,41 @@
       "version": "15.2.0",
       "url": "https://packages.termux.dev/apt/termux-main/pool/main/r/ripgrep/ripgrep_15.2.0_aarch64.deb",
       "sha256": "38e28bc297000517b24702568a483eca7dc3323eb6bdccc9033f031776bdcc6c"
+    },
+    "git": {
+      "version": "2.56.0",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/g/git/git_2.56.0_aarch64.deb",
+      "sha256": "dcdd22c5fdf7bdb5b825a03a17441d43858ed8515fea57fbb37eb42e733ca82f"
+    },
+    "libexpat": {
+      "version": "2.9.0",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/libe/libexpat/libexpat_2.9.0_aarch64.deb",
+      "sha256": "f8a104e8227c9c181f6818658a3ee2fa4c107fac94219b068144fc6591086cdb"
+    },
+    "libcurl": {
+      "version": "8.23.0",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/libc/libcurl/libcurl_8.23.0_aarch64.deb",
+      "sha256": "2011bb9709261bb3d5ecaa6672faa333be14cf48ad4af37031e3e365309557ac"
+    },
+    "libssh2": {
+      "version": "1.11.1-2",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/libs/libssh2/libssh2_1.11.1-2_aarch64.deb",
+      "sha256": "1add4e0a926b848814e7e2f1817ea28b123c54cabd5bbc4e5cfd65291cbad84e"
+    },
+    "libngtcp2": {
+      "version": "1.25.0",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/libn/libngtcp2/libngtcp2_1.25.0_aarch64.deb",
+      "sha256": "f471bad7f4329b6b0b4aedf124e0a23a35f6ac99bfbae73304136f8bfd570fc3"
+    },
+    "libnghttp3": {
+      "version": "1.18.0",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/libn/libnghttp3/libnghttp3_1.18.0_aarch64.deb",
+      "sha256": "0be2ee96def3608afaf24eb0b4b55f3484a37c95ea21bb1d6d85c7d543467603"
+    },
+    "libnghttp2": {
+      "version": "1.70.0",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/libn/libnghttp2/libnghttp2_1.70.0_aarch64.deb",
+      "sha256": "ab2e0a3408fe4934ffdf774bd5049a265db2e6db62dcb651baecbecfb81e3f0b"
     }
   },
   "x86_64": {
@@ -171,6 +206,41 @@
       "version": "15.2.0",
       "url": "https://packages.termux.dev/apt/termux-main/pool/main/r/ripgrep/ripgrep_15.2.0_x86_64.deb",
       "sha256": "2eb50ab2e378436767975b072ce7118decf6444d6d6ed178bc89979b5f150f2a"
+    },
+    "git": {
+      "version": "2.56.0",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/g/git/git_2.56.0_x86_64.deb",
+      "sha256": "9af296495286bffe22f8abda910c29fd09e561ddc668c2d45c94785b91cbb129"
+    },
+    "libexpat": {
+      "version": "2.9.0",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/libe/libexpat/libexpat_2.9.0_x86_64.deb",
+      "sha256": "4af6fa2a319696055d9b317270f6f7b54170159340e776cec53ed1ba09770293"
+    },
+    "libcurl": {
+      "version": "8.23.0",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/libc/libcurl/libcurl_8.23.0_x86_64.deb",
+      "sha256": "fa71ce8eca3d0aa48a748fc60e4519351fc9c4d51b20cac5722190cb002cfd1c"
+    },
+    "libssh2": {
+      "version": "1.11.1-2",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/libs/libssh2/libssh2_1.11.1-2_x86_64.deb",
+      "sha256": "00db1c1497e8703281efded7f1f2a63824b145c980d9ec309ae0ab7ccb9ce1c5"
+    },
+    "libngtcp2": {
+      "version": "1.25.0",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/libn/libngtcp2/libngtcp2_1.25.0_x86_64.deb",
+      "sha256": "d8232b10e8ab9129f4a0c1a5c8fc4591f11c74d99e5fd4d24121abbea65af5b7"
+    },
+    "libnghttp3": {
+      "version": "1.18.0",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/libn/libnghttp3/libnghttp3_1.18.0_x86_64.deb",
+      "sha256": "bd9dc28e1e7593837dae5bb6747ca95de1cfb8da78d86009cbeb18fc6464fc0e"
+    },
+    "libnghttp2": {
+      "version": "1.70.0",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/libn/libnghttp2/libnghttp2_1.70.0_x86_64.deb",
+      "sha256": "7378c2e54518d0bd8cd349f6f89148a7feaef7e42196efcc0db237767319cdca"
     }
   }
 }

@@ -1,0 +1,28 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+    <application android:name="local.dshx.app.MicroApp" android:allowBackup="false"
+        android:label="微应用" android:icon="@drawable/icon" android:roundIcon="@drawable/icon"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar" android:supportsRtl="true"
+        android:usesCleartextTraffic="false">
+        <activity android:name="local.dshx.app.MicroActivity" android:exported="true" android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <service android:name="local.dshx.app.MicroService" android:exported="false" android:stopWithTask="false" />
+        <service android:name="local.dshx.app.PhoneService" android:exported="true"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE" android:label="微应用手机操作">
+            <intent-filter><action android:name="android.accessibilityservice.AccessibilityService" /></intent-filter>
+            <meta-data android:name="android.accessibilityservice" android:resource="@xml/phone_service" />
+        </service>
+    </application>
+</manifest>
