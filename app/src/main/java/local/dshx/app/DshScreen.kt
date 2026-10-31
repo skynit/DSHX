@@ -205,6 +205,7 @@ fun DshScreen(
     val running = state.url != null
     val specimen = rememberSpecimenState(running, page == AppPage.Hosting || page == AppPage.HostingOptions,
         page == AppPage.HostingOptions, onHosting)
+    val specimenBackground = rememberSpecimenBackground(page == AppPage.Hosting || page == AppPage.HostingOptions)
     val active = running || state.busy && !state.backup.busy
     val webReady = (webVersion?.substringBefore('.')?.toIntOrNull() ?: 0) >= 126
     var keyboardOpen by remember { mutableStateOf(false) }
@@ -306,7 +307,7 @@ fun DshScreen(
                         VoiceChat(Modifier.fillMaxSize(), voice, voiceState, running, state.busy, onVoice, onStart,
                             onSettings = { selectTab(2); settingsPage = AppPage.VoiceOptions }, onChat = { selectTab(1) }, onBack = ::goBack)
                     } else if (shownPage == AppPage.Hosting || shownPage == AppPage.HostingOptions) {
-                        SpecimenScreen(specimen, running, shownPage == AppPage.HostingOptions, current, ::goBack,
+                        SpecimenScreen(specimen, specimenBackground, running, shownPage == AppPage.HostingOptions, current, ::goBack,
                             onOptions = { backGesture.reset(); settingsPage = AppPage.HostingOptions },
                             onSaved = { backGesture.reset(); settingsPage = AppPage.Hosting },
                             openSession = { onOpenSession(it); selectTab(1) })

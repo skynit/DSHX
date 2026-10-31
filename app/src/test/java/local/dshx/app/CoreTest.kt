@@ -3408,6 +3408,137 @@ class CoreTest {
         assertEquals("未启用", specimenStatus(true, false, status.put("running", false)))
     }
 
+    @Test
+    @Config(sdk = [26, 34])
+    @org.robolectric.annotation.GraphicsMode(org.robolectric.annotation.GraphicsMode.Mode.NATIVE)
+    fun specimenBackgroundPersistsReplacesAndRestoresDefault() {
+        val root = folder.newFolder("specimen-background")
+        val store = SpecimenBackground(root)
+        assertNull(store.load())
+        fun picture(color: Int): ByteArray = ByteArrayOutputStream().use { output ->
+            android.graphics.Bitmap.createBitmap(12, 20, android.graphics.Bitmap.Config.ARGB_8888).apply {
+                eraseColor(color)
+                assertTrue(compress(android.graphics.Bitmap.CompressFormat.PNG, 100, output))
+                recycle()
+            }
+            output.toByteArray()
+        }
+        val original = picture(android.graphics.Color.RED)
+        store.save(original.inputStream()).recycle()
+        val loaded = SpecimenBackground(root).load()!!
+        assertEquals(12, loaded.width)
+        assertEquals(20, loaded.height)
+        assertEquals(android.graphics.Color.RED, loaded.getPixel(0, 0))
+        loaded.recycle()
+        assertThrows(IllegalArgumentException::class.java) { store.save("无效图片".byteInputStream()) }
+        assertThrows(IllegalArgumentException::class.java) { store.save(ByteArray(20 * 1024 * 1024 + 1).inputStream()) }
+        assertEquals(android.graphics.Color.RED, store.load()!!.getPixel(0, 0))
+        assertFalse(root.listFiles()!!.any { it.name.startsWith("import-") })
+        store.save(picture(android.graphics.Color.BLUE).inputStream()).recycle()
+        assertEquals(android.graphics.Color.BLUE, store.load()!!.getPixel(0, 0))
+        store.clear()
+        assertNull(SpecimenBackground(root).load())
+        store.clear()
+        File(root, "background.png").writeText("损坏的已保存图片")
+        assertThrows(IllegalStateException::class.java) { store.load() }
+        store.clear()
+        assertNull(store.load())
+    }
+
+    @Test
+    @org.robolectric.annotation.GraphicsMode(org.robolectric.annotation.GraphicsMode.Mode.NATIVE)
+    fun specimenBackgroundSamplesLargeImagesBeforeSaving() {
+        val store = SpecimenBackground(folder.newFolder("large-background"))
+        val source = android.graphics.Bitmap.createBitmap(4096, 64, android.graphics.Bitmap.Config.ARGB_8888)
+        val bytes = ByteArrayOutputStream().use { output ->
+            assertTrue(source.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, output))
+            source.recycle()
+            output.toByteArray()
+        }
+        val bitmap = store.save(bytes.inputStream())
+        assertEquals(2048, bitmap.width)
+        assertEquals(32, bitmap.height)
+        bitmap.recycle()
+        val restored = store.load()!!
+        assertEquals(2048, restored.width)
+        restored.recycle()
+        val odd = android.graphics.Bitmap.createBitmap(4097, 64, android.graphics.Bitmap.Config.ARGB_8888)
+        val oddBytes = ByteArrayOutputStream().use { output ->
+            assertTrue(odd.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, output))
+            odd.recycle()
+            output.toByteArray()
+        }
+        val sampled = store.save(oddBytes.inputStream())
+        assertTrue(sampled.width <= 2048)
+        sampled.recycle()
+    }
+
+    @Test
+    @org.robolectric.annotation.GraphicsMode(org.robolectric.annotation.GraphicsMode.Mode.NATIVE)
+    fun specimenBackgroundKeepsPhotoOrientation() {
+        val store = SpecimenBackground(folder.newFolder("photo-background"))
+        val photo = File(folder.root, "photo.jpg")
+        val colors = intArrayOf(android.graphics.Color.RED, android.graphics.Color.GREEN, android.graphics.Color.BLUE, android.graphics.Color.YELLOW)
+        val bitmap = android.graphics.Bitmap.createBitmap(120, 80, android.graphics.Bitmap.Config.ARGB_8888)
+        for (y in 0 until 80) for (x in 0 until 120) bitmap.setPixel(x, y, colors[(if (y < 40) 0 else 2) + if (x < 60) 0 else 1])
+        photo.outputStream().use { assertTrue(bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 100, it)) }
+        bitmap.recycle()
+        val expected = listOf(0, 1, 3, 2, 0, 2, 3, 1)
+        for (orientation in 1..8) {
+            android.media.ExifInterface(photo.path).apply {
+                setAttribute(android.media.ExifInterface.TAG_ORIENTATION, orientation.toString())
+                saveAttributes()
+            }
+            val image = photo.inputStream().use(store::save)
+            assertEquals(if (orientation >= 5) 80 else 120, image.width)
+            assertEquals(if (orientation >= 5) 120 else 80, image.height)
+            val actual = image.getPixel(10, 10)
+            val color = colors[expected[orientation - 1]]
+            for (shift in listOf(0, 8, 16)) assertTrue("照片方向 $orientation",
+                kotlin.math.abs((actual ushr shift and 255) - (color ushr shift and 255)) < 10)
+            image.recycle()
+        }
+    }
+
+    @Test
+    @org.robolectric.annotation.GraphicsMode(org.robolectric.annotation.GraphicsMode.Mode.NATIVE)
+    fun specimenBackgroundSelectionSurvivesReloadAndCancellation() = runBlocking {
+        val files = folder.newFolder("background-state")
+        val context = object : ContextWrapper(RuntimeEnvironment.getApplication()) {
+            override fun getFilesDir() = files
+        }
+        val selected = File(files, "chosen.png")
+        val bitmap = android.graphics.Bitmap.createBitmap(16, 24, android.graphics.Bitmap.Config.ARGB_8888)
+        selected.outputStream().use { assertTrue(bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it)) }
+        bitmap.recycle()
+        val state = SpecimenBackgroundState(this, context)
+        suspend fun awaitImage() {
+            kotlinx.coroutines.yield()
+            withTimeout(3000) { while (!state.ready || state.busy) kotlinx.coroutines.delay(10) }
+        }
+        state.load()
+        state.change(Uri.fromFile(selected))
+        awaitImage()
+        assertNotNull(state.image)
+        assertNull(state.error)
+        assertEquals("背景图已更换。", state.message)
+        selected.delete()
+        val reloaded = SpecimenBackgroundState(this, context)
+        reloaded.load(); awaitImage()
+        withTimeout(3000) { while (!reloaded.ready || reloaded.busy) kotlinx.coroutines.delay(10) }
+        assertNotNull(reloaded.image)
+        val saved = state.image
+        state.change(null); awaitImage()
+        assertSame(saved, state.image)
+        state.change(Uri.fromFile(selected)); awaitImage()
+        assertNotNull(state.error)
+        assertSame(saved, state.image)
+        state.restore(); awaitImage()
+        assertNull(state.image)
+        assertNull(state.error)
+        assertEquals("已恢复默认背景图。", state.message)
+    }
+
     @Test fun specimenDraftsSurviveRefreshAndInvalidDraftsDoNotPreventStopping() = runBlocking {
         var saved = JSONObject().put("enabled", false).put("probability", 20).put("session", "").put("prompt", "原指令")
         var revision = 1

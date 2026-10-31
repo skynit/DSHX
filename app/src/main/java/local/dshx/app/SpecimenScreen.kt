@@ -1,6 +1,11 @@
 package local.dshx.app
 
+import android.content.Context
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
@@ -21,10 +26,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.imageResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.error
@@ -40,15 +48,72 @@ import androidx.compose.ui.unit.sp
 import com.composables.icons.lucide.ChevronLeft
 import com.composables.icons.lucide.Lucide
 import com.composables.icons.lucide.Settings2
+import com.composables.icons.lucide.ImagePlus
+import com.composables.icons.lucide.RotateCcw
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runInterruptible
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import kotlin.math.roundToInt
+
+/** 背景设置只读写本机图片，与培养任务是否启动无关。 */
+internal class SpecimenBackgroundState(private val scope: CoroutineScope, private val context: Context) {
+    private val store = SpecimenBackground(java.io.File(context.filesDir, "specimen"))
+    private val lock = Mutex()
+    var image by mutableStateOf<ImageBitmap?>(null)
+        private set
+    var busy by mutableStateOf(false)
+        private set
+    var ready by mutableStateOf(false)
+        private set
+    var error by mutableStateOf<String?>(null)
+    var message by mutableStateOf<String?>(null)
+        private set
+
+    fun load() = work(null) { store.load() }
+
+    fun change(uri: Uri?) {
+        if (uri == null) return
+        work("背景图已更换。") {
+            (context.contentResolver.openInputStream(uri) ?: error("无法读取所选图片，请重新选择。")).use(store::save)
+        }
+    }
+
+    fun restore() = work("已恢复默认背景图。") { store.clear(); null }
+
+    private fun work(success: String?, action: () -> android.graphics.Bitmap?) {
+        scope.launch {
+            // 重新创建页面后返回的选图结果，排在首次读取之后，避免被旧图覆盖。
+            lock.withLock {
+                busy = true; error = null; message = null
+                try {
+                    image = runInterruptible(Dispatchers.IO) { action()?.asImageBitmap() }
+                    message = success
+                } catch (cause: kotlinx.coroutines.CancellationException) { throw cause }
+                catch (cause: Exception) {
+                    error = if (cause is java.io.IOException || cause is SecurityException) "无法读取或保存背景图，请重新选择。"
+                        else cause.message?.take(160) ?: "背景图未更改，请重试。"
+                }
+                finally { ready = true; busy = false }
+            }
+        }
+    }
+}
+
+@Composable
+internal fun rememberSpecimenBackground(visible: Boolean): SpecimenBackgroundState {
+    val context = LocalContext.current.applicationContext
+    val scope = rememberCoroutineScope()
+    val state = remember(context, scope) { SpecimenBackgroundState(scope, context) }
+    LaunchedEffect(visible) { if (visible && !state.ready) state.load() }
+    return state
+}
 
 /** 主画面和培养设置共用草稿与实际回执；页面切换不创建第二份后台状态。 */
 internal class SpecimenState(
@@ -189,16 +254,19 @@ internal fun specimenStatus(running: Boolean, loading: Boolean, status: JSONObje
 
 @Composable
 internal fun SpecimenScreen(
-    state: SpecimenState, running: Boolean, options: Boolean, active: Boolean, back: () -> Unit,
+    state: SpecimenState, background: SpecimenBackgroundState, running: Boolean, options: Boolean, active: Boolean, back: () -> Unit,
     onOptions: () -> Unit, onSaved: () -> Unit, openSession: (String) -> Unit,
 ) {
     val colors = MiuixTheme.colorScheme
     val title = specimenStatus(running, state.loading, state.status)
     if (options) {
-        SpecimenOptions(state, running, active, title, back, onSaved, openSession)
+        SpecimenOptions(state, background, running, active, title, back, onSaved, openSession)
     } else Box(Modifier.fillMaxSize().clipToBounds().background(colors.surface)) {
-        SpecimenArt(Modifier.fillMaxSize())
-        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
+        val image = background.image
+        if (image != null) Image(image, "自定义实验体背景图", Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+        else SpecimenArt(Modifier.fillMaxSize())
+        val textSurface = if (image != null) Modifier.background(colors.surface) else Modifier
+        Row(Modifier.fillMaxWidth().then(textSurface).padding(horizontal = 16.dp, vertical = 12.dp),
             verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             LibraryIcon(Lucide.ChevronLeft, "返回设置总览", back, iconSize = 16)
             Text("实验体", modifier = Modifier.weight(1f).semantics { heading() }, fontSize = 22.sp,
@@ -206,7 +274,7 @@ internal fun SpecimenScreen(
             // 复用已有圆形控件的按压反馈和焦点环。
             VoiceButton("打开培养设置", Lucide.Settings2, onOptions)
         }
-        Column(Modifier.align(Alignment.BottomStart).fillMaxWidth().padding(horizontal = 28.dp, vertical = 24.dp),
+        Column(Modifier.align(Alignment.BottomStart).fillMaxWidth().then(textSurface).padding(horizontal = 28.dp, vertical = 24.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Text(title, fontSize = 16.sp, fontWeight = FontWeight.Medium,
                 color = if (running && state.enabled) LocalStatusColor.current else colors.onSurface)
@@ -244,7 +312,7 @@ private fun SpecimenArt(modifier: Modifier) {
 
 @Composable
 private fun SpecimenOptions(
-    state: SpecimenState, running: Boolean, active: Boolean, title: String, back: () -> Unit,
+    state: SpecimenState, background: SpecimenBackgroundState, running: Boolean, active: Boolean, title: String, back: () -> Unit,
     onSaved: () -> Unit, openSession: (String) -> Unit,
 ) {
     val colors = MiuixTheme.colorScheme
@@ -253,6 +321,7 @@ private fun SpecimenOptions(
     val visit = remember(active) { mutableStateOf(active) }
     DisposableEffect(visit) { onDispose { visit.value = false } }
     val latestSaved by rememberUpdatedState(onSaved)
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent(), background::change)
     Column(Modifier.fillMaxSize().background(colors.surface)) {
         Row(Modifier.widthIn(max = 608.dp).fillMaxWidth().align(Alignment.CenterHorizontally)
             .padding(horizontal = 16.dp, vertical = 12.dp),
@@ -264,6 +333,24 @@ private fun SpecimenOptions(
         Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState())) {
             Column(Modifier.widthIn(max = 608.dp).fillMaxWidth().align(Alignment.CenterHorizontally)
                 .padding(horizontal = 28.dp, vertical = 8.dp)) {
+                Text("背景图", fontSize = 15.sp, fontWeight = FontWeight.Medium)
+                Note(if (background.image == null) "默认插画" else "自定义图片")
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.padding(vertical = 12.dp)) {
+                    Action(if (background.busy) "正在处理图片…" else "更换背景图", {
+                        try { picker.launch("image/*") }
+                        catch (_: android.content.ActivityNotFoundException) { background.error = "没有可用的图片选择器。" }
+                    }, enabled = active && background.ready && !background.busy, icon = Lucide.ImagePlus)
+                    Action("恢复默认", background::restore, enabled = active && background.ready && !background.busy &&
+                        (background.image != null || background.error != null), icon = Lucide.RotateCcw)
+                }
+                Note("选择后自动保存，仅用于当前设备。")
+                background.error?.let { Text(it, fontSize = 13.sp, lineHeight = 20.sp, color = colors.error,
+                    modifier = Modifier.semantics { error(it) }) }
+                background.message?.let { Note(it) }
+                Spacer(Modifier.height(16.dp))
+                Divider()
+                Spacer(Modifier.height(16.dp))
                 SettingsSwitch("启用实验体", "按指令探索，随时可以停止。", state.enabled, available,
                     if (state.status == null) "状态未知" else null) { state.save(it, stop = !it) }
                 Divider()
