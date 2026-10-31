@@ -3,6 +3,9 @@ package local.dshx.app
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.LinearOutSlowInEasing
+import androidx.compose.animation.core.keyframes
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandVertically
@@ -25,6 +28,15 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 /** 沿用现有控件的短反馈；位移与尺寸使用无回弹弹簧，避免数据和表单晃动。 */
 internal object AppMotion {
     val startupEnter = tween<Float>(durationMillis = 320)
+    // 开屏只跃起一次，越过停驻位置后轻轻收稳；其余页面仍使用原有短反馈。
+    val startupJump = keyframes<Float> {
+        durationMillis = 960
+        0f at 0 using FastOutSlowInEasing
+        -0.04f at 120 using LinearOutSlowInEasing
+        1.08f at 640 using FastOutSlowInEasing
+        1f at 960
+    }
+    val startupWater = tween<Float>(durationMillis = 1400)
     val startupSweep = tween<Float>(durationMillis = 640)
     const val startupWaitMillis = 1600L
     val color = tween<Color>(durationMillis = 160)
