@@ -45,6 +45,11 @@ class MainActivity : ComponentActivity() {
     private var accessibilityHandled = false
     private val engine get() = (application as DshApp).engine
     private val voice get() = (application as DshApp).voice
+    private val update get() = (application as DshApp).update
+    private val updateInstaller = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        update.installed(result.resultCode)
+    }
+    internal fun installUpdate() { update.install(this) { updateInstaller.launch(it) } }
     private var pendingVoice: String? = null
     private val modelPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) {
@@ -380,6 +385,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        update.resume(this) { updateInstaller.launch(it) }
         voice.refreshSpeech()
         engine.phone.resume()
         engine.phone.device.attach(this)

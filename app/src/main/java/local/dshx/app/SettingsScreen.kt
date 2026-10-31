@@ -12,6 +12,7 @@ import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.input.rememberTextFieldState
 import androidx.compose.foundation.text.input.setTextAndPlaceCursorAtEnd
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
@@ -19,6 +20,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.heading
@@ -85,6 +87,8 @@ internal fun SettingsContent(
                 }
                 Divider()
                 LinkRow("备份与恢复", "会话与附件的导出、恢复", { onPage(AppPage.Backup) })
+                Divider()
+                LinkRow("应用更新", "检查新版本与更新内容", { onPage(AppPage.Update) })
             }
         }
         AppPage.Assistant -> {
@@ -100,7 +104,42 @@ internal fun SettingsContent(
         AppPage.Apps -> AppsSettings(engine.url != null, phoneRevision, onApps, onCreateApp, onHostingSession, permission,
             back = { onPage(AppPage.Settings) })
         AppPage.Backup -> BackupSettings(engine, backupPicking, onStop, onBackup)
+        AppPage.Update -> UpdateSettings()
         else -> Unit
+    }
+}
+
+@Composable
+private fun UpdateSettings() {
+    val context = LocalContext.current
+    val update = (context.applicationContext as DshApp).update
+    val state = update.state
+    Section("版本")
+    Panel {
+        SettingsTitle("DSHX ${update.version}")
+        Spacer(Modifier.height(8.dp))
+        Text(state.message, fontSize = 14.sp, lineHeight = 21.sp,
+            modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
+        state.error?.let { Text(it, fontSize = 13.sp, lineHeight = 20.sp, color = MiuixTheme.colorScheme.error) }
+        Spacer(Modifier.height(16.dp))
+        Action("检查更新", update::check, enabled = !state.busy, icon = Lucide.RotateCcw)
+        if (state.downloading) {
+            Spacer(Modifier.height(8.dp))
+            Action("取消下载", update::cancel, icon = Lucide.Square)
+        } else if (state.release != null) {
+            Spacer(Modifier.height(8.dp))
+            if (state.ready) Action("安装更新", { (context as? MainActivity)?.installUpdate() },
+                enabled = !state.busy, primary = true, icon = Lucide.Download)
+            else Action("下载更新", update::download, enabled = !state.busy, primary = true, icon = Lucide.Download)
+        }
+    }
+    state.release?.let { release ->
+        Section("${release.name} 更新内容")
+        Panel {
+            if (state.notes != null) SelectionContainer {
+                Text(state.notes, fontSize = 14.sp, lineHeight = 23.sp)
+            } else Note(if (state.notesError != null) "更新说明暂时无法加载，请重新检查更新。" else "重新检查更新可查看更新说明。")
+        }
     }
 }
 

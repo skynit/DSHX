@@ -65,6 +65,179 @@ import kotlinx.coroutines.withTimeout
 class CoreTest {
     @get:Rule val folder = TemporaryFolder()
 
+    private fun updateManifest(base: String, bytes: ByteArray = "apk".toByteArray()): JSONObject = JSONObject()
+        .put("format", 1).put("packageName", "local.dshx.app").put("versionCode", 3).put("versionName", "0.1.0-dev.2")
+        .put("commit", "a".repeat(40)).put("releaseNotesUrl", "${base}releases/3/release-note.txt")
+        .put("releaseNotesSha256", UpdateStore.hash("更新说明".toByteArray()))
+        .put("artifacts", org.json.JSONArray().put(JSONObject().put("abi", "arm64-v8a").put("minSdk", 26)
+            .put("url", "${base}releases/3/DSHX-arm64-0.1.0-dev.2.apk").put("size", bytes.size)
+            .put("sha256", UpdateStore.hash(bytes))))
+
+    private fun signedUpdate(json: JSONObject, signer: com.android.apksig.ApkSigner.SignerConfig): String {
+        val signature = java.security.Signature.getInstance("SHA256withRSA").apply { initSign(signer.privateKey) }
+        signature.update(UpdateStore.canonical(json).toByteArray(Charsets.UTF_8))
+        return JSONObject(json.toString()).put("signature", java.util.Base64.getEncoder().encodeToString(signature.sign())).toString()
+    }
+
+    @Test @Config(sdk = [26, 34]) fun updateManifestRequiresPublisherSignatureAndSelectsCompatibleApk() {
+        val signer = apkSigner()
+        val store = UpdateStore("http://47.119.120.17:18088/latest.json", signer.certificates)
+        val json = updateManifest("http://47.119.120.17:18088/")
+        val release = store.parse(signedUpdate(json, signer), "local.dshx.app", listOf("arm64-v8a"), 26)
+        assertEquals(3L, release.code)
+        assertEquals("DSHX-arm64-0.1.0-dev.2.apk", release.artifact.url.substringAfterLast('/'))
+        assertTrue(release.notesUrl.endsWith("/release-note.txt"))
+        assertThrows(IllegalArgumentException::class.java) { store.parse(json.toString(), "local.dshx.app", listOf("arm64-v8a"), 34) }
+        val tampered = JSONObject(signedUpdate(json, signer)).put("versionCode", 999)
+        assertThrows(IllegalArgumentException::class.java) { store.parse(tampered.toString(), "local.dshx.app", listOf("arm64-v8a"), 34) }
+        assertThrows(IllegalArgumentException::class.java) { store.parse(signedUpdate(json, apkSigner()), "local.dshx.app", listOf("arm64-v8a"), 34) }
+        assertThrows(IllegalArgumentException::class.java) { store.parse(signedUpdate(json, signer), "another.app", listOf("arm64-v8a"), 34) }
+        assertThrows(IllegalArgumentException::class.java) { store.parse(signedUpdate(json, signer), "local.dshx.app", listOf("x86_64"), 34) }
+        assertThrows(IllegalArgumentException::class.java) { store.parse(signedUpdate(json, signer), "local.dshx.app", listOf("arm64-v8a"), 25) }
+    }
+
+    @Test fun updateManifestRejectsCrossOriginFilesAndUnsafeMetadata() {
+        val signer = apkSigner()
+        val store = UpdateStore("https://updates.example.com/latest.json", signer.certificates)
+        fun reject(change: (JSONObject) -> Unit) {
+            val json = updateManifest("https://updates.example.com/").apply(change)
+            assertThrows(IllegalArgumentException::class.java) { store.parse(signedUpdate(json, signer), "local.dshx.app", listOf("arm64-v8a"), 34) }
+        }
+        reject { it.put("releaseNotesUrl", "https://another.example.com/release-note.txt") }
+        reject { it.put("releaseNotesUrl", "http://updates.example.com/release-note.txt") }
+        reject { it.put("versionName", "../bad") }
+        reject { it.put("versionCode", -1) }
+        reject { it.put("commit", "unknown") }
+        reject { it.getJSONArray("artifacts").getJSONObject(0).put("size", 2L * 1024 * 1024 * 1024) }
+        reject { it.getJSONArray("artifacts").getJSONObject(0).put("sha256", "wrong") }
+    }
+
+    @Test fun updateDownloadsOnlyPublishVerifiedCompleteFilesAndVerifyExternalNotes() {
+        val signer = apkSigner()
+        okhttp3.mockwebserver.MockWebServer().use { server ->
+            server.start()
+            val base = server.url("/").toString()
+            val bytes = "valid apk contents".toByteArray()
+            val store = UpdateStore("${base}latest.json", signer.certificates)
+            val release = store.parse(signedUpdate(updateManifest(base, bytes), signer), "local.dshx.app", listOf("arm64-v8a"), 34)
+            val target = File(folder.newFolder(), "update.apk")
+            server.enqueue(okhttp3.mockwebserver.MockResponse().setBody("valid apk contents"))
+            store.download(release, target, { false }) { _, _ -> }
+            assertArrayEquals(bytes, target.readBytes())
+            server.enqueue(okhttp3.mockwebserver.MockResponse().setBody("wrong apk contents"))
+            assertThrows(IllegalArgumentException::class.java) { store.download(release, target, { false }) { _, _ -> } }
+            assertArrayEquals(bytes, target.readBytes())
+            assertFalse(File(target.path + ".part").exists())
+            server.enqueue(okhttp3.mockwebserver.MockResponse().setBody("更新说明"))
+            assertEquals("更新说明", store.notes(release))
+            server.enqueue(okhttp3.mockwebserver.MockResponse().setBody("篡改后的更新说明"))
+            assertThrows(IllegalArgumentException::class.java) { store.notes(release) }
+            server.enqueue(okhttp3.mockwebserver.MockResponse().setBody("valid apk contents"))
+            assertThrows(java.io.InterruptedIOException::class.java) { store.download(release, target, { true }) { _, _ -> } }
+            assertArrayEquals(bytes, target.readBytes())
+        }
+    }
+
+    @Test fun updateDoesNotFollowRedirectsOrReadUnboundedReleaseNotes() {
+        val signer = apkSigner()
+        okhttp3.mockwebserver.MockWebServer().use { server ->
+            server.start()
+            val base = server.url("/").toString()
+            val store = UpdateStore("${base}latest.json", signer.certificates)
+            val release = store.parse(signedUpdate(updateManifest(base), signer), "local.dshx.app", listOf("arm64-v8a"), 34)
+            server.enqueue(okhttp3.mockwebserver.MockResponse().setResponseCode(302).addHeader("Location", "http://another.example.com/file"))
+            assertThrows(IllegalArgumentException::class.java) { store.notes(release) }
+            assertEquals(1, server.requestCount)
+            server.enqueue(okhttp3.mockwebserver.MockResponse().setBody("x".repeat(128 * 1024 + 1)))
+            assertThrows(IllegalArgumentException::class.java) { store.notes(release) }
+        }
+    }
+
+    @Test fun updateCanonicalUsesTheSameSortedUtf8FormatAsThePublisher() {
+        val json = JSONObject().put("z", "中文").put("a", org.json.JSONArray().put(26).put(JSONObject().put("url", "http://47.119.120.17:18088/")))
+        assertEquals("{\"a\":[26,{\"url\":\"http://47.119.120.17:18088/\"}],\"z\":\"中文\"}", UpdateStore.canonical(json))
+    }
+
+    @Test @Config(sdk = [26, 34]) fun updateAndPhoneFilesShareOneProviderWithSeparateDirectories() {
+        val context = RuntimeEnvironment.getApplication()
+        val update = File(context.filesDir, "updates/update.apk").apply { parentFile!!.mkdirs(); writeText("update") }
+        val sharing = File(context.cacheDir, "phone-sharing/share.txt").apply { parentFile!!.mkdirs(); writeText("share") }
+        for ((file, expected) in listOf(update to "update", sharing to "share")) {
+            val uri = androidx.core.content.FileProvider.getUriForFile(context, "${context.packageName}.phone.files", file)
+            assertEquals("content", uri.scheme)
+            assertEquals(expected, context.contentResolver.openInputStream(uri)!!.bufferedReader().use { it.readText() })
+        }
+    }
+
+    @Test @Config(sdk = [26]) fun updateKeepsTheDownloadedNewerVersionWhenTheServerReturnsAnOlderManifest() {
+        val context = RuntimeEnvironment.getApplication()
+        val signer = apkSigner()
+        val info = context.packageManager.getPackageInfo(context.packageName, android.content.pm.PackageManager.GET_SIGNATURES)
+        info.signatures = arrayOf(android.content.pm.Signature(signer.certificates.single().encoded))
+        shadowOf(context.packageManager).installPackage(info)
+        ReflectionHelpers.setStaticField(Build::class.java, "SUPPORTED_ABIS", arrayOf("arm64-v8a"))
+        okhttp3.mockwebserver.MockWebServer().use { server ->
+            server.start()
+            val base = server.url("/").toString()
+            val root = File(context.filesDir, "updates").apply { mkdirs() }
+            File(root, "update.apk").writeText("apk")
+            File(root, "pending.json").writeText(signedUpdate(updateManifest(base).put("versionCode", 5), signer))
+            val update = AppUpdate(context, "${base}latest.json")
+            fun await() {
+                val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+                while (update.state.busy && System.nanoTime() < deadline) {
+                    Thread.sleep(10)
+                    shadowOf(Looper.getMainLooper()).idle()
+                }
+                assertFalse("更新操作未在限定时间内完成", update.state.busy)
+            }
+            await()
+            assertTrue(update.state.ready)
+            assertEquals(5L, update.state.release?.code)
+            server.enqueue(okhttp3.mockwebserver.MockResponse().setBody(signedUpdate(updateManifest(base), signer)))
+            server.enqueue(okhttp3.mockwebserver.MockResponse().setBody("更新说明"))
+            update.check(); await()
+            assertNull(update.state.error)
+            assertTrue(update.state.ready)
+            assertEquals(5L, update.state.release?.code)
+            assertEquals("更新说明", update.state.notes)
+        }
+    }
+
+    @Test @Config(sdk = [26, 34]) fun updateApkChecksRealSignaturesHashesAndPackageVersions() {
+        val app = RuntimeEnvironment.getApplication()
+        val definition = AppPackage.parse(notesPackage())
+        val packageName = AppApk.packageName(definition.id)
+        val context = object : ContextWrapper(app) { override fun getPackageName() = packageName }
+        val manager = shadowOf(context.packageManager)
+        val installed = android.content.pm.PackageInfo().apply { this.packageName = packageName; versionCode = 1; versionName = "old" }
+        manager.installPackage(installed)
+        val template = folder.newFile("ota-template.apk")
+        app.assets.open("micro-apk/runtime.apk").use { input -> template.outputStream().use { input.copyTo(it) } }
+        val signer = apkSigner()
+        val apk = folder.newFile("ota-signed.apk")
+        AppApk.assemble(template, definition, 3, signer, apk)
+        val archive = android.content.pm.PackageInfo().apply {
+            this.packageName = packageName; versionCode = 3; versionName = definition.version
+            applicationInfo = android.content.pm.ApplicationInfo().apply { minSdkVersion = 26 }
+        }
+        manager.setPackageArchiveInfo(apk.path, archive)
+        val release = UpdateStore.Release(3, definition.version, "a".repeat(40), "", "",
+            UpdateStore.Artifact("", apk.length(), UpdateStore.hash(apk.readBytes())), "")
+        AppUpdate.verify(context, release, apk, signer.certificates)
+        assertThrows(IllegalArgumentException::class.java) { AppUpdate.verify(context, release, apk, apkSigner().certificates) }
+        assertThrows(IllegalArgumentException::class.java) { AppUpdate.verify(context, release.copy(code = 4), apk, signer.certificates) }
+        assertThrows(IllegalArgumentException::class.java) { AppUpdate.verify(context, release.copy(name = "wrong"), apk, signer.certificates) }
+        archive.packageName = "another.app"
+        assertThrows(IllegalArgumentException::class.java) { AppUpdate.verify(context, release, apk, signer.certificates) }
+        archive.packageName = packageName
+        java.io.RandomAccessFile(apk, "rw").use { it.seek(100); it.write(0) }
+        assertThrows(IllegalArgumentException::class.java) { AppUpdate.verify(context, release, apk, signer.certificates) }
+        assertThrows(IllegalArgumentException::class.java) {
+            AppUpdate.verify(context, release.copy(artifact = release.artifact.copy(hash = UpdateStore.hash(apk.readBytes()))), apk, signer.certificates)
+        }
+    }
+
     @Test fun darkPaletteUsesReferenceBlackAndNeutralSurfaces() {
         val colors = AppColors(true)
         assertEquals(0xFF0E0E0E.toInt(), colors.background)

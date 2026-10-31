@@ -32,6 +32,7 @@ class DshApp : Application(), PhoneEvents {
     }
     val engine by lazy { Engine(this) }
     val voice by lazy { VoiceControl(this, engine) }
+    internal val update by lazy { AppUpdate(this) }
 }
 
 class EngineService : Service() {

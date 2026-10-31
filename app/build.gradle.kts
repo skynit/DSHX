@@ -6,6 +6,10 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+val updateUrl = providers.gradleProperty("dshxUpdateUrl").orElse("http://47.119.120.17/dshx/latest.json")
+val buildCommit = providers.exec { commandLine("git", "rev-parse", "HEAD") }.standardOutput.asText.map { it.trim() }
+val buildDirty = providers.exec { commandLine("git", "status", "--porcelain") }.standardOutput.asText.map { it.isNotBlank() }
+
 android {
     ndkVersion = "28.2.13676358"
     namespace = "local.dshx.app"
@@ -14,8 +18,9 @@ android {
         applicationId = "local.dshx.app"
         minSdk = 26
         targetSdk = 28
-        versionCode = 2
-        versionName = "0.1.0-dev.1"
+        versionCode = providers.gradleProperty("dshxVersionCode").orElse("3").get().toInt()
+        versionName = providers.gradleProperty("dshxVersionName").orElse("0.1.0-dev.2").get()
+        resValue("string", "update_url", updateUrl.get())
         val info = file("src/main/assets/core-info.json")
         val abi = providers.gradleProperty("dshxAbi").orNull
             ?: if (info.isFile) Regex("\"abi\"\\s*:\\s*\"([^\"]+)\"").find(info.readText())?.groupValues?.get(1) else null
@@ -32,6 +37,25 @@ android {
     lint { disable += "ExpiredTargetSdkVersion" }
     externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt"); version = "3.22.1" } }
 }
+
+// 发布脚本读取 APK 内的构建记录，防止把未提交代码或别的构建登记为 GitHub 版本。
+val releaseAssets = layout.buildDirectory.dir("generated/releaseAssets")
+val prepareReleaseInfo by tasks.registering {
+    inputs.property("commit", buildCommit)
+    inputs.property("dirty", buildDirty)
+    inputs.property("updateUrl", updateUrl)
+    outputs.dir(releaseAssets)
+    doLast {
+        val address = updateUrl.get()
+        check(address.matches(Regex("https?://[A-Za-z0-9.:/_-]+"))) { "更新清单地址无效。" }
+        releaseAssets.get().file("build-info.json").asFile.apply {
+            parentFile.mkdirs()
+            writeText("""{"commit":"${buildCommit.get()}","dirty":${buildDirty.get()},"updateUrl":"$address"}""" + "\n")
+        }
+    }
+}
+android.sourceSets.getByName("main").assets.srcDir(releaseAssets)
+tasks.matching { it.name == "preBuild" }.configureEach { dependsOn(prepareReleaseInfo) }
 
 kotlin { compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17) } }
 
