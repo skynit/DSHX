@@ -69,7 +69,7 @@ internal fun SettingsContent(
             }
             Section("能力")
             Panel(padding = 0) {
-                LinkRow("任务分工", "${if (voice.local) "已开启" else "未开启"} · 简单语音任务与截图识别", { onPage(AppPage.Tasks) })
+                LinkRow("任务分工", "${if (voice.local) "已开启" else "未开启"} · 简单任务与截图识别", { onPage(AppPage.Tasks) })
                 Divider()
                 LinkRow("手机操作与权限", "屏幕操作、悬浮提示与通知", { onPage(AppPage.Permissions) })
                 Divider()
@@ -408,7 +408,7 @@ private fun SmallModelSettings(voice: VoiceControl, state: VoiceControl.State, a
         "custom" -> "导入本地 · ${state.customModel.ifBlank { "未导入" }}"
         else -> "默认本地 · ${if (state.localReady) "已下载" else "未下载"}"
     }
-    Note("为简单语音任务与截图识别指定处理模型。复杂任务仍使用当前聊天模型。")
+    Note("为文字或语音中的简单任务与截图识别指定处理模型。复杂任务仍使用当前聊天模型。")
     Panel(padding = 0) {
         SettingsSwitch("开启任务分工", if (local) "已开启，使用下方配置" else "未开启，可先准备下方配置", local, !state.active) {
             local = it; voice.local = it
@@ -416,7 +416,7 @@ private fun SmallModelSettings(voice: VoiceControl, state: VoiceControl.State, a
     }
     Section("按任务配置")
     Panel(padding = 0) {
-        SettingsFold("简单语音任务", current, simpleOpen) {
+        SettingsFold("简单任务", current, simpleOpen) {
             SettingsOptions(source, listOf("default" to "默认本地", "custom" to "导入本地", "online" to "在线服务"), !state.active) {
                 source = it; message = null; error = null; attempted = false
             }
@@ -436,10 +436,10 @@ private fun SmallModelSettings(voice: VoiceControl, state: VoiceControl.State, a
                         enabled = !state.active, icon = Lucide.Upload)
                 }
                 else -> {
-                    SettingsRow("Qwen3 0.6B · 本地", "简单语音任务模型 · 约 379 MiB · ${if (state.localReady) "已下载" else "未下载"}") {
+                    SettingsRow("Qwen3 0.6B · 本地", "简单任务模型 · 约 379 MiB · ${if (state.localReady) "已下载" else "未下载"}") {
                         Action(if (state.localReady) "重新校验" else "下载模型", { action("download-local") }, enabled = !state.active, icon = Lucide.Download)
                     }
-                    Note("处理语音识别后的文字任务，仅支持文字输入。")
+                    Note("处理文字输入或语音识别后的简单任务，仅支持文字内容。")
                     Panel(padding = 0) {
                         SettingsFold("模型文件下载来源", if (mirror) "HF Mirror 镜像" else "Hugging Face 官方") {
                             SettingsOptions(if (mirror) "mirror" else "official", listOf("official" to "Hugging Face 官方", "mirror" to "HF Mirror 镜像"), !state.active) {

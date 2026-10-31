@@ -18,6 +18,14 @@ function localTask(text) {
 
 export function localQuestion(text) { return localTask(text) !== null; }
 
+function checkedRoute(selected) {
+  if (!selected || typeof selected !== 'object' || Array.isArray(selected) ||
+      Object.keys(selected).some(key => !['provider', 'model'].includes(key)) ||
+      ['provider', 'model'].some(key => typeof selected[key] !== 'string' || !selected[key].trim() || selected[key].length > 256 || /[\u0000-\u001f\u007f]/.test(selected[key])) ||
+      selected.provider === route.provider && ![route.model, 'custom'].includes(selected.model)) throw new Error('小模型配置无效。');
+  return { provider: selected.provider.trim(), model: selected.model.trim() };
+}
+
 function needsHistory(text) {
   return localTask(text) === 'followup' || /这个|那个|它|上文|上面|前面|上一条|上一轮|继续|刚才|第[一二三四五六七八九十\d]+点|\b(it|that|previous|above)\b/i.test(text);
 }
@@ -128,15 +136,32 @@ export function localAdapter(Base, host = policyHost) {
   }();
 }
 
-/** Native voice submits ordinary user messages; the official loop owns history and tools. */
-export function voiceSession(ctx) {
+/** 语音与文字共用正式会话，简单任务只临时选择模型。 */
+export function voiceSession(ctx, host = policyHost) {
   let active;
+  const tasks = new Map();
   const waiting = new Set();
   function restore(run) {
     if (!run.selection || run.restored) return;
     run.restored = true;
     // User model selections are durable events and always take precedence over our temporary route.
     if (!run.changed) run.selection.current = run.previous;
+  }
+  function select(run) {
+    run.selection = ctx.sessionController.agents.selectionFor(run.agent);
+    run.previous = run.selection.current;
+    // 只把原模型作为后续选择写入历史，分工模型仅在当前轮次生效。
+    if (run.previous && (run.previous.provider !== run.route.provider || run.previous.model !== run.route.model)) {
+      run.recording = true;
+      try { ctx.sessionController.agents.selectForNextRequest(run.agent, run.previous); }
+      finally { run.recording = false; }
+    }
+    run.selection.current = { ...run.route };
+  }
+  function release(run) {
+    restore(run);
+    run.assembly?.(); run.retry?.();
+    tasks.delete(run.agent);
   }
   function removePending(run) {
     if (!run.agent) return;
@@ -175,7 +200,7 @@ export function voiceSession(ctx) {
   };
   const claimed = ctx.on('agent/inbox/claimed', ({ agent, message, turn }) => {
     const run = active;
-    if (!run || run.agent !== agent || message.source?.kind !== 'user') return;
+    if (!run || run.agent !== agent || message.source?.kind !== 'user') return claimTask({ agent, message, turn });
     if (message.source.rpcId === run.request) {
       run.entered = true; run.turn = turn;
       if (run.cancelled) { agent.cancel({ kind: 'user' }, { keepInbox: true }); return; }
@@ -188,23 +213,55 @@ export function voiceSession(ctx) {
         run.local = task !== null && (history.some(isMemory) || localInput([...history, message], needsHistory(run.input)) !== null);
       }
       if (run.local || run.online) {
-        run.selection = ctx.sessionController.agents.selectionFor(agent);
-        run.previous = run.selection.current;
-        // Keep the original route pending in durable history. A local request header
-        // must not become the next model after the application recreates this Agent.
-        if (run.previous && (run.previous.provider !== run.route.provider || run.previous.model !== run.route.model)) {
-          run.recording = true;
-          try { ctx.sessionController.agents.selectForNextRequest(agent, run.previous); }
-          finally { run.recording = false; }
-        }
-        run.selection.current = { ...run.route };
+        select(run);
       }
     } else {
       run.finished = true; run.cancelled = true;
       removePending(run); restore(run);
       run.reject(new Error('会话已收到新的输入，语音播报已停止。'));
+      claimTask({ agent, message, turn });
     }
   });
+  function claimTask({ agent, message, turn }) {
+    if (active?.agent === agent && message.source?.rpcId === active.request) return;
+    const previous = tasks.get(agent);
+    if (previous) {
+      release(previous);
+      // 同一轮收到追加输入时不再将它当作独立简单任务。
+      if (previous.turn === turn) {
+        tasks.set(agent, { agent, session: agent.session.id, turn });
+        return;
+      }
+    }
+    if (!host.configured) return;
+    const run = { agent, session: agent.session.id, turn };
+    tasks.set(agent, run);
+    if (message.source?.kind !== 'user' || message.content.some(part => part.type !== 'text')) return;
+    const input = message.content.map(part => part.text).join('\n').trim();
+    if (!localQuestion(input)) return;
+    run.input = input;
+    // 领取消息后、组装提示词前读取配置，让正式模型选择与界面入口无关。
+    run.assembly = agent.ctx.on('system-prompt/assemble', async (_assembly, { signal }, next) => {
+      if (!signal || run.prepared || tasks.get(agent) !== run) return next();
+      run.prepared = true;
+      const settings = await host.smallModel(run.session, signal);
+      signal.throwIfAborted();
+      if (tasks.get(agent) !== run || run.changed || settings?.enabled !== true) return next();
+      run.route = checkedRoute(settings.textRoute ?? settings.route);
+      run.local = run.route.provider === route.provider;
+      const history = agent.session.deriveMessages();
+      if (run.local && !history.some(isMemory) && localInput([...history, message], needsHistory(input)) === null) return next();
+      select(run);
+      return next();
+    }, { prepend: true });
+  }
+  function taskEvent(session, entry) {
+    for (const run of tasks.values()) {
+      if (run.session !== session.id) continue;
+      if (entry.type === 'model/selection' && !run.recording) run.changed = true;
+      if (entry.type === 'turn/end' && entry.data.turn === run.turn) release(run);
+    }
+  }
   const request = ctx.on('agent/request', ({ agent, turn, signal }, next) => {
     const run = active;
     if (run?.agent === agent && run.entered && run.turn === turn) run.signal = signal;
@@ -232,6 +289,7 @@ export function voiceSession(ctx) {
     publish(run, text);
   });
   const event = ctx.on('session/event', (session, entry) => {
+    taskEvent(session, entry);
     const run = active;
     if (!run || run.session !== session.id) return;
     if (entry.type === 'model/selection' && run.selection && !run.recording) run.changed = true;
@@ -275,7 +333,7 @@ export function voiceSession(ctx) {
   // Scoped instructions can enter after inbox claim. Recheck at the adapter
   // boundary, and retry that same logged user message once on its original model.
   const retry = ctx.on('agent/request-error', ({ agent, provider, failure, signal }, next) => {
-    const run = active;
+    const run = active?.agent === agent ? active : tasks.get(agent);
     if (failure.code === 'LOCAL_MEMORY_CONTEXT' && provider === route.provider && run?.agent === agent) {
       run.contextFailure = failure;
       return next();
@@ -291,7 +349,7 @@ export function voiceSession(ctx) {
     // needs a request override outside that snapshot, scoped to this run only.
     run.retry = agent.ctx.on('agent/request', async (_payload, next) => {
       const config = await next();
-      if (run.cancelled || run.changed || active !== run) return config;
+      if (run.cancelled || run.changed || (active !== run && tasks.get(agent) !== run)) return config;
       const { reasoningEffort: _effort, ...rest } = config;
       return { ...rest, ...run.previous };
     }, { prepend: true });
@@ -313,12 +371,7 @@ export function voiceSession(ctx) {
       if (onEvent !== undefined && typeof onEvent !== 'function') throw new Error('语音事件回调无效。');
       if (typeof data.interaction !== 'string' || !/^[a-zA-Z0-9-]{1,80}$/.test(data.interaction)) throw new Error('语音轮次无效。');
       if (typeof data.text !== 'string' || !data.text.trim() || Buffer.byteLength(data.text) > 16000) throw new Error('语音文字为空或过长。');
-      const selected = data.smallModel ?? route;
-      if (!selected || typeof selected !== 'object' || Array.isArray(selected) ||
-          Object.keys(selected).some(key => !['provider', 'model'].includes(key)) ||
-          ['provider', 'model'].some(key => typeof selected[key] !== 'string' || !selected[key].trim() || selected[key].length > 256 || /[\u0000-\u001f\u007f]/.test(selected[key])) ||
-          selected.provider === route.provider && ![route.model, 'custom'].includes(selected.model)) throw new Error('小模型配置无效。');
-      const target = { provider: selected.provider.trim(), model: selected.model.trim() };
+      const target = checkedRoute(data.smallModel ?? route);
       const split = data.local === true && localQuestion(data.text.trim());
       let resolve, reject;
       const reply = new Promise((yes, no) => { resolve = yes; reject = no; });
@@ -358,7 +411,11 @@ export function voiceSession(ctx) {
         }
       }
     },
-    close() { cancel(); retry(); event(); stream(); request(); claimed(); },
+    close() {
+      cancel();
+      for (const run of tasks.values()) release(run);
+      retry(); event(); stream(); request(); claimed();
+    },
   };
 }
 

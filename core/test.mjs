@@ -3851,6 +3851,112 @@ for (const target of [{ provider: 'dshx-local', model: 'custom' }, { provider: '
   });
 }
 
+for (const target of [{ provider: 'dshx-local', model: 'qwen3-0.6b' },
+  { provider: 'dshx-local', model: 'custom' }, { provider: 'fixture', model: 'small-online' }]) {
+  test(`simple tasks route typed input through ${target.model} and keep the main model`, async () => {
+    const { Context } = await load('@deepseek-ai/cordis');
+    const { default: SystemPrompt } = await load('@deepseek-ai/dsh-system-prompt');
+    const { default: Tools } = await load('@deepseek-ai/dsh-tools');
+    const { default: LlmRuntime, LlmAdapter, createUserMessage } = await load('@deepseek-ai/dsh-llm');
+    const { default: Agents, installModelSelection } = await load('@deepseek-ai/dsh-agent');
+    const { default: Sessions } = await load('@deepseek-ai/dsh-session');
+    const { default: Projections } = await load('@deepseek-ai/dsh-session-projection');
+    const { default: AgentLoop } = await load('@deepseek-ai/dsh-agent-loop');
+    const { voiceSession, localAdapter } = await import(pathToFileURL(join(core, 'voice.mjs')));
+    const ctx = new Context(), calls = [], events = [];
+    const original = { provider: 'fixture', model: 'main' }, selection = { current: original };
+    let enabled = true, fail = false, voice, dispose, gate, started;
+    const wait = async signal => {
+      if (!gate) return;
+      started.resolve();
+      await Promise.race([gate.promise, new Promise((_, reject) => {
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      })]);
+    };
+    class Remote extends LlmAdapter {
+      async *stream(options) {
+        calls.push({ provider: options.provider, model: options.model });
+        selection.current = undefined;
+        await wait(options.signal);
+        if (fail) throw new Error('fixture failure');
+        yield { type: 'text-delta', index: 0, text: '第二点是节省流量。' };
+        yield { type: 'finish', reason: { kind: 'stop' } };
+      }
+    }
+    try {
+      for (const plugin of [SystemPrompt, Tools, LlmRuntime, Agents, Sessions, Projections]) await ctx.plugin(plugin);
+      await ctx.plugin(AgentLoop, { agents: [] });
+      ctx.llm.registerAdapter(['fixture'], new Remote());
+      ctx.llm.registerAdapter(['dshx-local'], localAdapter(LlmAdapter, { async query(method, data, signal) {
+        assert.equal(method, 'local-model');
+        calls.push({ provider: 'dshx-local', model: data.model ?? 'qwen3-0.6b' });
+        selection.current = undefined;
+        await wait(signal);
+        if (fail) throw new Error('fixture failure');
+        return { text: '第二点是节省流量。', inputTokens: 12, outputTokens: 8 };
+      } }));
+      const agent = await ctx.agentLoop.create('typed-simple', original);
+      dispose = installModelSelection(agent.ctx, selection);
+      ctx.sessionController = { agents: {
+        selectionFor: () => selection,
+        selectForNextRequest(agent, selected) { agent.session.append('model/selection', selected); selection.current = selected; },
+      } };
+      ctx.on('session/event', (_session, entry) => events.push(entry));
+      voice = voiceSession(ctx, { configured: true, async smallModel(session, signal) {
+        assert.equal(session, agent.session.id); assert.equal(signal.aborted, false);
+        return { enabled, route: { provider: 'fixture', model: 'image-only' }, textRoute: target };
+      } });
+      const send = async (text, content = [{ type: 'text', text }], source = { kind: 'user' }) => {
+        agent.followup(createUserMessage({ content, source }));
+        await agent.whenIdle();
+      };
+      await send('你好');
+      assert.deepEqual(calls, [target], 'typed input uses the configured text route, not the screenshot route');
+      assert.equal(selection.current, original);
+      await send('把你的第二点展开说说');
+      assert.deepEqual(calls, [target, target]);
+      assert.equal(selection.current, original);
+      await send('搜索文件');
+      assert.deepEqual(calls.at(-1), original);
+      selection.current = original; enabled = false;
+      await send('你好');
+      assert.deepEqual(calls.at(-1), original);
+      selection.current = original; enabled = true;
+      await send('你好', [{ type: 'text', text: '你好' }, { type: 'image', attachment: { attachmentId: 'sha256:' + 'a'.repeat(64), mimeType: 'image/png', size: 5 } }]);
+      assert.deepEqual(calls.at(-1), original, 'attachments remain with the main model');
+      selection.current = original;
+      await send('你好', undefined, { kind: 'plugin:background' });
+      assert.deepEqual(calls.at(-1), original, 'background messages are not simple user tasks');
+      selection.current = original; fail = true;
+      await send('你好');
+      assert.deepEqual(calls.at(-1), target);
+      assert.equal(selection.current, original, 'failure restores the main model');
+      fail = false; gate = Promise.withResolvers(); started = Promise.withResolvers();
+      const cancelled = send('你好');
+      await started.promise;
+      agent.cancel({ kind: 'user' });
+      await cancelled;
+      assert.equal(selection.current, original, 'cancellation restores the main model');
+      gate = Promise.withResolvers(); started = Promise.withResolvers();
+      const changed = send('你好');
+      await started.promise;
+      const manual = { provider: 'fixture', model: 'manual' };
+      ctx.sessionController.agents.selectForNextRequest(agent, manual);
+      gate.resolve(); await changed;
+      assert.equal(selection.current, manual, 'an explicit user selection wins over temporary routing');
+      gate = undefined; selection.current = original;
+      const beforeBatch = calls.length;
+      agent.inbox.append('next-step', createUserMessage({ content: [{ type: 'text', text: '你好' }], source: { kind: 'user' } }));
+      await send('搜索文件');
+      assert.equal(calls.length, beforeBatch + 1);
+      assert.deepEqual(calls.at(-1), original, 'a greeting cannot route a batch containing a complex request');
+      assert.ok(events.filter(entry => entry.type === 'model/selection').every(entry => ['main', 'manual'].includes(entry.data.model)));
+      assert.equal(events.filter(entry => entry.type === 'user/message' && entry.data.source?.kind === 'user').length, 10,
+        'each typed message is recorded once');
+    } finally { voice?.close(); dispose?.(); await ctx.fiber.dispose(); }
+  });
+}
+
 test('voice host sends incremental frames before one final response and discards late callbacks', async t => {
   const host = new PolicyHost(), frames = [], reply = Promise.withResolvers();
   let publish;

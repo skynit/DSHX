@@ -2186,6 +2186,11 @@ class CoreTest {
         recreated.local = true
         assertTrue(store.status().getBoolean("enabled"))
         assertEquals("vision-small", store.status().getJSONObject("route").getString("model"))
+        assertEquals("qwen3-0.6b", store.status().getJSONObject("textRoute").getString("model"))
+        store.save(saved.copy(source = "online", provider = "text-service", model = "text-small"))
+        assertEquals("text-small", store.status().getJSONObject("textRoute").getString("model"))
+        assertEquals("vision-small", store.status().getJSONObject("route").getString("model"))
+        store.save(saved)
         for (invalid in listOf(saved.copy(imageModel = ""), saved.copy(imageProvider = ""),
             saved.copy(imageProvider = "dshx-local"), saved.copy(imageModel = "bad\u0000model"))) {
             assertThrows(IllegalArgumentException::class.java) { store.save(invalid) }

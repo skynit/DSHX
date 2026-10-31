@@ -37,7 +37,11 @@ class SmallModel(private val context: Context) {
         preferences.getString("smallProvider", "").orEmpty(), preferences.getString("smallModel", "").orEmpty(),
         preferences.getString("imageProvider", "").orEmpty(), preferences.getString("imageModel", "").orEmpty()).checked()
 
-    fun status(): JSONObject = JSONObject().put("enabled", preferences.getBoolean("local", false)).put("route", settings().imageRoute())
+    fun status(): JSONObject {
+        val saved = settings()
+        return JSONObject().put("enabled", preferences.getBoolean("local", false))
+            .put("route", saved.imageRoute()).put("textRoute", saved.route())
+    }
 
     fun save(value: Settings) {
         val clean = value.checked()
