@@ -6112,6 +6112,25 @@ class CoreTest {
         assertTrue(skill.readText().endsWith("用户自己的规则"))
     }
 
+    @Test fun softwareBuiltinSkillInstallsResourcesAndPreservesUserEdits() {
+        val assets = RuntimeEnvironment.getApplication().assets
+        val store = LibraryStore(folder.root)
+        store.prepareSkills(assets)
+        val name = "install-dshx-software"
+        val entry = store.skills().single { it.name == name }
+        assertEquals("user:$name/SKILL.md", entry.id)
+        val original = store.readSkill(entry)
+        assertEquals(assets.open("skills/$name/SKILL.md").bufferedReader().use { it.readText() }, original.text)
+        val reference = File(folder.root, "home/.dsh/skills/$name/references/packages.md")
+        assertEquals(assets.open("skills/$name/references/packages.md").bufferedReader().use { it.readText() }, reference.readText())
+        val edited = original.text + "\n用户自己的装配规则\n"
+        store.saveSkill(name, edited, original)
+        store.prepareSkills(assets)
+        val reopened = LibraryStore(folder.root)
+        assertEquals(edited, reopened.readSkill(reopened.skills().single { it.name == name }).text)
+        assertTrue(reference.isFile)
+    }
+
     @Test @Config(shadows = [PhoneAccess::class])
     fun microAppCannotReplaceAChatObservationBetweenCallsAndOldCleanupCannotClearNewOwner() {
         val controller = phoneService()
