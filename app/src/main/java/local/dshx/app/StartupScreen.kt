@@ -81,8 +81,6 @@ internal fun StartupScreen(state: EngineState, onFinished: () -> Unit, modifier:
             Spacer(Modifier.height(8.dp))
             Text("DSHX", fontSize = 30.sp, letterSpacing = 5.sp,
                 fontWeight = FontWeight.SemiBold, color = colors.onSurface)
-            Spacer(Modifier.height(8.dp))
-            Text("你的手机助手", fontSize = 14.sp, color = colors.onSurfaceVariantSummary)
             Spacer(Modifier.height(32.dp))
             Row(Modifier.widthIn(max = 320.dp), verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(10.dp)) {
