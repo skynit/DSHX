@@ -2861,6 +2861,8 @@ class CoreTest {
 
     private val contents = linkedMapOf(
         "bin/node" to "node".toByteArray(),
+        "bin/npm" to "npm launcher".toByteArray(),
+        "bin/pnpm" to "pnpm launcher".toByteArray(),
         "bin/git" to "git".toByteArray(),
         "libexec/git-core/git-remote-http" to "git http".toByteArray(),
         "libexec/git-core/git-remote-https" to "git https".toByteArray(),
@@ -2906,7 +2908,7 @@ class CoreTest {
 
     private fun manifest(zip: ByteArray, files: Map<String, ByteArray> = contents, version: String = "test-1"): CoreStore.Manifest {
         val entries = files.mapValues { (name, bytes) -> CoreStore.Entry(bytes.size.toLong(), hash(bytes),
-            name in listOf("bin/node", "bin/git", "libexec/git-core/git-remote-http", "libexec/git-core/git-remote-https")) }
+            name in listOf("bin/node", "bin/npm", "bin/pnpm", "bin/git", "libexec/git-core/git-remote-http", "libexec/git-core/git-remote-https")) }
         return CoreStore.Manifest(version, "x86_64", hash(zip), zip.size.toLong(), entries)
     }
 
@@ -2923,6 +2925,8 @@ class CoreTest {
         assertEquals(file, store.current(manifest(zip)))
         assertEquals("dsh", File(file, "lib/node_modules/@deepseek-ai/dsh/lib/bin.js").readText())
         assertTrue(File(file, "bin/node").canExecute())
+        assertTrue(File(file, "bin/npm").canExecute())
+        assertTrue(File(file, "bin/pnpm").canExecute())
         assertTrue(File(file, "bin/git").canExecute())
         assertTrue(File(file, "libexec/git-core/git-remote-http").canExecute())
         assertTrue(File(file, "libexec/git-core/git-remote-https").canExecute())
@@ -2963,7 +2967,7 @@ class CoreTest {
     @Test fun missingPluginLauncherRequiresRepairWithoutScanningOtherFiles() {
         for (name in listOf("start.mjs", "plugins.mjs", "memory.mjs", "phone.mjs", "hosting.mjs", "specimen.mjs", "specimen-store.mjs", "background.mjs", "bin/git",
             "libexec/git-core/git-remote-http", "libexec/git-core/git-remote-https", "share/git-core/templates/info/exclude",
-            "lib/node_modules/pnpm/dist/pnpm.cjs", "lib/node_modules/npm/lib/cli.js")) {
+            "bin/npm", "bin/pnpm", "lib/node_modules/pnpm/dist/pnpm.cjs", "lib/node_modules/npm/lib/cli.js")) {
             val store = CoreStore(folder.newFolder())
             val zip = archive()
             val installed = install(store, zip)

@@ -737,6 +737,45 @@ test('Android Git runtime creates commits and clones local and HTTP repositories
   } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
 });
 
+test('Android package commands install local packages and preserve script arguments shell overrides and exit codes', { timeout: 60000 }, async () => {
+  const dir = await mkdtemp(join(directory, 'package commands '));
+  const source = join(dir, 'local package');
+  await mkdir(source);
+  await writeFile(join(source, 'package.json'), JSON.stringify({ name: 'dshx-command-test', version: '1.0.0', main: 'index.cjs' }));
+  await writeFile(join(source, 'index.cjs'), 'module.exports = "local package ready";');
+  for (const name of ['npm', 'pnpm']) {
+    const cwd = join(dir, name);
+    await mkdir(cwd);
+    await writeFile(join(cwd, 'package.json'), JSON.stringify({ private: true, scripts: {
+      probe: 'node probe.cjs', fail: 'node -e "process.exit(7)"', nested: 'npm --version && pnpm --version'
+    } }));
+    await writeFile(join(cwd, 'probe.cjs'), 'console.log(JSON.stringify(process.argv.slice(2)));');
+    const env = { ...process.env, HOME: dir, PREFIX: join(dir, 'unused prefix'),
+      PATH: `${join(core, 'bin')}:/system/bin`, npm_config_cache: join(dir, 'cache'),
+      npm_config_store_dir: join(dir, 'store'), npm_config_update_notifier: 'false' };
+    delete env.npm_config_script_shell;
+    const run = (args, extra = {}) => spawnSync(name, args, { cwd, env: { ...env, ...extra }, encoding: 'utf8', timeout: 15000 });
+    const success = result => {
+      assert.ifError(result.error);
+      assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+      return result.stdout.trim();
+    };
+    const version = JSON.parse(await readFile(join(core, 'lib/node_modules', name, 'package.json'), 'utf8')).version;
+    assert.equal(success(run(['--version'])), version);
+    const args = ['含 空格', '"引号"', '$HOME;$(exit 9)', ''];
+    const probe = success(run(['run', 'probe', ...(name === 'npm' ? ['--'] : []), ...args]));
+    assert.ok(probe.includes(JSON.stringify(args)), probe);
+    const failure = run(['run', 'fail']);
+    assert.ifError(failure.error);
+    assert.equal(failure.status, 7, `${failure.stdout}\n${failure.stderr}`);
+    success(run(['run', 'nested']));
+    assert.equal(success(run(['config', 'get', 'script-shell'], { npm_config_script_shell: '/system/bin/sh' })), '/system/bin/sh');
+    success(run([name === 'npm' ? 'install' : 'add', '--offline', '--ignore-scripts',
+      ...(name === 'npm' ? ['--no-audit', '--no-fund'] : []), source]));
+    assert.equal(createRequire(join(cwd, 'package.json'))('dshx-command-test'), 'local package ready');
+  }
+});
+
 test('Android plugin GitHub installation preserves Git sources while scripts stay disabled', async () => {
   const { runPnpm, packageManager } = await import(pathToFileURL(join(core, 'plugins.mjs')));
   const runtime = await mkdtemp(join(directory, 'plugin-github-'));

@@ -148,6 +148,15 @@ def build(abi):
                     name.startswith(("node-addon-system-linux-", "sherpa-onnx-linux-", "sharp-linux-", "sharp-libvips-linux-"))]
         modules = bundle / "lib/node_modules"
         shutil.copytree(SOURCE / "node_modules", modules, ignore=exclude, symlinks=False)
+        # 使用 Android 的 shell 和同一运行包的 Node，保留完整参数与退出码。
+        for name, entry in (("npm", "npm/bin/npm-cli.js"), ("pnpm", "pnpm/bin/pnpm.cjs")):
+            (bundle / "bin" / name).write_text(
+                '#!/system/bin/sh\n'
+                'bin=${0%/*}\n'
+                'export npm_config_script_shell="${npm_config_script_shell:-$bin/bash}"\n'
+                f'exec "$bin/node" "$bin/../lib/node_modules/{entry}" "$@"\n'
+            )
+            executables.add("bin/" + name)
         # The official WASM build keeps sharp's image pipeline available on
         # Android. Retain its bundled third-party license notice as well.
         sharp_license = bundle / "share/licenses/sharp-wasm32"
