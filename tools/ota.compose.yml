@@ -1,0 +1,9 @@
+services:
+  ota:
+    image: ${DSHX_OTA_IMAGE:-nginx:stable-alpine}
+    restart: unless-stopped
+    ports:
+      - "18088:80"
+    volumes:
+      - ./updates:/usr/share/nginx/html:ro
+      - ./ota.nginx.conf:/etc/nginx/conf.d/default.conf:ro

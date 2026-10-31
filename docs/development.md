@@ -36,6 +36,8 @@ JAVA_HOME=/usr/lib/jvm/java-17-openjdk ./gradlew :app:assembleDebug
 
 ## 安装并完成第一次对话
 
+应用内检查、下载更新及发布操作见[Android 应用在线更新](update.md)。发布文件名使用 `DSHX-arm64-${versionName}.apk`；下方 `app-debug.apk` 是 Gradle 的构建输出，发布脚本会根据包内版本生成正式下载文件名。
+
 构建成功后，开发调试安装包位于 `app/build/outputs/apk/debug/app-debug.apk`。选择与手机或模拟器架构一致的包，按设备允许的方式安装。
 
 如果使用 Android SDK 提供的 `adb`（开发机与已授权设备通信的工具），先用 `adb devices` 确认目标。只有一个目标时，在仓库根目录运行：
