@@ -3849,9 +3849,79 @@ class CoreTest {
             window.finish("unrelated")
             window.finish("root")
             assertSame(window, PhoneWindow.current)
+            assertNull("仍有手机任务时不能返回主界面", shadowOf(context).nextStartedActivity)
             window.finish("child")
             assertNull(PhoneWindow.current)
+            val returned = shadowOf(context).nextStartedActivity
+            assertNotNull("最后一个手机任务结束后必须返回 DSH", returned)
+            assertEquals(MainActivity::class.java.name, returned.component!!.className)
+            assertTrue(returned.flags and Intent.FLAG_ACTIVITY_NEW_TASK != 0)
+            assertTrue(returned.flags and Intent.FLAG_ACTIVITY_REORDER_TO_FRONT != 0)
+            assertTrue(returned.flags and Intent.FLAG_ACTIVITY_SINGLE_TOP != 0)
+            window.finish("child")
+            window.finish("unrelated")
+            assertNull("重复或无关的结束通知不能再次打开主界面", shadowOf(context).nextStartedActivity)
         } finally { window.close(); controller.destroy() }
+    }
+
+    @Test @LooperMode(LooperMode.Mode.PAUSED)
+    fun phoneWindowReturnsToDshWithoutPictureInPictureOrAccessibility() {
+        val context = RuntimeEnvironment.getApplication()
+        val manager = shadowOf(context.packageManager)
+        val window = PhoneWindow(context) { fail("display must not stop the phone") }
+        val calls = AtomicInteger()
+        val controller = phoneService()
+        try {
+            manager.setSystemFeature(android.content.pm.PackageManager.FEATURE_PICTURE_IN_PICTURE, false)
+            window.finish("unused")
+            assertNull("没有手机操作时不能打开主界面", shadowOf(context).nextStartedActivity)
+            window.show("no-pip", "device", { true }) { calls.incrementAndGet() }
+            assertEquals(1, calls.get())
+            assertNull(shadowOf(context).nextStartedActivity)
+            window.finish("no-pip")
+            assertEquals(MainActivity::class.java.name, shadowOf(context).nextStartedActivity.component!!.className)
+            controller.destroy()
+            manager.setSystemFeature(android.content.pm.PackageManager.FEATURE_PICTURE_IN_PICTURE, true)
+            window.show("no-service", "device", { true }) { calls.incrementAndGet() }
+            assertEquals(2, calls.get())
+            assertNull(shadowOf(context).nextStartedActivity)
+            window.finish("no-service")
+            assertEquals(MainActivity::class.java.name, shadowOf(context).nextStartedActivity.component!!.className)
+        } finally { window.close(); if (PhoneService.current != null) controller.destroy() }
+    }
+
+    @Test @LooperMode(LooperMode.Mode.PAUSED)
+    fun phoneWindowExpansionReturnsToDshWithoutStoppingTheTask() {
+        val context = RuntimeEnvironment.getApplication()
+        shadowOf(context.packageManager).setSystemFeature(android.content.pm.PackageManager.FEATURE_PICTURE_IN_PICTURE, true)
+        val controller = phoneService()
+        val window = PhoneWindow(context) { fail("展开小窗不能停止手机任务") }
+        val calls = AtomicInteger()
+        window.show("root", "observe", { true }) { calls.incrementAndGet() }
+        val page = Robolectric.buildActivity(PhoneWindowActivity::class.java, shadowOf(context).nextStartedActivity).create()
+        try {
+            val config = context.resources.configuration
+            page.get().onPictureInPictureModeChanged(false, config)
+            assertNull("首次显示操作页不能误判为放大小窗", shadowOf(context).nextStartedActivity)
+            page.get().onPictureInPictureModeChanged(true, config)
+            shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(300))
+            assertEquals(1, calls.get())
+            page.get().onPictureInPictureModeChanged(false, config)
+            val returned = shadowOf(context).nextStartedActivity
+            assertNotNull("放大小窗必须返回 DSH", returned)
+            assertEquals(MainActivity::class.java.name, returned.component!!.className)
+            assertTrue("放大后应关闭操作面板", page.get().isFinishing)
+            assertSame(window, PhoneWindow.current)
+            page.destroy()
+            window.show("root", "click", { true }) { calls.incrementAndGet() }
+            assertEquals("返回后手机任务仍能继续", 2, calls.get())
+            assertNull(shadowOf(context).nextStartedActivity)
+            window.finish("root")
+            assertNull(PhoneWindow.current)
+            assertEquals(MainActivity::class.java.name, shadowOf(context).nextStartedActivity.component!!.className)
+            page.get().onPictureInPictureModeChanged(false, config)
+            assertNull("页面关闭后的模式通知不能再次打开 DSH", shadowOf(context).nextStartedActivity)
+        } finally { window.close(); if (!page.get().isDestroyed) page.destroy(); controller.destroy() }
     }
 
     @Test @LooperMode(LooperMode.Mode.PAUSED)

@@ -49,11 +49,6 @@ internal class PhoneWindow(context: Context, private val stopPhone: () -> Unit) 
 
     fun show(session: String, method: String, valid: () -> Boolean, run: () -> Unit) {
         check(Looper.myLooper() == Looper.getMainLooper())
-        // 普通设备能力在没有无障碍时仍可用；系统不支持画中画时也不阻断原有能力。
-        if (PhoneService.current == null || !context.packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)) {
-            run()
-            return
-        }
         if (current !== this) {
             current?.close()
             current = this
@@ -63,6 +58,11 @@ internal class PhoneWindow(context: Context, private val stopPhone: () -> Unit) 
             history = emptyList()
         }
         owners[session] = valid
+        // 无法显示小窗时仍登记任务，结束后同样返回 DSH。
+        if (PhoneService.current == null || !context.packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)) {
+            run()
+            return
+        }
         count++
         title = label(method)
         history = (history + Step(count, title.removePrefix("正在"), SystemClock.elapsedRealtime())).takeLast(3)
@@ -109,8 +109,14 @@ internal class PhoneWindow(context: Context, private val stopPhone: () -> Unit) 
     }
 
     fun finish(session: String) {
-        owners.remove(session)
-        if (owners.isEmpty()) close()
+        if (owners.remove(session) == null || owners.isNotEmpty()) return
+        close()
+        openApp()
+    }
+
+    fun openApp() {
+        context.startActivity(Intent(context, MainActivity::class.java).addFlags(
+            Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or Intent.FLAG_ACTIVITY_SINGLE_TOP))
     }
 
     fun stop() { stopPhone(); close() }

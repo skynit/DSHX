@@ -257,6 +257,11 @@ class PhoneWindowActivity : Activity() {
 
     override fun onPictureInPictureModeChanged(small: Boolean, config: Configuration) {
         super.onPictureInPictureModeChanged(small, config)
+        if (!small && entered && !closing && !isFinishing) {
+            state?.openApp()
+            closeWindow()
+            return
+        }
         render()
         if (small) { entered = true; state?.entered() }
     }
