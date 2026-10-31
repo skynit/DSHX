@@ -2859,6 +2859,19 @@ class CoreTest {
         } finally { page.destroy() }
     }
 
+    private val commandFiles = listOf(
+        "bin/npx", "bin/pnpx", "bin/coreutils", "bin/env", "bin/sh", "bin/curl", "bin/jq", "bin/sqlite3",
+        "bin/python3", "bin/pip", "bin/pip3", "bin/ssh", "bin/scp", "bin/sftp", "bin/ssh-keygen",
+        "bin/ssh-keyscan", "bin/ssh-agent", "bin/ssh-add", "bin/rsync", "bin/find", "bin/xargs", "bin/diff",
+        "bin/patch", "bin/tar", "bin/gzip", "bin/zip", "bin/unzip", "bin/libstdbuf.so",
+        "libexec/dshx/ssh", "libexec/dshx/scp", "libexec/dshx/sftp", "libexec/dshx/rsync",
+        "libexec/dshx/ssh-keygen", "libexec/dshx/ssh-agent", "etc/ssh/ssh_config",
+        "lib/libtermux-exec-ld-preload.so", "lib/libtermux-exec.so", "lib/libtermux-exec_nos_c_tre.so",
+        "lib/python3.14/encodings/__init__.py", "lib/python3.14/venv/__init__.py", "lib/python3.14/site-packages/pip/__main__.py",
+        "lib/node_modules/npm/bin/npx-cli.js", "lib/node_modules/pnpm/bin/pnpx.cjs",
+        "bin/python", "bin/gunzip", "bin/zcat", "bin/zipinfo", "bin/diff3", "bin/cmp", "bin/sdiff", "bin/sort"
+    )
+
     private val contents = linkedMapOf(
         "bin/node" to "node".toByteArray(),
         "bin/npm" to "npm launcher".toByteArray(),
@@ -2892,7 +2905,7 @@ class CoreTest {
         "android.patch.yml" to "patch".toByteArray(),
         "guard.mjs" to "guard".toByteArray(),
         "native.node" to "native".toByteArray()
-    )
+    ).apply { commandFiles.forEach { put(it, it.toByteArray()) } }
 
     private fun archive(files: Map<String, ByteArray> = contents): ByteArray {
         val output = ByteArrayOutputStream()
@@ -2908,7 +2921,7 @@ class CoreTest {
 
     private fun manifest(zip: ByteArray, files: Map<String, ByteArray> = contents, version: String = "test-1"): CoreStore.Manifest {
         val entries = files.mapValues { (name, bytes) -> CoreStore.Entry(bytes.size.toLong(), hash(bytes),
-            name in listOf("bin/node", "bin/npm", "bin/pnpm", "bin/git", "libexec/git-core/git-remote-http", "libexec/git-core/git-remote-https")) }
+            name.startsWith("bin/") && !name.endsWith(".so") || name.startsWith("libexec/")) }
         return CoreStore.Manifest(version, "x86_64", hash(zip), zip.size.toLong(), entries)
     }
 
@@ -2967,7 +2980,7 @@ class CoreTest {
     @Test fun missingPluginLauncherRequiresRepairWithoutScanningOtherFiles() {
         for (name in listOf("start.mjs", "plugins.mjs", "memory.mjs", "phone.mjs", "hosting.mjs", "specimen.mjs", "specimen-store.mjs", "background.mjs", "bin/git",
             "libexec/git-core/git-remote-http", "libexec/git-core/git-remote-https", "share/git-core/templates/info/exclude",
-            "bin/npm", "bin/pnpm", "lib/node_modules/pnpm/dist/pnpm.cjs", "lib/node_modules/npm/lib/cli.js")) {
+            "bin/npm", "bin/pnpm", "lib/node_modules/pnpm/dist/pnpm.cjs", "lib/node_modules/npm/lib/cli.js") + commandFiles) {
             val store = CoreStore(folder.newFolder())
             val zip = archive()
             val installed = install(store, zip)

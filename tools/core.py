@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import tempfile
 import zipfile
+import runtime
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "core"
@@ -26,14 +27,24 @@ def digest(path):
 def download(item):
     target = CACHE / (item["sha256"] + ".deb")
     if not target.is_file() or digest(target) != item["sha256"]:
-        staging = target.with_suffix(".part")
+        handle, path = tempfile.mkstemp(prefix=item["sha256"] + "-", suffix=".part", dir=CACHE)
+        os.close(handle)
+        staging = Path(path)
         # Both domains are Termux's official package endpoints. The pinned hash,
         # rather than the selected endpoint, determines the accepted bytes.
-        url = item["url"].replace("packages.termux.dev", "packages-cf.termux.dev")
-        subprocess.run(["curl", "-fLsS", "--retry", "3", "--max-time", "240", url, "-o", str(staging)], check=True)
-        if digest(staging) != item["sha256"]:
-            raise ValueError("Termux package hash mismatch: " + item["url"])
-        staging.replace(target)
+        urls = [item["url"], item["url"].replace("packages.termux.dev", "packages-cf.termux.dev")]
+        try:
+            for index, url in enumerate(urls):
+                result = subprocess.run(["curl", "-fLsS", "--retry", "1", "--max-time", "240", url, "-o", str(staging)])
+                if result.returncode == 0:
+                    break
+                if index == len(urls) - 1:
+                    result.check_returncode()
+            if digest(staging) != item["sha256"]:
+                raise ValueError("Termux package hash mismatch: " + item["url"])
+            staging.replace(target)
+        finally:
+            staging.unlink(missing_ok=True)
     return target
 
 
@@ -43,8 +54,8 @@ def copy_libraries(usr, bundle):
     system = {"libc.so", "libdl.so", "libm.so", "liblog.so", "libandroid.so"}
     pending = []
     for file in bundle.rglob("*"):
-        if file.is_file() and (file.parent == bundle / "bin" or
-                               file.is_relative_to(bundle / "libexec") or file.suffix == ".node"):
+        if file.is_file() and (file.parent == bundle / "bin" or file.is_relative_to(bundle / "libexec") or
+                               file.suffix in (".node", ".so")):
             with file.open("rb") as handle:
                 if handle.read(4) == b"\x7fELF":
                     pending.append(file)
@@ -131,6 +142,7 @@ def build(abi):
         for name in ("node", "bash", "rg"):
             shutil.copy2(usr / "bin" / name, bundle / "bin" / name)
         executables.update(copy_git(usr, bundle))
+        executables.update(runtime.install(usr, bundle))
         cert = bundle / "etc/tls/cert.pem"
         cert.parent.mkdir(parents=True)
         shutil.copy2(usr / "etc/tls/cert.pem", cert)
@@ -149,7 +161,8 @@ def build(abi):
         modules = bundle / "lib/node_modules"
         shutil.copytree(SOURCE / "node_modules", modules, ignore=exclude, symlinks=False)
         # 使用 Android 的 shell 和同一运行包的 Node，保留完整参数与退出码。
-        for name, entry in (("npm", "npm/bin/npm-cli.js"), ("pnpm", "pnpm/bin/pnpm.cjs")):
+        for name, entry in (("npm", "npm/bin/npm-cli.js"), ("pnpm", "pnpm/bin/pnpm.cjs"),
+                            ("npx", "npm/bin/npx-cli.js"), ("pnpx", "pnpm/bin/pnpx.cjs")):
             (bundle / "bin" / name).write_text(
                 '#!/system/bin/sh\n'
                 'bin=${0%/*}\n'
@@ -514,7 +527,7 @@ def build(abi):
                 with file.open("rb") as handle:
                     if handle.read(4) == b"\x7fELF":
                         relative = file.relative_to(bundle).as_posix()
-                        if relative not in executables | {"native.node"} and not relative.startswith("lib/"):
+                        if relative not in executables | {"native.node", "bin/libstdbuf.so"} and not relative.startswith("lib/"):
                             raise ValueError("Unexpected native executable: " + relative)
                         info = subprocess.check_output(["readelf", "-lW", str(file)], text=True)
                         loads = [line for line in info.splitlines() if line.strip().startswith("LOAD")]
@@ -536,10 +549,10 @@ def build(abi):
                 with file.open("rb") as source, output.open(entry, "w") as target:
                     shutil.copyfileobj(source, target)
         manifest = {
-            "format": 1, "version": "dsh-0.2.1-rc.2-android.1-" + abi,
+            "format": 1, "version": "dsh-0.2.1-rc.2-a2-" + abi,
             "abi": abi, "sha256": digest(archive), "archiveSize": archive.stat().st_size,
             "dsh": "0.2.1-rc.2", "node": packages["nodejs-lts"]["version"],
-            "tools": {name: packages[name]["version"] for name in ("bash", "ripgrep", "git")},
+            "tools": {name: packages[name]["version"] for name in ("bash", "ripgrep", "git", *runtime.PACKAGES)},
             "nodePty": json.loads((SOURCE / "node_modules/node-pty/package.json").read_text())["version"],
             "pnpm": json.loads((SOURCE / "node_modules/pnpm/package.json").read_text())["version"],
             "npm": json.loads((SOURCE / "node_modules/npm/package.json").read_text())["version"],

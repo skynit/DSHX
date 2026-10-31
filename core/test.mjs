@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:net';
 import { createServer as createHttpServer } from 'node:http';
+import { createServer as createHttpsServer } from 'node:https';
 import { createHash } from 'node:crypto';
 import { gzipSync } from 'node:zlib';
 import { pathToFileURL } from 'node:url';
@@ -737,6 +738,96 @@ test('Android Git runtime creates commits and clones local and HTTP repositories
   } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
 });
 
+async function runtimeCommand(name, args, options = {}) {
+  const { status = 0, input, ...spawnOptions } = options;
+  const child = spawn(name.includes('/') ? name : join(core, 'bin', name), args, {
+    env: { ...process.env, PATH: `${join(core, 'bin')}:/system/bin` }, ...spawnOptions,
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
+  let stdout = '', stderr = '';
+  child.stdout.on('data', chunk => { stdout += chunk; });
+  child.stderr.on('data', chunk => { stderr += chunk; });
+  child.stdin.end(input);
+  const timer = setTimeout(() => child.kill('SIGKILL'), 30000);
+  try {
+    const code = await new Promise((resolve, reject) => {
+      child.once('error', reject); child.once('exit', resolve);
+    });
+    assert.equal(code, status, `${name}: ${stdout}\n${stderr}`);
+    return stdout;
+  } finally { clearTimeout(timer); }
+}
+
+test('Android runtime tools process JSON databases GNU commands archives and HTTP', { timeout: 60000 }, async () => {
+  const dir = await mkdtemp(join(directory, 'runtime tools '));
+  assert.equal((await runtimeCommand('jq', ['-r', '.items | sort | join(",")'], { input: '{"items":["乙","甲"]}' })).trim(), '乙,甲');
+  const database = join(dir, 'records.db');
+  assert.equal((await runtimeCommand('sqlite3', [database, "create table note(text); insert into note values('本地数据库'); select text from note;"])).trim(), '本地数据库');
+  const original = join(dir, 'note.txt');
+  await writeFile(original, '旧内容\n');
+  await runtimeCommand('patch', [original], { input: '--- note.txt\n+++ note.txt\n@@ -1 +1 @@\n-旧内容\n+新内容\n' });
+  assert.equal(await readFile(original, 'utf8'), '新内容\n');
+  const changed = join(dir, 'changed.txt'); await writeFile(changed, '另一份内容\n');
+  assert.match(await runtimeCommand('diff', ['-u', original, changed], { status: 1 }), /另一份内容/);
+  assert.equal((await runtimeCommand('sort', ['-u'], { input: 'b\na\nb\n' })).trim(), 'a\nb');
+  assert.match(await runtimeCommand('find', [dir, '-name', '*.txt']), /note\.txt/);
+  assert.equal((await runtimeCommand('xargs', ['-0', 'printf', '<%s>'], { input: '含 空格\0第二项\0' })).trim(), '<含 空格><第二项>');
+  assert.match(await runtimeCommand('sha256sum', [original]), /^[0-9a-f]{64} /);
+  assert.equal(await runtimeCommand('stdbuf', ['-oL', 'printf', 'buffer ready']), 'buffer ready');
+  await runtimeCommand('gzip', ['-k', original]);
+  assert.equal(await runtimeCommand('zcat', [original + '.gz']), '新内容\n');
+  await rm(original);
+  await runtimeCommand('gunzip', [original + '.gz']);
+  await runtimeCommand('tar', ['-czf', join(dir, 'notes.tar.gz'), '-C', dir, 'note.txt']);
+  const tarOutput = join(dir, 'tar output'); await mkdir(tarOutput);
+  await runtimeCommand('tar', ['-xzf', join(dir, 'notes.tar.gz'), '-C', tarOutput]);
+  assert.equal(await readFile(join(tarOutput, 'note.txt'), 'utf8'), '新内容\n');
+  await runtimeCommand('zip', ['-q', join(dir, 'notes.zip'), 'note.txt'], { cwd: dir });
+  const zipOutput = join(dir, 'zip output'); await mkdir(zipOutput);
+  await runtimeCommand('unzip', ['-q', join(dir, 'notes.zip'), '-d', zipOutput]);
+  assert.equal(await readFile(join(zipOutput, 'note.txt'), 'utf8'), '新内容\n');
+  assert.equal((await runtimeCommand('zipinfo', ['-1', join(dir, 'notes.zip')])).trim(), 'note.txt');
+  const server = createHttpServer((req, res) => { res.setHeader('Content-Type', 'application/json'); res.end('{"ok":true}'); });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    assert.equal(await runtimeCommand('curl', ['--fail', '--silent', '--show-error', `http://127.0.0.1:${server.address().port}/`]), '{"ok":true}');
+  } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
+  assert.ok(process.env.DSHX_TEST_TLS_CERT && process.env.DSHX_TEST_TLS_KEY, 'Provide the temporary localhost TLS certificate');
+  const tls = createHttpsServer({ cert: await readFile(process.env.DSHX_TEST_TLS_CERT), key: await readFile(process.env.DSHX_TEST_TLS_KEY) },
+    (req, res) => res.end('tls ready'));
+  await new Promise(resolve => tls.listen(0, '127.0.0.1', resolve));
+  try {
+    const url = `https://127.0.0.1:${tls.address().port}/`;
+    assert.equal(await runtimeCommand('curl', ['--fail', '--silent', '--show-error', '--cacert', process.env.DSHX_TEST_TLS_CERT, url]), 'tls ready');
+    await runtimeCommand('curl', ['--silent', '--show-error', url], { status: 60 });
+    assert.equal((await runtimeCommand('python3', ['-c', 'import ssl,urllib.request,sys; print(urllib.request.urlopen(sys.argv[1], context=ssl.create_default_context(cafile=sys.argv[2])).read().decode())',
+      url, process.env.DSHX_TEST_TLS_CERT])).trim(), 'tls ready');
+  } finally { tls.closeAllConnections(); await new Promise(resolve => tls.close(resolve)); }
+});
+
+test('Android runtime Python loads standard extensions creates venv and installs an offline wheel', { timeout: 90000 }, async () => {
+  const dir = await mkdtemp(join(directory, 'python tools '));
+  const code = 'import ssl,sqlite3,ctypes,bz2,lzma,zlib,hashlib,dbm.gnu,multiprocessing; print("stdlib ready")';
+  assert.equal((await runtimeCommand('python3', ['-c', code])).trim(), 'stdlib ready');
+  assert.match(await runtimeCommand('pip', ['--version']), /^pip /);
+  const script = join(dir, 'script');
+  await writeFile(script, '#!/usr/bin/env python3\nprint("shebang ready")\n', { mode: 0o700 });
+  assert.equal((await runtimeCommand('bash', ['-c', '"$1"', 'test', script])).trim(), 'shebang ready');
+  const venv = join(dir, 'venv');
+  await runtimeCommand('python3', ['-m', 'venv', venv]);
+  const python = join(venv, 'bin/python');
+  const wheel = join(dir, 'dshx_test-1.0-py3-none-any.whl');
+  await runtimeCommand('python3', ['-c', 'import sys,zipfile; z=zipfile.ZipFile(sys.argv[1],"w"); '
+    + 'z.writestr("dshx_test.py","value = 42\\n"); '
+    + 'z.writestr("dshx_test-1.0.dist-info/METADATA","Metadata-Version: 2.1\\nName: dshx-test\\nVersion: 1.0\\n"); '
+    + 'z.writestr("dshx_test-1.0.dist-info/WHEEL","Wheel-Version: 1.0\\nGenerator: dshx-test\\nRoot-Is-Purelib: true\\nTag: py3-none-any\\n"); '
+    + 'z.writestr("dshx_test-1.0.dist-info/RECORD",""); z.close()', wheel]);
+  await runtimeCommand(python, ['-m', 'pip', 'install', '--no-index', '--disable-pip-version-check', wheel]);
+  assert.equal((await runtimeCommand(python, ['-c', 'import sys,dshx_test; assert sys.prefix != sys.base_prefix; print(dshx_test.value)'])).trim(), '42');
+  assert.equal((await runtimeCommand('bash', ['-c', '"$1/bin/pip" --version', 'test', venv])).includes(venv), true);
+  await runtimeCommand('python3', ['-c', 'import importlib.util; assert importlib.util.find_spec("dshx_test") is None']);
+});
+
 test('Android package commands install local packages and preserve script arguments shell overrides and exit codes', { timeout: 60000 }, async () => {
   const dir = await mkdtemp(join(directory, 'package commands '));
   const source = join(dir, 'local package');
@@ -773,6 +864,72 @@ test('Android package commands install local packages and preserve script argume
     success(run([name === 'npm' ? 'install' : 'add', '--offline', '--ignore-scripts',
       ...(name === 'npm' ? ['--no-audit', '--no-fund'] : []), source]));
     assert.equal(createRequire(join(cwd, 'package.json'))('dshx-command-test'), 'local package ready');
+  }
+});
+
+test('Android package runners execute a local command with an env shebang', { timeout: 60000 }, async () => {
+  const dir = await mkdtemp(join(directory, 'package runners '));
+  const source = join(dir, 'package'); await mkdir(source);
+  await writeFile(join(source, 'package.json'), JSON.stringify({
+    name: 'dshx-runner-test', version: '1.0.0', bin: { 'dshx-runner-test': 'cli.cjs' }
+  }));
+  await writeFile(join(source, 'cli.cjs'), '#!/usr/bin/env node\nconsole.log(JSON.stringify(process.argv.slice(2)));\n', { mode: 0o700 });
+  const archive = join(dir, 'package.tgz');
+  await runtimeCommand('tar', ['-czf', archive, '-C', dir, 'package']);
+  const env = { ...process.env, HOME: dir, PATH: `${join(core, 'bin')}:/system/bin`,
+    npm_config_cache: join(dir, 'npm cache'), npm_config_store_dir: join(dir, 'pnpm store'),
+    npm_config_update_notifier: 'false', npm_config_script_shell: join(core, 'bin/bash'), CI: 'true' };
+  const args = ['含 空格', '$HOME;$(exit 9)', ''];
+  for (const name of ['npx', 'pnpx']) {
+    const result = await runtimeCommand(name, [...(name === 'npx' ? ['--yes', '--offline'] : []),
+      `--package=file:${archive}`, 'dshx-runner-test', ...args], { cwd: dir, env });
+    assert.ok(result.includes(JSON.stringify(args)), result);
+  }
+});
+
+test('Android runtime SSH creates keys honors user config transfers files and synchronizes through SSH', { timeout: 90000 }, async () => {
+  assert.ok(process.env.DSHX_TEST_SSH_PORT, 'Provide the temporary loopback SSH test service');
+  const dir = await mkdtemp(join(directory, 'ssh tools '));
+  const home = join(dir, 'home'); await mkdir(home);
+  const env = { ...process.env, HOME: home, PATH: `${join(core, 'bin')}:/system/bin` };
+  await runtimeCommand('ssh-keygen', ['-q', '-t', 'ed25519', '-N', ''], { env });
+  await stat(join(home, '.ssh/id_ed25519.pub'));
+  const config = ['Host dshx-runtime-test', '    HostName 127.0.0.1', `    Port ${process.env.DSHX_TEST_SSH_PORT}`, '    ConnectTimeout 5',
+    `    User ${process.env.DSHX_TEST_SSH_USER}`, `    IdentityFile "${process.env.DSHX_TEST_SSH_KEY}"`,
+    '    BatchMode yes', '    StrictHostKeyChecking yes', `    UserKnownHostsFile "${process.env.DSHX_TEST_SSH_HOSTS}"`].join('\n') + '\n';
+  await writeFile(join(home, '.ssh/config'), config, { mode: 0o600 });
+  const settings = await runtimeCommand('ssh', ['-G', 'dshx-runtime-test'], { env });
+  assert.match(settings, /hostname 127\.0\.0\.1/);
+  assert.ok(settings.includes(`userknownhostsfile ${process.env.DSHX_TEST_SSH_HOSTS}`), settings);
+  assert.match(await runtimeCommand('ssh-keyscan', ['-T', '5', '-t', 'ed25519', '-p', process.env.DSHX_TEST_SSH_PORT, '127.0.0.1'], { env }), /ssh-ed25519 /);
+  assert.equal((await runtimeCommand('ssh', ['dshx-runtime-test', 'printf remote-ready'], { env })).trim(), 'remote-ready');
+  await runtimeCommand('ssh', ['dshx-runtime-test', 'exit 7'], { env, status: 7 });
+  const source = join(dir, 'source.txt'); await writeFile(source, 'SSH 文件传输\n');
+  const remote = process.env.DSHX_TEST_SSH_ROOT;
+  await runtimeCommand('scp', [source, `dshx-runtime-test:${remote}/remote/scp.txt`], { env });
+  const download = join(dir, 'download.txt');
+  await runtimeCommand('sftp', ['-b', '-', 'dshx-runtime-test'], {
+    env, input: `get ${remote}/remote/scp.txt "${download}"\nput "${source}" ${remote}/remote/sftp.txt\n`
+  });
+  assert.equal(await readFile(download, 'utf8'), 'SSH 文件传输\n');
+  const local = join(dir, 'sync'); await mkdir(local); await writeFile(join(local, 'note.txt'), '同步内容\n');
+  await runtimeCommand('rsync', ['-r', local + '/', `dshx-runtime-test:${remote}/remote/sync/`], { env });
+  const received = join(dir, 'received'); await mkdir(received);
+  await runtimeCommand('rsync', ['-r', `dshx-runtime-test:${remote}/remote/sync/`, received + '/'], { env });
+  assert.equal(await readFile(join(received, 'note.txt'), 'utf8'), '同步内容\n');
+  const socket = join(dir, 'agent.sock');
+  const agent = spawn(join(core, 'bin/ssh-agent'), ['-D', '-a', socket], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+  let output = ''; agent.stderr.on('data', chunk => { output += chunk; });
+  try {
+    for (let count = 0; count < 100; count++) {
+      try { await stat(socket); break; } catch { await delay(20); }
+    }
+    assert.equal(agent.exitCode, null, output);
+    const agentEnv = { ...env, SSH_AUTH_SOCK: socket };
+    await runtimeCommand('ssh-add', [join(home, '.ssh/id_ed25519')], { env: agentEnv });
+    assert.match(await runtimeCommand('ssh-add', ['-l'], { env: agentEnv }), /ED25519/);
+  } finally {
+    if (agent.exitCode === null) { agent.kill('SIGTERM'); await new Promise(resolve => agent.once('exit', resolve)); }
   }
 });
 

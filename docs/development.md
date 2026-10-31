@@ -62,6 +62,8 @@ JAVA_HOME=/usr/lib/jvm/java-17-openjdk ./gradlew :app:testDebugUnitTest \
 
 Node 适配测试集中在 `core/test.mjs`，依赖已经构建或安装、与当前源码一致的运行目录。`DSHX_CORE` 指向该目录，`DSHX_WORKSPACE` 指向可写测试工作区；需要 Android 原生库的测试必须在对应环境执行，不能直接把开发机 `core/` 当作手机运行目录。使用 `--test-name-pattern` 选择涉及模块的用例，应先核对所选测试需要的运行目录与平台，不能把开发机包内的依赖当作已构建的 Android 环境。
 
+预装命令环境选择 `^Android (runtime|package commands|package runners|Git runtime|terminal persistent|plugin manager|plugin registry)`；覆盖本地 HTTP/HTTPS、JSON、数据库、GNU 命令、归档压缩、Python 标准库与离线虚拟环境、npm/pnpm 安装、npx/pnpx 脚本、SSH 文件传输及现有插件、终端行为。运行测试的进程应继承 `Engine` 配置的兼容库、证书、Python 缓存和 Git 环境。HTTPS 用例通过 `DSHX_TEST_TLS_CERT`、`DSHX_TEST_TLS_KEY` 指定设备上的临时证书和密钥，证书须包含 `127.0.0.1` 的 IP 地址；同时验证信任该证书时连接成功，默认信任库拒绝该测试证书。SSH 用例需要独立的本机临时服务，通过 ADB 反向转发暴露到设备的 `127.0.0.1`，并设置 `DSHX_TEST_SSH_PORT`、`DSHX_TEST_SSH_USER`、`DSHX_TEST_SSH_ROOT`、`DSHX_TEST_SSH_KEY`、`DSHX_TEST_SSH_HOSTS`。这些变量分别指定端口、测试用户、远端临时目录、设备上的临时客户端密钥和已知主机文件；仅使用本轮生成的测试密钥，不读取用户凭据，结束后清理本轮服务、映射和临时文件。
+
 后台托管只选择 `^Android hosting` 适配用例，以及 `CoreTest` 中的状态查询、运行包缺失修复和服务恢复相关用例。测试中的本地模型适配器、虚拟时钟和手机回执用于验证执行流程，不代表真实服务商或实体手机验收。
 
 实验体优化只选 `^Android (hosting|memory local specimen|assistant usage)`，覆盖来源、后台竞争、预算、目标与复用；原生选择 `specimenSkillAdoptionIsDurableIdempotentAndKeepsUserEdits`、`specimenDraftsSurviveRefreshAndInvalidDraftsDoNotPreventStopping` 及实际受影响的技能、桥接、运行包修复方法。新增模块 `specimen.mjs`、`specimen-store.mjs`、`background.mjs` 必须同时包含在构建清单和启动必需文件检查中。模拟器上运行同组测试时使用 APK 实际安装的对应架构运行目录，固定模型与手机回执仍不代表真实服务商或真实手机动作。
@@ -70,7 +72,7 @@ Node 适配测试集中在 `core/test.mjs`，依赖已经构建或安装、与�
 
 ## 构建模块如何协作
 
-[`tools/core.py`](../tools/core.py) 是运行包构建入口：执行锁定依赖的 `npm ci --omit=dev --ignore-scripts`，校验固定 Termux 包，提取 Android Node、bash、rg、Git、Git 传输助手与模板、证书和实际依赖库；保留官方网页与许可，移除不适用的桌面原生二进制及 LibreOffice 打包内容；按固定锚点应用 Android 补丁，使用 NDK 编译 `native.node`、`dshx-run` 和 PTY 扩展，再检查原生文件的 16KB 对齐，生成三个资源文件。**NDK** 是开发者安装的 Android 原生编译工具集，负责把 C/C++ 编译成目标架构库；对齐检查不是 16KB 真机功能验收。
+[`tools/core.py`](../tools/core.py) 是运行包构建入口：执行锁定依赖的 `npm ci --omit=dev --ignore-scripts`，校验固定 Termux 包，提取 Android Node、bash、rg、Git、Git 传输助手与模板、证书和实际依赖库，并调用 [`tools/runtime.py`](../tools/runtime.py) 安装[预装命令环境](runtime.md#预装命令环境)；保留官方网页与许可，移除不适用的桌面原生二进制及 LibreOffice 打包内容；按固定锚点应用 Android 补丁，使用 NDK 编译 `native.node`、`dshx-run` 和 PTY 扩展，再检查原生文件的 16KB 对齐，生成三个资源文件。**NDK** 是开发者安装的 Android 原生编译工具集，负责把 C/C++ 编译成目标架构库；对齐检查不是 16KB 真机功能验收。
 
 构建补丁除注册项目模块，还适配上游文件和搜索、最终工具准入、默认 Full、附件发布、用户手动终端、插件失败恢复、人设、模型用量与 `storages` 路径。补丁要求目标片段唯一匹配；上游版本变更导致锚点不符时构建停止，不能静默忽略。
 

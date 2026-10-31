@@ -21,7 +21,8 @@ class CoreStore(private val root: File) {
         val abi: String,
         val archiveHash: String,
         val archiveSize: Long,
-        val entries: Map<String, Entry>
+        val entries: Map<String, Entry>,
+        val executables: List<String> = entries.filterValues { it.executable }.keys.toList()
     ) {
         val totalSize: Long get() = entries.values.sumOf { it.size }
 
@@ -58,7 +59,7 @@ class CoreStore(private val root: File) {
         if (Files.isSymbolicLink(root.toPath()) || Files.isSymbolicLink(base) ||
             !Files.isRegularFile(marker, NOFOLLOW_LINKS) || Files.size(marker) != manifest.archiveHash.length.toLong() ||
             marker.toFile().readText() != manifest.archiveHash) return null
-        for (name in startupFiles) {
+        for (name in (startupFiles + manifest.executables).distinct()) {
             checkCancel(cancelled)
             val entry = manifest.entries[name] ?: return null
             val path = base.resolve(name)
@@ -234,6 +235,15 @@ class CoreStore(private val root: File) {
             "lib/node_modules/@deepseek-ai/dsh/lib/bin.js",
             "lib/node_modules/pnpm/bin/pnpm.cjs", "lib/node_modules/pnpm/dist/pnpm.cjs",
             "lib/node_modules/npm/bin/npm-cli.js", "lib/node_modules/npm/lib/cli.js",
+            "bin/npx", "bin/pnpx", "bin/coreutils", "bin/env", "bin/sh", "bin/curl", "bin/jq", "bin/sqlite3",
+            "bin/python3", "bin/pip", "bin/pip3", "bin/ssh", "bin/scp", "bin/sftp", "bin/ssh-keygen",
+            "bin/ssh-keyscan", "bin/ssh-agent", "bin/ssh-add", "bin/rsync", "bin/find", "bin/xargs", "bin/diff",
+            "bin/patch", "bin/tar", "bin/gzip", "bin/zip", "bin/unzip", "bin/libstdbuf.so",
+            "libexec/dshx/ssh", "libexec/dshx/scp", "libexec/dshx/sftp", "libexec/dshx/rsync",
+            "libexec/dshx/ssh-keygen", "libexec/dshx/ssh-agent", "etc/ssh/ssh_config",
+            "lib/libtermux-exec-ld-preload.so", "lib/libtermux-exec.so", "lib/libtermux-exec_nos_c_tre.so",
+            "lib/python3.14/encodings/__init__.py", "lib/python3.14/venv/__init__.py", "lib/python3.14/site-packages/pip/__main__.py",
+            "lib/node_modules/npm/bin/npx-cli.js", "lib/node_modules/pnpm/bin/pnpx.cjs",
             "android.patch.yml", "guard.mjs", "native.node"
         )
 
