@@ -210,6 +210,13 @@ def build(abi):
               "\t\t\tapply$2(ctx, config.office);",
               "\t\t\t// Office conversion is not bundled on Android.")
 
+        # Android 没有桌面 Documents 目录；仍由上游负责首次登记、持久化和历史检查。
+        patch("@deepseek-ai/dsh-api-workspace-controller/lib/index.js",
+              '\tsignal.throwIfAborted();\n\tlet directory = documentsDirectory;',
+              '\tsignal.throwIfAborted();\n'
+              '\tif (process.env.DSHX_WORKSPACE !== void 0) return validateDocumentsDirectory(process.env.DSHX_WORKSPACE);\n'
+              '\tlet directory = documentsDirectory;')
+
         # A restarted engine uses a new origin. Seed only the selected session;
         # all execution grants still come from the authenticated native bridge.
         patch("@deepseek-ai/dsh-client-ui-workspace/lib/client.js",

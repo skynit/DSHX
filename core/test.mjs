@@ -27,6 +27,107 @@ after(() => rm(directory, { recursive: true, force: true }));
 const workspace = await mkdtemp(join(process.env.DSHX_WORKSPACE, 'dshx-test-'));
 after(() => rm(workspace, { recursive: true, force: true }));
 
+async function workspaceFixture(t, dir) {
+  const { Context } = await load('@deepseek-ai/cordis');
+  const { WorkspaceController } = await load('@deepseek-ai/dsh-api-workspace-controller');
+  const ctx = new Context();
+  t.after(() => ctx.fiber.dispose());
+  await ctx.plugin((await load('@deepseek-ai/dsh-storage')).default);
+  await ctx.plugin(await load('@deepseek-ai/dsh-storage-json'), { root: join(dir, 'storages') });
+  await ctx.plugin(await load('@deepseek-ai/dsh-storage-domain'), { backend: 'json' });
+  await ctx.plugin((await load('@deepseek-ai/dsh-session')).default);
+  await ctx.plugin(await load('@deepseek-ai/dsh-session-persistence-jsonl'), { root: join(dir, 'sessions') });
+  await ctx.plugin((await load('@deepseek-ai/dsh-workspace')).default);
+  // 直接执行真实初始化命令和登记逻辑，无需启动远程通信服务。
+  const initialize = signal => WorkspaceController.prototype.initializeDefault.call({ ctx,
+    config: { documentsDirectory: join(dir, 'Documents'), documentsLookupTimeoutMs: 1000 } }, signal ?? new AbortController().signal);
+  return { ctx, initialize };
+}
+
+test('Android workspace creates the app directory and reuses its registration across restarts', async t => {
+  const dir = await mkdtemp(join(directory, 'workspace-default-'));
+  const previous = process.env.DSHX_WORKSPACE;
+  process.env.DSHX_WORKSPACE = join(dir, 'workspace');
+  try {
+    const first = await workspaceFixture(t, dir);
+    const result = await first.initialize();
+    assert.equal(result.workspace.path, await realpath(process.env.DSHX_WORKSPACE));
+    assert.equal(result.workspace.title, 'workspace');
+    assert.equal((await stat(process.env.DSHX_WORKSPACE)).isDirectory(), true);
+    assert.equal(first.ctx.sessions.list().length, 0, 'registration must not create a session');
+    const project = first.ctx.workspaceRegistry.get(result.workspace.workspaceId);
+    await project.setTitle('我的工作区');
+    await writeFile(join(project.path, 'notes.txt'), '保留工作文件');
+    await first.ctx.fiber.dispose();
+    const second = await workspaceFixture(t, dir);
+    const reopened = await second.initialize();
+    assert.equal(reopened.workspace.workspaceId, result.workspace.workspaceId);
+    assert.equal(reopened.workspace.title, '我的工作区');
+    assert.equal(second.ctx.workspaceRegistry.list().length, 1);
+    assert.equal(await readFile(join(project.path, 'notes.txt'), 'utf8'), '保留工作文件');
+    await second.ctx.workspaceRegistry.delete(project.id);
+    await second.ctx.fiber.dispose();
+    const third = await workspaceFixture(t, dir);
+    assert.equal(await third.initialize(), undefined, 'deleting the default must not recreate it');
+    assert.equal(await readFile(join(project.path, 'notes.txt'), 'utf8'), '保留工作文件');
+  } finally { process.env.DSHX_WORKSPACE = previous; }
+});
+
+test('Android workspace preserves an existing directory and retries conflicts without committing a default', async t => {
+  const dir = await mkdtemp(join(directory, 'workspace-retry-'));
+  const previous = process.env.DSHX_WORKSPACE;
+  const target = join(dir, 'workspace');
+  process.env.DSHX_WORKSPACE = target;
+  try {
+    const f = await workspaceFixture(t, dir);
+    await writeFile(target, '同名文件');
+    await assert.rejects(f.initialize(), { code: 'EEXIST' });
+    assert.equal(f.ctx.workspaceRegistry.list().length, 0);
+    assert.equal(await readFile(target, 'utf8'), '同名文件');
+    process.env.DSHX_WORKSPACE = 'relative/workspace';
+    await assert.rejects(f.initialize(), /fully qualified/);
+    process.env.DSHX_WORKSPACE = target;
+    await rm(target);
+    await mkdir(target);
+    await writeFile(join(target, 'notes.txt'), '已有内容');
+    const abort = new AbortController(); abort.abort();
+    await assert.rejects(f.initialize(abort.signal), { name: 'AbortError' });
+    assert.equal(f.ctx.workspaceRegistry.list().length, 0);
+    assert.equal((await f.initialize()).workspace.path, await realpath(target));
+    assert.equal(await readFile(join(target, 'notes.txt'), 'utf8'), '已有内容');
+  } finally { process.env.DSHX_WORKSPACE = previous; }
+});
+
+test('Android workspace keeps existing projects and live or stored session history', async t => {
+  const previous = process.env.DSHX_WORKSPACE;
+  try {
+    for (const kind of ['project', 'live', 'stored', 'archived']) {
+      const dir = await mkdtemp(join(directory, `workspace-${kind}-`));
+      const target = join(dir, 'workspace');
+      process.env.DSHX_WORKSPACE = target;
+      const f = await workspaceFixture(t, dir);
+      if (kind === 'project') {
+        const custom = join(dir, 'custom'); await mkdir(custom);
+        await f.ctx.workspaceRegistry.create(custom, '已有工作区');
+      } else {
+        const session = f.ctx.sessions.create(`existing-${kind}`);
+        if (kind === 'archived') await f.ctx.workspaceRegistry.archiveSession(session.id);
+        if (kind === 'stored') {
+          const handle = await f.ctx.sessionPersistence.create(session.header);
+          await handle.flush();
+          await handle.close();
+          await f.ctx.fiber.dispose();
+        }
+      }
+      const current = kind === 'stored' ? await workspaceFixture(t, dir) : f;
+      const before = current.ctx.workspaceRegistry.list().map(row => row.id);
+      assert.equal(await current.initialize(), undefined, kind);
+      assert.deepEqual(current.ctx.workspaceRegistry.list().map(row => row.id), before);
+      await assert.rejects(stat(target), { code: 'ENOENT' });
+    }
+  } finally { process.env.DSHX_WORKSPACE = previous; }
+});
+
 test('Android assistant persona updates the next assembly including complete scoped presets and literal braces', async () => {
   const { Context } = await load('@deepseek-ai/cordis');
   const { createScope } = await load('@deepseek-ai/dsh-scope');
