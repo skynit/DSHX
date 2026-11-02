@@ -82,9 +82,9 @@ export function hostingHistory(directory = process.env.DSHX_ASSISTANT_DIR) {
     return lines.flatMap(line => {
       try {
         const row = JSON.parse(line);
-        return row.version === 1 && ['check', 'start', 'finish'].includes(row.event) && Number.isSafeInteger(row.at) ? [row] : [];
+        return row.version === 1 && ['check', 'trigger', 'start', 'finish'].includes(row.event) && Number.isSafeInteger(row.at) ? [row] : [];
       } catch { return []; }
-    }).slice(-20);
+    }).slice(-100);
   } catch (error) { if (error.code === 'ENOENT') return []; throw error; }
   finally { if (file !== undefined) closeSync(file); }
 }

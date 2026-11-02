@@ -75,7 +75,7 @@ internal fun SettingsContent(
                 Divider()
                 LinkRow("手机操作与权限", "屏幕操作、悬浮提示与通知", { onPage(AppPage.Permissions) })
                 Divider()
-                LinkRow("实验体", "培养指令与后台探索", { onPage(AppPage.Hosting) })
+                LinkRow("实验体", "触发日志与培养设置", { onPage(AppPage.Hosting) })
                 Divider()
                 LinkRow("微应用", "添加功能、配置与运行记录", { onPage(AppPage.Apps) })
             }
@@ -178,7 +178,24 @@ internal fun hostingResult(row: JSONObject): String = when (row.optString("outco
         "timeout" -> "本轮超时，已取消"
         "stopped", "session_disposed" -> "本轮已停止"
         "child_session" -> "目标不是普通会话，已跳过"
-        else -> if (row.optString("event") == "start") "概率命中，开始执行" else "本次未完成，请查看会话结果"
+        "device_unavailable" -> "设备状态不可用，已跳过"
+        "unknown_result" -> "上轮结果待核实，已跳过"
+        "goal_paused" -> "培养目标已暂停，已跳过"
+        "goal_completed" -> "目标观察条件已满足，已跳过"
+        "goal_limit" -> "培养尝试已达上限，已跳过"
+        "request_limit" -> "本轮模型请求已达上限"
+        "tool_limit" -> "本轮工具调用已达上限"
+        "management_changed" -> "培养目标已更改，本轮已取消"
+        "request_failed" -> "任务提交失败，本轮已取消"
+        "unavailable" -> "触发处理未完成，请刷新核实"
+        "error" -> "模型执行出错，本轮已结束"
+        "aborted" -> "本轮已取消"
+        "unknown" -> "本轮结束原因未知"
+        else -> when (row.optString("event")) {
+            "trigger" -> "概率命中，等待执行检查"
+            "start" -> "概率命中，开始执行"
+            else -> "本次未完成，请查看会话结果"
+        }
     }
 }
 

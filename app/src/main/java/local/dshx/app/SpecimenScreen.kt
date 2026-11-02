@@ -1,14 +1,11 @@
 package local.dshx.app
 
-import android.content.Context
-import android.net.Uri
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.Image
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
@@ -23,97 +20,46 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.focus.onFocusChanged
-import androidx.compose.ui.graphics.ImageBitmap
-import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
-import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.res.imageResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.error
 import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.unit.IntOffset
-import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.composables.icons.lucide.ChevronDown
+import com.composables.icons.lucide.ChevronRight
+import com.composables.icons.lucide.ChevronUp
+import com.composables.icons.lucide.Square
+import com.composables.icons.lucide.CircleAlert
+import com.composables.icons.lucide.Play
+import com.composables.icons.lucide.Zap
+import com.composables.icons.lucide.Minus
 import com.composables.icons.lucide.ChevronLeft
 import com.composables.icons.lucide.Lucide
+import com.composables.icons.lucide.RefreshCw
+import com.composables.icons.lucide.ScrollText
 import com.composables.icons.lucide.Settings2
-import com.composables.icons.lucide.ImagePlus
-import com.composables.icons.lucide.RotateCcw
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runInterruptible
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
+import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.theme.MiuixTheme
-import kotlin.math.roundToInt
-
-/** 背景设置只读写本机图片，与培养任务是否启动无关。 */
-internal class SpecimenBackgroundState(private val scope: CoroutineScope, private val context: Context) {
-    private val store = SpecimenBackground(java.io.File(context.filesDir, "specimen"))
-    private val lock = Mutex()
-    var image by mutableStateOf<ImageBitmap?>(null)
-        private set
-    var busy by mutableStateOf(false)
-        private set
-    var ready by mutableStateOf(false)
-        private set
-    var error by mutableStateOf<String?>(null)
-    var message by mutableStateOf<String?>(null)
-        private set
-
-    fun load() = work(null) { store.load() }
-
-    fun change(uri: Uri?) {
-        if (uri == null) return
-        work("背景图已更换。") {
-            (context.contentResolver.openInputStream(uri) ?: error("无法读取所选图片，请重新选择。")).use(store::save)
-        }
-    }
-
-    fun restore() = work("已恢复默认背景图。") { store.clear(); null }
-
-    private fun work(success: String?, action: () -> android.graphics.Bitmap?) {
-        scope.launch {
-            // 重新创建页面后返回的选图结果，排在首次读取之后，避免被旧图覆盖。
-            lock.withLock {
-                busy = true; error = null; message = null
-                try {
-                    image = runInterruptible(Dispatchers.IO) { action()?.asImageBitmap() }
-                    message = success
-                } catch (cause: kotlinx.coroutines.CancellationException) { throw cause }
-                catch (cause: Exception) {
-                    error = if (cause is java.io.IOException || cause is SecurityException) "无法读取或保存背景图，请重新选择。"
-                        else cause.message?.take(160) ?: "背景图未更改，请重试。"
-                }
-                finally { ready = true; busy = false }
-            }
-        }
-    }
-}
-
-@Composable
-internal fun rememberSpecimenBackground(visible: Boolean): SpecimenBackgroundState {
-    val context = LocalContext.current.applicationContext
-    val scope = rememberCoroutineScope()
-    val state = remember(context, scope) { SpecimenBackgroundState(scope, context) }
-    LaunchedEffect(visible) { if (visible && !state.ready) state.load() }
-    return state
-}
 
 /** 主画面和培养设置共用草稿与实际回执；页面切换不创建第二份后台状态。 */
 internal class SpecimenState(
@@ -252,67 +198,183 @@ internal fun specimenStatus(running: Boolean, loading: Boolean, status: JSONObje
     else -> "未启用"
 }
 
+internal fun specimenLogs(status: JSONObject?, filter: String): List<JSONObject> {
+    val recent = status?.optJSONArray("recent") ?: return emptyList()
+    return (0 until recent.length()).mapNotNull { recent.optJSONObject(it) }
+        .sortedByDescending { it.optLong("at") }
+        .distinctBy { "${it.optString("id")}:${it.optString("event")}:${it.optLong("at")}" }
+        .filter { row -> when (filter) {
+            "trigger" -> row.optString("event") == "trigger"
+            "skipped" -> row.optString("outcome") == "skipped"
+            "execution" -> row.optString("event") in setOf("start", "finish")
+            else -> true
+        } }
+}
+
 @Composable
 internal fun SpecimenScreen(
-    state: SpecimenState, background: SpecimenBackgroundState, running: Boolean, options: Boolean, active: Boolean, back: () -> Unit,
+    state: SpecimenState, running: Boolean, options: Boolean, active: Boolean, back: () -> Unit,
     onOptions: () -> Unit, onSaved: () -> Unit, openSession: (String) -> Unit,
 ) {
     val colors = MiuixTheme.colorScheme
     val title = specimenStatus(running, state.loading, state.status)
     if (options) {
-        SpecimenOptions(state, background, running, active, title, back, onSaved, openSession)
-    } else Box(Modifier.fillMaxSize().clipToBounds().background(colors.surface)) {
-        val image = background.image
-        if (image != null) Image(image, "自定义实验体背景图", Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
-        else SpecimenArt(Modifier.fillMaxSize())
-        val textSurface = if (image != null) Modifier.background(colors.surface) else Modifier
-        Row(Modifier.fillMaxWidth().then(textSurface).padding(horizontal = 16.dp, vertical = 12.dp),
+        SpecimenOptions(state, running, active, title, back, onSaved, openSession)
+        return
+    }
+    var filter by rememberSaveable { mutableStateOf("all") }
+    val allRows = remember(state.status) { specimenLogs(state.status, "all") }
+    val rows = remember(state.status, filter) { specimenLogs(state.status, filter) }
+    Column(Modifier.fillMaxSize().background(colors.surface)) {
+        Row(Modifier.widthIn(max = 720.dp).fillMaxWidth().align(Alignment.CenterHorizontally)
+            .padding(horizontal = 12.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            LibraryIcon(Lucide.ChevronLeft, "返回设置总览", back, iconSize = 16)
+            LibraryIcon(Lucide.ChevronLeft, "返回设置总览", back, iconSize = 18)
             Text("实验体", modifier = Modifier.weight(1f).semantics { heading() }, fontSize = 22.sp,
-                fontWeight = FontWeight.Medium, color = colors.onSurface)
-            // 复用已有圆形控件的按压反馈和焦点环。
+                fontWeight = FontWeight.Medium)
             VoiceButton("打开培养设置", Lucide.Settings2, onOptions)
         }
-        Column(Modifier.align(Alignment.BottomStart).fillMaxWidth().then(textSurface).padding(horizontal = 28.dp, vertical = 24.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Text(title, fontSize = 16.sp, fontWeight = FontWeight.Medium,
-                color = if (running && state.enabled) LocalStatusColor.current else colors.onSurface)
-            if (state.error != null) Text(state.error!!, fontSize = 12.sp, lineHeight = 18.sp, color = colors.error)
-            else state.message?.let { Note(it) } ?: Note(when {
-                !running -> "启动工作区后可读取培养状态"
-                state.loading || state.status == null -> "培养状态以实际读取结果为准"
-                state.enabled -> "约每 5 分钟检查一次机会"
-                state.status?.optJSONObject("settings")?.optString("prompt").isNullOrBlank() -> "培养指令待设置"
-                else -> "培养指令已设置"
-            })
+        LazyColumn(Modifier.weight(1f).widthIn(max = 720.dp).fillMaxWidth().align(Alignment.CenterHorizontally),
+            contentPadding = PaddingValues(start = 24.dp, end = 24.dp, top = 12.dp, bottom = 32.dp)) {
+            item(key = "status") {
+                SpecimenSummary(state, running, title, openSession)
+                state.error?.let { Text(it, fontSize = 13.sp, lineHeight = 21.sp, color = colors.error,
+                    modifier = Modifier.padding(top = 12.dp).semantics { error(it) }) }
+                state.message?.let { Text(it, fontSize = 12.sp, lineHeight = 18.sp,
+                    color = colors.onSurfaceVariantSummary, modifier = Modifier.padding(top = 8.dp)) }
+                Spacer(Modifier.height(24.dp))
+            }
+            item(key = "filters") {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("运行日志", fontSize = 16.sp, fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.weight(1f).semantics { heading() })
+                    Text("${allRows.size} 条", fontSize = 12.sp, color = colors.onSurfaceVariantSummary)
+                    LibraryIcon(Lucide.RefreshCw, if (state.loading) "正在刷新日志" else "刷新日志",
+                        { state.request() }, enabled = running && !state.loading, iconSize = 16)
+                }
+                LibraryFilters(listOf("all" to "全部", "trigger" to "触发", "skipped" to "跳过", "execution" to "执行"), filter) { filter = it }
+                Spacer(Modifier.height(12.dp))
+                Divider()
+            }
+            if (rows.isEmpty()) item(key = "empty") {
+                Row(Modifier.fillMaxWidth().padding(vertical = 24.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Icon(Lucide.ScrollText, contentDescription = null, modifier = Modifier.padding(top = 2.dp).size(20.dp),
+                        tint = colors.onSurfaceVariantSummary)
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(if (filter == "all") "暂无事件记录" else "暂无此类事件", fontSize = 14.sp,
+                            lineHeight = 21.sp, fontWeight = FontWeight.Medium)
+                        Note(if (filter == "all") "启用后，检查与执行事件会显示在这里。" else "切换分类可查看其他记录。")
+                    }
+                }
+            }
+            items(rows, key = { "${it.optString("id")}:${it.optString("event")}:${it.optLong("at")}" }) { row ->
+                SpecimenLog(row, running, openSession)
+            }
+            item(key = "footer") {
+                Spacer(Modifier.height(16.dp))
+                Divider()
+                Text("显示最近 100 条 · 前台每 10 秒刷新", fontSize = 12.sp, lineHeight = 18.sp,
+                    color = colors.onSurfaceVariantSummary, modifier = Modifier.padding(top = 16.dp))
+            }
         }
     }
 }
 
-/** 中段保持确认后的纤细比例；上下段独立延伸到边界，缩放与系统字号无关。 */
 @Composable
-private fun SpecimenArt(modifier: Modifier) {
-    val dark = MiuixTheme.colorScheme.surface.luminance() < 0.5f
-    val top = ImageBitmap.imageResource(if (dark) R.drawable.specimen_top_dark else R.drawable.specimen_top)
-    val middle = ImageBitmap.imageResource(if (dark) R.drawable.specimen_middle_dark else R.drawable.specimen_middle)
-    val bottom = ImageBitmap.imageResource(if (dark) R.drawable.specimen_bottom_dark else R.drawable.specimen_bottom)
-    Canvas(modifier.semantics { contentDescription = "彩铅实验体，上下细丝连接屏幕边缘" }) {
-        val layoutWidth = minOf(size.width, size.height * 0.58f)
-        val width = (layoutWidth * 0.60f).roundToInt().coerceAtLeast(1)
-        val height = (layoutWidth * middle.height / middle.width).roundToInt().coerceAtMost(size.height.roundToInt())
-        val remaining = (size.height.roundToInt() - height).coerceAtLeast(0)
-        val upper = remaining * 2 / 3
-        val x = ((size.width - width) / 2).roundToInt()
-        if (upper > 0) drawImage(top, dstOffset = IntOffset(x, 0), dstSize = IntSize(width, upper))
-        drawImage(middle, dstOffset = IntOffset(x, upper), dstSize = IntSize(width, height))
-        if (remaining > upper) drawImage(bottom, dstOffset = IntOffset(x, upper + height), dstSize = IntSize(width, remaining - upper))
+private fun SpecimenSummary(state: SpecimenState, running: Boolean, title: String, openSession: (String) -> Unit) {
+    val colors = MiuixTheme.colorScheme
+    val statusColor = if (running && state.enabled) LocalStatusColor.current else colors.onSurfaceVariantSummary
+    var focused by remember { mutableStateOf(false) }
+    val nextCheck = state.status?.optLong("nextCheckAt")?.takeIf { running && state.enabled && it > 0 }
+    Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(colors.secondary)
+        .padding(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Box(Modifier.size(7.dp).background(statusColor, androidx.compose.foundation.shape.CircleShape))
+            Text(title, fontSize = 14.sp, lineHeight = 22.sp, fontWeight = FontWeight.Medium,
+                modifier = Modifier.weight(1f))
+        }
+        val metrics: @Composable () -> Unit = {
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text("下次检查", fontSize = 12.sp, lineHeight = 18.sp, color = colors.onSurfaceVariantSummary)
+                Text(nextCheck?.let(::hostingTime) ?: "—", fontSize = 18.sp, lineHeight = 26.sp, fontWeight = FontWeight.Medium)
+            }
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text("触发概率", fontSize = 12.sp, lineHeight = 18.sp, color = colors.onSurfaceVariantSummary)
+                Text(state.status?.optJSONObject("settings")?.let { "${it.optInt("probability")}%" } ?: "—",
+                    fontSize = 18.sp, lineHeight = 26.sp, fontWeight = FontWeight.Medium)
+            }
+        }
+        if (LocalDensity.current.fontScale >= 1.5f) Column(verticalArrangement = Arrangement.spacedBy(12.dp)) { metrics() }
+        else Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { metrics() }
+        if (!running) Note("启动工作区后可读取本机日志。")
+        state.target?.let { target ->
+            Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(6.dp))
+                .onFocusChanged { focused = it.isFocused }
+                .border(2.dp, if (focused) colors.primary else androidx.compose.ui.graphics.Color.Transparent, RoundedCornerShape(6.dp))
+                .clickable(enabled = running, role = Role.Button, onClick = { openSession(target) })
+                .heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("查看培养会话", fontSize = 13.sp, color = if (running) colors.primary else colors.onSurfaceVariantSummary)
+                Icon(Lucide.ChevronRight, contentDescription = null, modifier = Modifier.size(14.dp), tint = colors.onSurfaceVariantSummary)
+            }
+        }
+    }
+}
+
+@Composable
+private fun SpecimenLog(row: JSONObject, running: Boolean, openSession: (String) -> Unit) {
+    val colors = MiuixTheme.colorScheme
+    val event = row.optString("event")
+    var expanded by rememberSaveable { mutableStateOf(false) }
+    var focused by remember { mutableStateOf(false) }
+    val failed = row.optString("outcome") in setOf("failed", "unknown")
+    val label = when (event) { "trigger" -> "触发命中"; "start" -> "开始执行"; "finish" -> "执行结束"; "check" -> "检查跳过"; else -> "事件记录" }
+    val tint = when { failed -> colors.error; event == "trigger" || event == "start" -> colors.primary; else -> colors.onSurfaceVariantSummary }
+    val icon = when { failed -> Lucide.CircleAlert; event == "trigger" -> Lucide.Zap; event == "start" -> Lucide.Play; event == "finish" -> Lucide.Square; else -> Lucide.Minus }
+    val time = java.time.Instant.ofEpochMilli(row.optLong("at")).atZone(java.time.ZoneId.systemDefault())
+        .format(java.time.format.DateTimeFormatter.ofPattern("MM-dd HH:mm:ss"))
+    val lineColor = colors.outline
+    Row(Modifier.fillMaxWidth().drawBehind {
+        drawLine(lineColor, Offset(14.dp.toPx(), 38.dp.toPx()), Offset(14.dp.toPx(), size.height), 1.dp.toPx())
+    }, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        Box(Modifier.padding(top = 14.dp).size(28.dp).background(colors.secondary, RoundedCornerShape(8.dp)), contentAlignment = Alignment.Center) {
+            Icon(icon, contentDescription = null, modifier = Modifier.size(14.dp), tint = tint)
+        }
+        Column(Modifier.weight(1f).padding(bottom = 4.dp)) {
+            Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(6.dp))
+                .onFocusChanged { focused = it.isFocused }
+                .border(2.dp, if (focused) colors.primary else androidx.compose.ui.graphics.Color.Transparent, RoundedCornerShape(6.dp))
+                .clickable(role = Role.Button, onClickLabel = if (expanded) "收起事件详情" else "展开事件详情") { expanded = !expanded }
+                .semantics { stateDescription = if (expanded) "已展开" else "已收起" }
+                .heightIn(min = 48.dp).padding(vertical = 14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(label, fontSize = 14.sp, lineHeight = 22.sp, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
+                    Icon(if (expanded) Lucide.ChevronUp else Lucide.ChevronDown, contentDescription = null,
+                        modifier = Modifier.size(14.dp), tint = colors.onSurfaceVariantSummary)
+                }
+                Text(hostingResult(row), fontSize = 13.sp, lineHeight = 20.sp,
+                    color = if (failed) colors.error else colors.onSurfaceVariantSummary)
+                Text(time, fontSize = 12.sp, lineHeight = 18.sp, color = colors.onSurfaceVariantSummary)
+            }
+            if (expanded) Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).background(colors.secondary)
+                .padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (row.has("probability") && row.has("roll")) Note("触发概率 ${row.optInt("probability")}% · 抽样值 ${row.optInt("roll")}（0～99）")
+                if (row.has("durationMs")) Note("耗时 ${"%.1f".format(java.util.Locale.ROOT, row.optLong("durationMs") / 1000.0)} 秒")
+                row.optJSONObject("tools")?.let { tools -> Note("手机工具：完成 ${tools.optInt("completed")} · 失败 ${tools.optInt("failed")} · 未知 ${tools.optInt("unknown")}") }
+                row.optString("id").takeIf(String::isNotBlank)?.let { Note("机会编号 $it") }
+                row.optString("session").takeIf { it.isNotBlank() && it != "null" }?.let { session ->
+                    Action("查看会话", { openSession(session) }, enabled = running)
+                }
+                if (!row.has("id") && !row.has("durationMs") && !row.has("probability")) Note("此事件没有其他详情。")
+            }
+        }
     }
 }
 
 @Composable
 private fun SpecimenOptions(
-    state: SpecimenState, background: SpecimenBackgroundState, running: Boolean, active: Boolean, title: String, back: () -> Unit,
+    state: SpecimenState, running: Boolean, active: Boolean, title: String, back: () -> Unit,
     onSaved: () -> Unit, openSession: (String) -> Unit,
 ) {
     val colors = MiuixTheme.colorScheme
@@ -321,7 +383,6 @@ private fun SpecimenOptions(
     val visit = remember(active) { mutableStateOf(active) }
     DisposableEffect(visit) { onDispose { visit.value = false } }
     val latestSaved by rememberUpdatedState(onSaved)
-    val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent(), background::change)
     Column(Modifier.fillMaxSize().background(colors.surface)) {
         Row(Modifier.widthIn(max = 608.dp).fillMaxWidth().align(Alignment.CenterHorizontally)
             .padding(horizontal = 16.dp, vertical = 12.dp),
@@ -333,24 +394,6 @@ private fun SpecimenOptions(
         Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState())) {
             Column(Modifier.widthIn(max = 608.dp).fillMaxWidth().align(Alignment.CenterHorizontally)
                 .padding(horizontal = 28.dp, vertical = 8.dp)) {
-                Text("背景图", fontSize = 15.sp, fontWeight = FontWeight.Medium)
-                Note(if (background.image == null) "默认插画" else "自定义图片")
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp),
-                    modifier = Modifier.padding(vertical = 12.dp)) {
-                    Action(if (background.busy) "正在处理图片…" else "更换背景图", {
-                        try { picker.launch("image/*") }
-                        catch (_: android.content.ActivityNotFoundException) { background.error = "没有可用的图片选择器。" }
-                    }, enabled = active && background.ready && !background.busy, icon = Lucide.ImagePlus)
-                    Action("恢复默认", background::restore, enabled = active && background.ready && !background.busy &&
-                        (background.image != null || background.error != null), icon = Lucide.RotateCcw)
-                }
-                Note("选择后自动保存，仅用于当前设备。")
-                background.error?.let { Text(it, fontSize = 13.sp, lineHeight = 20.sp, color = colors.error,
-                    modifier = Modifier.semantics { error(it) }) }
-                background.message?.let { Note(it) }
-                Spacer(Modifier.height(16.dp))
-                Divider()
-                Spacer(Modifier.height(16.dp))
                 SettingsSwitch("启用实验体", "按指令探索，随时可以停止。", state.enabled, available,
                     if (state.status == null) "状态未知" else null) { state.save(it, stop = !it) }
                 Divider()
@@ -387,15 +430,6 @@ private fun SpecimenOptions(
                 Divider()
                 SpecimenLearning(state, available)
                 Divider()
-                SettingsFold("最近记录", "查看实际检查与执行结果") {
-                    val recent = state.status?.optJSONArray("recent")
-                    if (recent == null || recent.length() == 0) Note("暂无检查记录。")
-                    else for (index in 0 until minOf(recent.length(), 8)) {
-                        val row = recent.getJSONObject(index)
-                        Text("${hostingTime(row.optLong("at"))} · ${hostingResult(row)}", fontSize = 13.sp, lineHeight = 21.sp,
-                            modifier = Modifier.padding(bottom = 8.dp))
-                    }
-                }
                 Note("锁屏、息屏时跳过；恢复后不补跑。")
                 Spacer(Modifier.height(24.dp))
             }

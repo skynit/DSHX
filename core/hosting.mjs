@@ -33,7 +33,7 @@ export function hostingSession(ctx, options = {}) {
   const log = (event, row = {}) => {
     const entry = { event, at: now(), ...row };
     record(entry); recent.push(entry);
-    if (recent.length > 20) recent.shift();
+    if (recent.length > 100) recent.shift();
   };
   const removePending = active => {
     for (const message of [...active.agent.inbox.nextTurn, ...active.agent.inbox.nextStep]) {
@@ -95,6 +95,7 @@ export function hostingSession(ctx, options = {}) {
       if (reason) return skip(reason);
       const roll = dice();
       if (roll >= config.probability) return log('check', { id, session: session || null, outcome: 'skipped', reason: 'probability', probability: config.probability, roll });
+      log('trigger', { id, session: session || null, probability: config.probability, roll });
       if (busy()) return skip('busy');
       if (!session) {
         session = (await ctx.sessionController.create({})).sessionId;

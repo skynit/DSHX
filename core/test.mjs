@@ -7790,8 +7790,12 @@ test('Android hosting uses local probability and never resolves a model session 
   await f.hosting.check();
   assert.equal(f.resolutions, 0); assert.equal(f.prompts.length, 0);
   assert.equal(f.records.at(-1).reason, 'probability');
+  assert.equal(f.records.at(-1).probability, 20); assert.equal(f.records.at(-1).roll, 20);
   f.config.probability = 21;
   await f.hosting.check();
+  assert.deepEqual(f.records.slice(-2).map(row => row.event), ['trigger', 'start']);
+  assert.equal(f.records.at(-2).id, f.records.at(-1).id);
+  assert.equal(f.records.at(-2).probability, 21); assert.equal(f.records.at(-2).roll, 20);
   assert.equal(f.prompts.length, 1);
   assert.equal(f.prompts[0].source.kind, 'plugin:dshx-hosting');
   assert.equal(f.prompts[0].request.sessionId, 'hosting-session');
@@ -7809,6 +7813,22 @@ test('Android hosting skips locked screen-off disabled offline and unknown devic
     assert.equal(f.records.at(-1).reason, reason);
     assert.equal(f.rolls, 0); assert.equal(f.resolutions, 0); assert.equal(f.prompts.length, 0);
   }
+});
+
+test('Android hosting logs a probability hit before later admission fails and bounds visible history', async t => {
+  const f = await hostingFixture(t, { resolve: () => { throw new Error('private resolution failure'); } });
+  await f.hosting.check();
+  assert.deepEqual(f.records.map(row => row.event), ['trigger', 'check']);
+  assert.equal(f.records[0].id, f.records[1].id);
+  assert.equal(f.records[1].reason, 'unavailable'); assert.equal(f.prompts.length, 0);
+  assert.doesNotMatch(JSON.stringify(f.records), /private/);
+  const history = await hostingFixture(t, { roll: 99 }); history.config.probability = 1;
+  for (let index = 0; index < 130; index++) await history.hosting.check();
+  assert.equal(history.records.length, 130);
+  assert.equal(history.hosting.status().recent.length, 100);
+  assert.equal(history.hosting.status().recent[0].id, history.records.at(-1).id);
+  const broken = await hostingFixture(t, { record: row => { if (row.event === 'trigger') throw new Error('disk full'); } });
+  await broken.hosting.check(); assert.equal(broken.prompts.length, 0); assert.equal(broken.resolutions, 0);
 });
 
 test('Android hosting waits five minutes and coalesces an hour asleep into only the current opportunity', async t => {
@@ -7999,7 +8019,7 @@ test('Android hosting actual command admission model loop and phone results sett
       record: row => records.push(structuredClone(row)) });
     await hosting.check(); await agent.whenIdle();
     assert.equal(requests, 2, JSON.stringify({ records, status: await memory.call('status'), events: agent.session.snapshotEvents() })); assert.equal(sends, 1);
-    assert.deepEqual(records.map(row => row.event), ['start', 'finish']);
+    assert.deepEqual(records.map(row => row.event), ['trigger', 'start', 'finish']);
     assert.equal(records.at(-1).outcome, 'completed');
     assert.equal(records.at(-1).tools.completed, 1);
     const events = agent.session.snapshotEvents();
@@ -8126,14 +8146,16 @@ test('Android hosting authenticated native channel rejects extra commands and sa
 test('Android hosting recent history survives restart and ignores a torn final record', async () => {
   const { hostingEvent, hostingHistory } = await import(pathToFileURL(join(core, 'assistant.mjs')));
   const dir = await mkdtemp(join(directory, 'hosting-history-'));
-  for (let index = 0; index < 30; index++) hostingEvent({ event: 'check', at: index, outcome: 'skipped', reason: 'probability' }, dir);
+  for (let index = 0; index < 130; index++) hostingEvent({ event: 'check', at: index, outcome: 'skipped', reason: 'probability' }, dir);
   let recent = hostingHistory(dir);
-  assert.equal(recent.length, 20); assert.equal(recent[0].at, 10); assert.equal(recent.at(-1).at, 29);
+  assert.equal(recent.length, 100); assert.equal(recent[0].at, 30); assert.equal(recent.at(-1).at, 129);
   const file = await open(join(dir, 'hosting.jsonl'), 'a');
   try { await file.write('{"partial":'); } finally { await file.close(); }
-  assert.equal(hostingHistory(dir).length, 20);
-  hostingEvent({ event: 'finish', at: 30, outcome: 'unknown' }, dir);
-  recent = hostingHistory(dir); assert.equal(recent.length, 20); assert.equal(recent.at(-1).outcome, 'unknown');
+  assert.equal(hostingHistory(dir).length, 100);
+  hostingEvent({ event: 'trigger', at: 130, probability: 20, roll: 3, id: 'hit' }, dir);
+  hostingEvent({ event: 'finish', at: 131, outcome: 'unknown' }, dir);
+  recent = hostingHistory(dir); assert.equal(recent.length, 100); assert.equal(recent.at(-1).outcome, 'unknown');
+  assert.equal(recent.at(-2).event, 'trigger'); assert.equal(recent.at(-2).roll, 3);
 });
 
 test('Android micro apps register all tools through the official schema and preserve the native boundary', async () => {
