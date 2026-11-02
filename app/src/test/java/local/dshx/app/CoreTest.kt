@@ -173,6 +173,7 @@ class CoreTest {
         val context = RuntimeEnvironment.getApplication()
         val signer = apkSigner()
         val info = context.packageManager.getPackageInfo(context.packageName, android.content.pm.PackageManager.GET_SIGNATURES)
+        info.versionCode = 1
         info.signatures = arrayOf(android.content.pm.Signature(signer.certificates.single().encoded))
         shadowOf(context.packageManager).installPackage(info)
         ReflectionHelpers.setStaticField(Build::class.java, "SUPPORTED_ABIS", arrayOf("arm64-v8a"))

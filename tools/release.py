@@ -113,6 +113,18 @@ def base_url(value):
     return value
 
 
+def verify_apk_signing(apk):
+    # 从仅支持 v1 的平台开始验签，防止新版验签器跳过已经包含的旧式签名。
+    # 这只扩大检查范围，不改变 APK 声明的最低 Android 版本。
+    signing = run(sdk_tool("apksigner"), "verify", "--verbose", "--print-certs", "--min-sdk-version", "23", str(apk))
+    for scheme in (1, 2, 3):
+        if not re.search(rf"^Verified using v{scheme} scheme \([^\n]+\): true$", signing, re.M):
+            raise ValueError(f"发布 APK 必须同时包含有效的 v1、v2、v3 签名，当前缺少 v{scheme}。")
+    fingerprints = re.findall(r"^Signer #\d+ certificate SHA-256 digest: ([a-fA-F0-9]+)$", signing, re.M)
+    if fingerprints != [key_operation("certificate")]:
+        raise ValueError("APK 签名与发布清单使用的本机密钥不一致。")
+
+
 def prepare(args):
     apk = Path(args.apk).expanduser().resolve()
     base = base_url(args.base_url)
@@ -129,10 +141,7 @@ def prepare(args):
     if not re.fullmatch(r"[a-f0-9]{40}", commit):
         raise ValueError("APK 内的构建提交无效。")
     run("git", "merge-base", "--is-ancestor", commit, "origin/master")
-    signing = run(sdk_tool("apksigner"), "verify", "--print-certs", str(apk))
-    fingerprints = re.findall(r"^Signer #\d+ certificate SHA-256 digest: ([a-fA-F0-9]+)$", signing, re.M)
-    if fingerprints != [key_operation("certificate")]:
-        raise ValueError("APK 签名与发布清单使用的本机密钥不一致。")
+    verify_apk_signing(apk)
     badging = run(sdk_tool("aapt"), "dump", "badging", str(apk))
     package = re.search(r"^package: name='([^']+)' versionCode='(\d+)' versionName='([^']+)'", badging, re.M)
     if not package or package.group(1) != "local.dshx.app":
@@ -185,6 +194,7 @@ def publish(args):
         raise ValueError("发布文件与已签名清单不符。")
     if {p.name for p in directory.iterdir()} != {apk.name, "release-note.txt", "latest.json"}:
         raise ValueError("发布目录包含额外文件。")
+    verify_apk_signing(apk)
     base = artifact["url"].split("/releases/", 1)[0]
     current = latest(base)
     if current and (current["versionCode"] > release["versionCode"] or

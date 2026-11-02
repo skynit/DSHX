@@ -6,7 +6,7 @@
 
 OTA 是通过网络交付更新的方式。本项目仅更新完整 Android 安装包（APK）；引擎运行包随 APK 更新，不提供单独替换引擎的入口。
 
-用户进入“设置 → 应用更新”，检查版本、阅读更新内容、下载并安装。安装包名称为 `DSHX-arm64-${versionName}.apk`，例如 `DSHX-arm64-0.1.0-dev.2.apk`。`versionName` 是开发者在 Gradle 构建配置中设置的可读版本；`versionCode` 是判断版本新旧的递增整数，发布时两者都从实际 APK 读取。
+用户进入“设置 → 应用更新”，检查版本、阅读更新内容、下载并安装。安装包名称为 `DSHX-arm64-${versionName}.apk`，例如 `DSHX-arm64-0.1.3.apk`。`versionName` 是开发者在 Gradle 构建配置中设置的可读版本，采用三段数字格式；`versionCode` 是判断版本新旧的递增整数，发布时两者都从实际 APK 读取。`0.1.3` 的内部版本号为 `5`，高于旧的 `0.1.0-dev.3`（内部版本号 `4`），覆盖升级依赖这个整数而非文件名。
 
 文件名中的 `arm64` 是简写；构建、运行包和设备匹配仍使用 Android 标准架构名称 `arm64-v8a`。第一版只发布 ARM64 手机安装包，模拟器版不能作为 ARM64 安装包发布。
 
@@ -39,6 +39,8 @@ HTTP 不提供传输保密性，也不能阻止网络中断或阻止新版信息
 
 本轮沿用开发机现有的 `~/.android/debug.keystore`，保证使用同一开发签名的现有应用能够覆盖升级。该文件需要由发布者妥善备份；其他机器默认生成的开发密钥不一定相同。首次安装含 OTA 功能的版本仍需用户手动安装，此后才有应用内检查入口。
 
+主应用调试构建显式启用 v1、v2、v3 三种 APK 签名，均使用上述同一密钥。v1 是在 ZIP 的 `META-INF` 中保存证书和逐文件签名的旧式 JAR 格式；v2 是 Android 7.0 起支持的整包签名；v3 在 Android 9 起增加签名轮换等信息。三者是同一安装包的不同验签格式，不是三个不同发布者。`release.py` 在准备和实际上传前均检查三种签名有效且证书与发布密钥一致，避免只验证 v2 就发布缺少兼容证书条目的安装包。
+
 每次发布先增加 `app/build.gradle.kts` 中的 `versionCode`，设置 `versionName`，完成定向验证后提交并推送到 `origin/master`。构建任务将当前提交、工作区是否干净和更新地址写入 APK 的 `assets/build-info.json`。发布脚本拒绝来自未提交工作区、未推送提交、错误架构或其他签名的 APK。
 
 提交并推送后重新构建，确保构建记录属于干净提交：
@@ -49,8 +51,8 @@ JAVA_HOME=/usr/lib/jvm/java-17-openjdk ./gradlew :app:assembleDebug
 python3 tools/release.py prepare \
   --apk app/build/outputs/apk/debug/app-debug.apk
 
-# 将 3 换成这次 APK 的实际 versionCode。
-python3 tools/release.py publish --release build/ota/3
+# 将 5 换成这次 APK 的实际 versionCode。
+python3 tools/release.py publish --release build/ota/5
 ```
 
 脚本要求 Python 3.11+、JDK 17+、Git、Android SDK 的 `aapt`/`apksigner`、SSH 和 SCP。脚本会获取 `origin` 最新状态，验证 APK 内记录的提交已包含在 `origin/master` 中，从服务器读取并验签上次发布清单，再生成差异提交说明。未提交到 GitHub 的当前修改不会被冒充为发布记录。
@@ -60,8 +62,8 @@ python3 tools/release.py publish --release build/ota/3
 准备后的目录如下，`latest.json` 另外留存于每个版本目录，便于核对历史发布：
 
 ```text
-build/ota/3/
-├── DSHX-arm64-0.1.0-dev.2.apk
+build/ota/5/
+├── DSHX-arm64-0.1.3.apk
 ├── release-note.txt
 └── latest.json
 ```

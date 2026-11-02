@@ -18,8 +18,8 @@ android {
         applicationId = "local.dshx.app"
         minSdk = 26
         targetSdk = 28
-        versionCode = providers.gradleProperty("dshxVersionCode").orElse("4").get().toInt()
-        versionName = providers.gradleProperty("dshxVersionName").orElse("0.1.0-dev.3").get()
+        versionCode = providers.gradleProperty("dshxVersionCode").orElse("5").get().toInt()
+        versionName = providers.gradleProperty("dshxVersionName").orElse("0.1.3").get()
         resValue("string", "update_url", updateUrl.get())
         val info = file("src/main/assets/core-info.json")
         val abi = providers.gradleProperty("dshxAbi").orNull
@@ -32,6 +32,11 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     buildFeatures { compose = true }
+    signingConfigs.getByName("debug") {
+        enableV1Signing = true
+        enableV2Signing = true
+        enableV3Signing = true
+    }
     testOptions { unitTests.isIncludeAndroidResources = true }
     androidResources { noCompress += "zip" }
     lint { disable += "ExpiredTargetSdkVersion" }
