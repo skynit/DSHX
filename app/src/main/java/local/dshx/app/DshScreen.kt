@@ -177,6 +177,10 @@ fun DshScreen(
     accessibilityNotice: Boolean = false, onAccessibilityDismiss: () -> Unit = {},
     onApps: (String, org.json.JSONObject) -> org.json.JSONObject = { _, _ -> error("微应用管理尚未连接。") },
     onCreateApp: (org.json.JSONObject) -> org.json.JSONObject = { error("微应用创建尚未连接。") },
+    onRestart: () -> Unit = {}, onCopyEntry: () -> Unit = {},
+    enginePage: String? = null, onEnginePageHandled: () -> Unit = {},
+    engineInfo: () -> org.json.JSONObject = { org.json.JSONObject() },
+    engineStatus: () -> org.json.JSONObject = { org.json.JSONObject() },
 ) {
     var tab by rememberSaveable { mutableIntStateOf(0) }
     var settingsPage by rememberSaveable { mutableStateOf(AppPage.Settings) }
@@ -237,6 +241,12 @@ fun DshScreen(
         if (changed && index == 2) settingsPage = AppPage.Settings
         if (startVoice && changed && index == 3 && running && voiceState.speechAvailable && !voiceState.active) onVoice("talk")
         if (changed && index == 1 && voiceState.active && !voiceState.downloading) onVoice("stop")
+    }
+    LaunchedEffect(enginePage, startup, running) {
+        if (!startup) when (enginePage) {
+            "chat" -> if (running) { selectTab(1); onEnginePageHandled() }
+            "logs" -> { openLogs(); onEnginePageHandled() }
+        }
     }
     BackHandler(library || logs) { goBack() }
     AppTheme(theme) {
@@ -326,7 +336,7 @@ fun DshScreen(
                                 Column(verticalArrangement = Arrangement.spacedBy(4.dp), modifier = Modifier.weight(1f)) {
                                     Text(shownPage.title, fontSize = 22.sp, fontWeight = FontWeight.SemiBold,
                                         modifier = Modifier.semantics { heading() })
-                                    if (showLogs) Note("最近 120 行 · 已脱敏")
+                                    if (showLogs) Note("最近 120 行 · 已脱敏并保存在本机")
                                 }
                                 if (shownPage == AppPage.Home && !showLogs) Text("开发版", fontSize = 12.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
                                     modifier = Modifier.border(1.dp, MiuixTheme.colorScheme.outline, RoundedCornerShape(6.dp)).padding(8.dp, 5.dp))
@@ -340,6 +350,12 @@ fun DshScreen(
                                     Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                                         Action("返回", onClick = { logs = false })
                                         Action("刷新日志", onClick = { logText = diagnostics() })
+                                    }
+                                    val info = engineInfo()
+                                    Panel {
+                                        Info("DSHX", info.optString("version", "未知版本"))
+                                        Divider()
+                                        Info("日志目录", info.optString("logPath", "暂无"))
                                     }
                                     Panel {
                                         SelectionContainer { Text(logText.ifBlank { "暂无日志" }, fontFamily = FontFamily.Monospace, fontSize = 12.sp, lineHeight = 18.sp) }
@@ -363,6 +379,21 @@ fun DshScreen(
                                                 icon = if (running) Lucide.ChevronRight else Lucide.Play)
                                             if (active) Action(if (running) "停止服务" else "取消启动", onClick = onStop,
                                                 enabled = state.phase != "正在停止", icon = Lucide.Square, danger = true)
+                                            if (running) Action("重启引擎", onClick = onRestart, enabled = !state.busy, icon = Lucide.RotateCcw)
+                                            Action("复制入口", onClick = onCopyEntry)
+                                        }
+                                        val operation = engineStatus().optJSONObject("operation")
+                                        if (operation != null && operation.optString("state") != "idle") {
+                                            Spacer(Modifier.height(12.dp))
+                                            val message = when (operation.optString("state")) {
+                                                "accepted" -> "重启请求已受理"
+                                                "stopping" -> "正在停止旧引擎"
+                                                "starting" -> "正在等待新引擎就绪"
+                                                "succeeded" -> "引擎重启完成"
+                                                "cancelled" -> "重启已取消"
+                                                else -> operation.optString("message").takeUnless { it.isBlank() || it == "null" } ?: "重启未完成，请查看运行诊断"
+                                            }
+                                            Note(message)
                                         }
                                     }
                                     Section("开始使用")

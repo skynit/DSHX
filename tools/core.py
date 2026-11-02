@@ -138,7 +138,7 @@ def build(abi):
         bundle = temp / "core"
         (bundle / "bin").mkdir(parents=True)
         (bundle / "lib").mkdir()
-        executables = {"bin/node", "bin/bash", "bin/rg", "bin/dshx-run"}
+        executables = {"bin/node", "bin/bash", "bin/rg", "bin/dshx-run", "bin/dsh"}
         for name in ("node", "bash", "rg"):
             shutil.copy2(usr / "bin" / name, bundle / "bin" / name)
         executables.update(copy_git(usr, bundle))
@@ -160,6 +160,14 @@ def build(abi):
                     name.startswith(("node-addon-system-linux-", "sherpa-onnx-linux-", "sharp-linux-", "sharp-libvips-linux-"))]
         modules = bundle / "lib/node_modules"
         shutil.copytree(SOURCE / "node_modules", modules, ignore=exclude, symlinks=False)
+        # 与原生引擎复用同一启动模块；入口随运行包移动，不绑定版本目录。
+        # CLI 不继承引擎权限连接：上游可能只清除 TOKEN，留下无法认证的半组配置。
+        (bundle / "bin/dsh").write_text(
+            '#!/system/bin/sh\n'
+            'bin=${0%/*}\n'
+            'unset DSHX_POLICY_PORT DSHX_POLICY_INSTANCE DSHX_POLICY_TOKEN\n'
+            'exec "$bin/node" --expose-internals --import "$bin/../compat.mjs" "$bin/../start.mjs" "$@"\n'
+        )
         # 使用 Android 的 shell 和同一运行包的 Node，保留完整参数与退出码。
         for name, entry in (("npm", "npm/bin/npm-cli.js"), ("pnpm", "pnpm/bin/pnpm.cjs"),
                             ("npx", "npm/bin/npx-cli.js"), ("pnpx", "pnpm/bin/pnpx.cjs")):
@@ -330,7 +338,7 @@ def build(abi):
               'const enableRunInBackground = process.platform === "android" ? false : config.enableRunInBackground ?? true;')
         patch("@deepseek-ai/dsh-tool-terminal/lib/index.js",
               'text: "Use a terminal session only when work needs persistent terminal state or interactive stdin; prefer shell/read/write/edit for bounded one-shot operations. Track every terminal session id and close sessions that no longer matter. An inferred_idle or timeout result does not prove the foreground command exited."',
-              'text: process.platform === "android" ? "普通命令默认使用持久 bash。bash_isolated 每次新建 shell；terminal_open 创建额外独立持久终端，使用 terminal_send 连续输入，terminal_read 读取输出，terminal_signal 中断，terminal_close 关闭。terminal_list 中 default 为默认 bash 终端，交互程序优先使用额外终端。终端的 inferred_idle、timeout 或 stdin_read 不代表命令成功；仅 bash 的完成标记给出命令退出码。记录终端编号并关闭不再需要的额外终端。" : "Use a terminal session only when work needs persistent terminal state or interactive stdin; prefer shell/read/write/edit for bounded one-shot operations. Track every terminal session id and close sessions that no longer matter. An inferred_idle or timeout result does not prove the foreground command exited."')
+              'text: process.platform === "android" ? "普通命令默认使用持久 bash。bash_isolated 每次新建 shell；terminal_open 创建额外独立持久终端，使用 terminal_send 连续输入，terminal_read 读取输出，terminal_signal 中断，terminal_close 关闭。terminal_list 中 default 为默认 bash 终端，交互程序优先使用额外终端。终端的 inferred_idle、timeout 或 stdin_read 不代表命令成功；仅 bash 的完成标记给出命令退出码。记录终端编号并关闭不再需要的额外终端。临时任务目录使用宿主提供的 $TMPDIR，不要写死 /tmp。" : "Use a terminal session only when work needs persistent terminal state or interactive stdin; prefer shell/read/write/edit for bounded one-shot operations. Track every terminal session id and close sessions that no longer matter. An inferred_idle or timeout result does not prove the foreground command exited."')
         # All Android presets inherit the same default shell and terminal tools.
         # Minimal's private PTY realm would otherwise create a second default.
         patch("@deepseek-ai/dsh-web-app/presets/minimal.patch.yml",
@@ -428,6 +436,34 @@ def build(abi):
         patch("@deepseek-ai/dsh-plugin-manager/lib/index.js",
               'const RESTORED_FILES = ["package.json", "pnpm-lock.yaml"];',
               'const RESTORED_FILES = ["package.json", "pnpm-lock.yaml", "cordis.patch.yml"];')
+        # Android 构建由应用 WebView 承载；原生端检查来源和用户手势后处理导航。
+        client = "@deepseek-ai/dsh-client-ui-plugin-manager/lib/client.js"
+        patch(client,
+              '\t\tfunction restartText(key, reason, t) {',
+              '\t\tfunction androidRestartNotice(text) {\n'
+              '\t\t\treturn (0, react_jsx_runtime.jsxs)("span", {\n'
+              '\t\t\t\tstyle: { display: "inline-flex", flexWrap: "wrap", alignItems: "center", gap: 8 },\n'
+              '\t\t\t\tchildren: [(0, react_jsx_runtime.jsx)("span", { children: text }),\n'
+              '\t\t\t\t\t(0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.Button, {\n'
+              '\t\t\t\t\t\tvariant: "primary", style: { minHeight: 48, minWidth: 48 },\n'
+              '\t\t\t\t\t\tonClick: () => { window.location.href = "dshx://engine/restart"; }, children: "重启以生效"\n'
+              '\t\t\t\t\t}), (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.Button, {\n'
+              '\t\t\t\t\t\tvariant: "outline", style: { minHeight: 48, minWidth: 48 },\n'
+              '\t\t\t\t\t\tonClick: () => { window.location.href = "dshx://engine/logs"; }, children: "查看日志"\n'
+              '\t\t\t\t\t})]\n'
+              '\t\t\t});\n'
+              '\t\t}\n'
+              '\t\tfunction restartText(key, reason, t) {')
+        patch(client,
+              'children: restartText("installDoneRestart", install.restartReason, t)',
+              'children: androidRestartNotice(restartText("installDoneRestart", install.restartReason, t))')
+        # 重启提示常驻页面，避免操作按钮随上游短暂 Toast 消失。
+        patch(client,
+              'state.notice === null || noticeLine === null ? null : (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.Toast, {',
+              'state.notice?.kind === "restart" ? (0, react_jsx_runtime.jsx)("div", {\n'
+              '\t\t\t\t\t\tclassName: PluginManagerPage_module_css_default.resultWarn, role: "status",\n'
+              '\t\t\t\t\t\tchildren: androidRestartNotice(noticeLine)\n'
+              '\t\t\t\t\t}) : state.notice === null || noticeLine === null ? null : (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.Toast, {')
         patch("@deepseek-ai/dsh-plugin-manager/lib/index.js",
               'const before = this.diskState();',
               'const before = this.diskState();\n'
@@ -507,7 +543,7 @@ def build(abi):
         patch('@deepseek-ai/dsh-llm-pi-ai/lib/index.js',
               '\t\t\tyield {\n\t\t\t\ttype: "usage",\n\t\t\t\tusage: mapUsage(event.error.usage)\n\t\t\t};',
               '\t\t\tif (providerUsage() !== void 0) yield {\n\t\t\t\ttype: "usage",\n\t\t\t\tusage: providerUsage()\n\t\t\t};')
-        for filename in ("start.mjs", "plugins.mjs", "assistant.mjs", "hosting.mjs", "specimen.mjs", "specimen-store.mjs", "background.mjs", "apps.mjs", "compat.mjs", "guard.mjs", "policy.mjs", "files.mjs", "host.mjs", "phone.mjs", "voice.mjs", "memory.mjs", "memory-store.mjs", "memory-extract.mjs", "read-budget.mjs", "knowledge.mjs", "knowledge-store.mjs", "knowledge-search.mjs", "knowledge-model.mjs", "local-route.mjs", "local-routes.json", "recover.mjs", "android.patch.yml"):
+        for filename in ("start.mjs", "engine.mjs", "plugins.mjs", "assistant.mjs", "hosting.mjs", "specimen.mjs", "specimen-store.mjs", "background.mjs", "apps.mjs", "compat.mjs", "guard.mjs", "policy.mjs", "files.mjs", "host.mjs", "phone.mjs", "voice.mjs", "memory.mjs", "memory-store.mjs", "memory-extract.mjs", "read-budget.mjs", "knowledge.mjs", "knowledge-store.mjs", "knowledge-search.mjs", "knowledge-model.mjs", "local-route.mjs", "local-routes.json", "recover.mjs", "android.patch.yml"):
             shutil.copy2(SOURCE / filename, bundle / filename)
         ndk = Path(os.environ.get("ANDROID_NDK_HOME", "/home/skynit/Android/Sdk/ndk/28.2.13676358"))
         compiler = ndk / "toolchains/llvm/prebuilt/linux-x86_64/bin" / (

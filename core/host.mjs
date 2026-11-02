@@ -177,7 +177,7 @@ export class PolicyHost {
       clearTimeout(pending.timer);
       pending.cleanup?.();
       this.pending.delete(message.id);
-      pending.reject(new Error(pending.phone || pending.local || pending.apps ? message.error ||
+      pending.reject(new Error(pending.phone || pending.local || pending.apps || pending.engine ? message.error ||
         (pending.phone ? '手机操作失败，请重新观察界面。' : '本机处理失败，请重新开始。') : '原生会话查询被拒绝，会话可能已结束。'));
       return;
     }
@@ -214,13 +214,14 @@ export class PolicyHost {
       const phone = method === 'phone';
       const local = method === 'local-model';
       const apps = method === 'apps';
+      const engine = method === 'engine';
       const timer = setTimeout(() => this.fail(), local ? 170000 : apps ? 30000 : phone ? (data.action === 'ask' ? 65000 : 25000) : 3000);
       const abort = () => {
         reject(new Error(local ? '本地模型生成已取消。' : '手机操作已取消；已发出的动作结果需重新观察，不能自动重试。' +
           (data.action === 'export' ? '导出可能已开始，授权目录可能残留不完整文件，请检查。' : '')));
         if (!apps) this.query(local ? 'local-cancel' : 'phone-cancel', { session: data.session, call: id }).catch(() => {});
       };
-      this.pending.set(id, { resolve, reject, timer, phone, local, apps, cleanup: () => signal?.removeEventListener('abort', abort) });
+      this.pending.set(id, { resolve, reject, timer, phone, local, apps, engine, cleanup: () => signal?.removeEventListener('abort', abort) });
       this.send({ id, method, ...data });
       signal?.addEventListener('abort', abort, { once: true });
       if (signal?.aborted) abort();
@@ -296,6 +297,17 @@ export class PolicyHost {
 
   async smallModel(session, signal) {
     return this.query('small-model', { session }, signal);
+  }
+
+  // 原生宿主先返回它持有的 operationId，再停止当前进程。
+  // 此处只等待受理回执，不等待重启完成，也不自动重试。
+  async engine(action, data, session) {
+    if (!this.configured || typeof session !== 'string' || !session) throw new Error('引擎操作需要当前原生会话连接。');
+    if (!['status', 'logs', 'restart', 'info'].includes(action) || !data || typeof data !== 'object' || Array.isArray(data) ||
+        Object.keys(data).some(key => !(action === 'status' ? ['operationId'] : action === 'logs' ? ['lines'] : []).includes(key)) ||
+        data.operationId !== undefined && (typeof data.operationId !== 'string' || !/^[A-Za-z0-9-]{1,128}$/.test(data.operationId)) ||
+        data.lines !== undefined && (!Number.isInteger(data.lines) || data.lines < 1 || data.lines > 200)) throw new Error('引擎操作参数无效。');
+    return this.query('engine', { action, args: data, session });
   }
 
   close() { this.fail(); }

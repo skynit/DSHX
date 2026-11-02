@@ -8332,3 +8332,482 @@ test('Android micro apps SDK recovers a late connection without sending expired 
   assert.equal((await window.dshx.info()).id, 'late-app');
   assert.equal(sent, 1, 'expired click must not be sent after connecting');
 });
+
+// Node 工具与插件管理：只在文件尾追加，便于与其他任务并行维护。
+test('Android engine policy exposes official skill and root management without granting child writes', async () => {
+  const { toolAvailable, toolReason } = await import(pathToFileURL(join(core, 'policy.mjs')));
+  const { policyHost } = await import(pathToFileURL(join(core, 'host.mjs')));
+  const previous = policyHost.cachedMode;
+  const root = { session: { id: 'engine-root', header: {} } };
+  const child = { session: { id: 'engine-child', header: { origin: 'subagent' } } };
+  try {
+    policyHost.cachedMode = () => 'full';
+    for (const name of ['skill', 'plugin_manager', 'plugin_market', 'engine_status', 'engine_info', 'engine_logs', 'engine_plugins', 'engine_restart']) {
+      assert.equal(toolAvailable(name, root), true, name);
+      assert.equal(toolReason({ name, agent: root, arguments: {} }), undefined, name);
+    }
+    assert.equal(toolAvailable('plugin_manager', child), false);
+    assert.equal(toolAvailable('plugin_market', child), false);
+    assert.equal(toolAvailable('engine_restart', child), false);
+    policyHost.cachedMode = () => 'read-only';
+    for (const name of ['skill', 'engine_status', 'engine_info', 'engine_logs', 'engine_plugins']) assert.equal(toolAvailable(name, root), true, name);
+    for (const name of ['plugin_manager', 'plugin_market', 'engine_restart']) assert.equal(toolAvailable(name, root), false, name);
+    policyHost.cachedMode = () => 'unavailable';
+    assert.equal(toolAvailable('engine_status', root), false);
+  } finally { policyHost.cachedMode = previous; }
+});
+
+test('Android engine tools return stable entry and live plugin phases without web credentials', async () => {
+  const { callEngine } = await import(pathToFileURL(join(core, 'engine.mjs')));
+  const root = { session: { id: 'engine-root', header: {} } };
+  const calls = [], plugins = [{ entryId: 'runtime-1', moduleName: '@demo/live', enabled: true, fiberPhase: 'failed', config: { token: 'hidden' } }];
+  const ctx = { get: name => name === 'pluginManager' ? {
+    listPlugins: async () => plugins,
+    listBundles: async () => [{ name: '@demo/bundle', installed: true, enabled: true, version: '1.0', rows: [], source: 'https://user:password@example.com/pkg?token=hidden' }],
+  } : undefined };
+  const host = { mode: async () => 'read-only', engine: async (...args) => {
+    calls.push(args);
+    return { state: 'running', webUrl: 'http://127.0.0.1:1234/?token=hidden', token: 'hidden', nested: { authorization: 'hidden' } };
+  } };
+  const exec = { agent: root, signal: new AbortController().signal };
+  const status = await callEngine(ctx, host, 'status', {}, exec);
+  assert.equal(status.stableUrl, 'dshx://engine');
+  assert.equal(status.state, 'running');
+  assert.doesNotMatch(JSON.stringify(status), /hidden|127\.0\.0\.1|authorization|webUrl/);
+  assert.deepEqual(calls, [['status', {}, 'engine-root']]);
+  const inventory = await callEngine(ctx, host, 'plugins', {}, exec);
+  assert.equal(inventory.plugins[0].fiberPhase, 'failed');
+  assert.equal(inventory.plugins[0].entryId, 'runtime-1');
+  assert.equal(inventory.bundles[0].installed, true);
+  assert.doesNotMatch(JSON.stringify(inventory), /hidden|password|source|config/);
+  plugins[0].fiberPhase = 'active';
+  assert.equal((await callEngine(ctx, host, 'plugins', {}, exec)).plugins[0].fiberPhase, 'active');
+  await assert.rejects(callEngine(ctx, host, 'restart', {}, exec), /权限/);
+  await assert.rejects(callEngine(ctx, host, 'logs', { lines: 201 }, exec), /参数/);
+  await assert.rejects(callEngine(ctx, host, 'status', { webUrl: 'anything' }, exec), /参数/);
+});
+
+test('Android engine restart preserves host receipt and rejects a fabricated success', async () => {
+  const { callEngine } = await import(pathToFileURL(join(core, 'engine.mjs')));
+  const exec = { agent: { session: { id: 'root', header: {} } }, signal: new AbortController().signal };
+  const receipt = { operationId: 'native-request-7', state: 'accepted', done: false, accepted: true };
+  const host = { mode: async () => 'full', engine: async () => receipt };
+  assert.deepEqual(await callEngine({ get() {} }, host, 'restart', {}, exec), receipt);
+  host.engine = async () => ({ status: 'success' });
+  await assert.rejects(callEngine({ get() {} }, host, 'restart', {}, exec), /请求编号/);
+  host.engine = async () => receipt;
+  await assert.rejects(callEngine({ get() {} }, host, 'restart', {}, { ...exec, agent: { session: { id: 'child', header: { origin: 'subagent' } } } }), /主/);
+});
+
+test('Android engine PolicyHost sends the agreed frame and preserves the connection after a refusal', async t => {
+  const requests = [], sessions = [{ id: 'root', mode: 'full' }];
+  const server = createServer(socket => {
+    let buffer = '';
+    socket.setEncoding('utf8');
+    socket.on('data', chunk => {
+      buffer += chunk;
+      let newline;
+      while ((newline = buffer.indexOf('\n')) >= 0) {
+        const frame = JSON.parse(buffer.slice(0, newline)); buffer = buffer.slice(newline + 1);
+        if (frame.method) requests.push(frame);
+        const ok = frame.action !== 'info';
+        socket.write(JSON.stringify({ id: frame.id ?? 0, ok, ...(ok ? {
+          state: { instance: 'engine-test', connected: true, revision: 1, sessions },
+          result: { operationId: 'host-restart-1', state: 'accepted', done: false, accepted: true },
+        } : { error: 'engine unavailable' }) }) + '\n');
+      }
+    });
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const host = new PolicyHost({ port: server.address().port, instance: 'engine-test', token: 'fixture-only' });
+  t.after(async () => { host.close(); await new Promise(resolve => server.close(resolve)); });
+  await assert.rejects(host.engine('invalid', {}, 'root'), /参数/);
+  await assert.rejects(host.engine('status', {}, ''), /会话/);
+  await assert.rejects(host.engine('info', {}, 'root'), /engine unavailable/);
+  assert.equal((await host.engine('restart', {}, 'root')).operationId, 'host-restart-1');
+  assert.deepEqual(requests.at(-1), { id: 2, method: 'engine', action: 'restart', args: {}, session: 'root' });
+  assert.equal(host.connected, true);
+  assert.equal(host.pending.size, 0);
+});
+
+test('Android engine official tools keep skill loading management outcomes and upstream approvals', async t => {
+  const { Context } = await load('@deepseek-ai/cordis');
+  const { createScope } = await load('@deepseek-ai/dsh-scope');
+  const { policyHost } = await import(pathToFileURL(join(core, 'host.mjs')));
+  const { toolReason, toolAvailable } = await import(pathToFileURL(join(core, 'policy.mjs')));
+  const ctx = new Context(), scopes = [], detach = [];
+  const previous = policyHost.cachedMode;
+  t.after(async () => { detach.reverse().forEach(stop => stop()); scopes.reverse().forEach(scope => scope.dispose()); await ctx.fiber.dispose(); policyHost.cachedMode = previous; });
+  policyHost.cachedMode = () => 'full';
+  let mode = 'danger-full-access', application = 'applied', operations = 0, approvals = 0;
+  const changes = [];
+  ctx.provide('workingDirectory', { ensure: async () => workspace });
+  ctx.provide('sandboxPolicy', { resolve: () => ({ mode, workspaceRoot: workspace }) });
+  ctx.provide('pluginManager', {
+    listPlugins: async () => [{ entryId: 'actual-plugin', enabled: true, fiberPhase: 'active' }],
+    listBundles: async () => [],
+    setPluginEnabled: async (target, enabled) => {
+      operations++; changes.push({ target, enabled });
+      return { application, changed: true, stage: 'enable', target, enabled, ...(application === 'restart-required' ? { restartReason: 'no-hmr' } : {}) };
+    },
+  });
+  for (const name of ['system-prompt', 'tools', 'agent', 'skill']) {
+    const plugin = await load('@deepseek-ai/dsh-' + name);
+    await ctx.plugin(plugin.default ?? plugin);
+  }
+  ctx.tools.guard(toolReason);
+  await ctx.plugin(await load('@deepseek-ai/dsh-tool-skill'));
+  await ctx.plugin(await load('@deepseek-ai/dsh-plugin-manager/tools'));
+  await ctx.plugin(await load('@deepseek-ai/dsh-plugin-market/tools'));
+  assert.equal(ctx.tools.get('plugin_market'), undefined, 'an absent market must not be fabricated');
+  ctx.provide('pluginMarket', { listIndexes: () => [{ url: 'https://example.com/index.json', title: { en: 'Configured index' } }] });
+  await waitFor(() => ctx.tools.get('plugin_market'), 'optional market tool did not register');
+  assert.ok(ctx.tools.get('plugin_market'), 'the official optional injection must register when its service appears');
+  const owner = parent => {
+    const scope = createScope(ctx, {}); scopes.push(scope);
+    const id = parent ? 'official-child' : 'official-root';
+    const agent = { id, ctx: scope.ctx, session: { id, header: {} } };
+    detach.push(ctx.agents.enter(agent, parent));
+    return agent;
+  };
+  const root = owner(), child = owner(root);
+  const call = (name, args, agent = root) => ctx.tools.execute({ name, arguments: args, agent, signal: new AbortController().signal, callId: 'official-tool' });
+  for (const name of ['skill', 'plugin_manager', 'plugin_market']) assert.ok(ctx.tools.schemas(root).some(tool => tool.name === name), name);
+  assert.equal(toolAvailable('plugin_manager', child), false, 'live ownership must catch children without header metadata');
+  ctx.skills.register({ name: 'engine-example', description: '现有注册表技能', source: 'runtime', content: '读取既有技能正文。' });
+  ctx.skills.register({ name: 'user-only-example', description: '只供用户调用', source: 'runtime', content: '不向模型开放', invocation: { modelInvocable: false, userInvocable: true } });
+  const skill = await call('skill', { name: 'engine-example' });
+  assert.equal(skill.isError, false, JSON.stringify(skill));
+  assert.equal(skill.value.content, '读取既有技能正文。');
+  assert.equal((await call('skill', { name: 'user-only-example' })).isError, true);
+  assert.equal((await call('plugin_market', { action: 'list_indexes' })).isError, false);
+  for (application of ['applied', 'restart-required', 'overridden', 'failed', 'cancelled']) {
+    const result = await call('plugin_manager', { action: 'set_plugin', target: 'actual-plugin', enabled: true });
+    assert.equal(result.isError, false, JSON.stringify(result));
+    assert.equal(JSON.parse(result.value).application, application);
+  }
+  assert.equal(operations, 5);
+  assert.equal((await call('plugin_manager', { action: 'set_plugin', target: 'actual-plugin', enabled: false }, child)).isError, true);
+  assert.equal(operations, 5, 'a child must not reach the shared manager');
+  mode = 'workspace-write';
+  const noChannel = await call('plugin_manager', { action: 'set_plugin', target: 'actual-plugin', enabled: false });
+  assert.equal(noChannel.isError, true);
+  assert.equal(operations, 5, 'upstream approval cannot be bypassed by the Android tool gate');
+  ctx.provide('approval', { request: async () => { approvals++; return 'rejected'; } });
+  const refused = await call('plugin_manager', { action: 'set_plugin', target: 'actual-plugin', enabled: false });
+  assert.equal(refused.isError, true);
+  assert.equal(approvals, 1);
+  assert.equal(operations, 5);
+  assert.match(ctx.tools.get('plugin_manager').parameters.properties.approvedBuilds.description, /explicitly approves/);
+  assert.match(ctx.tools.get('plugin_manager').parameters.properties.acceptRisk.description, /explicit permission/);
+});
+
+test('Android engine boot overlay mounts official management and engine without another skill store', async () => {
+  const { composeEntries, loadOverlayPatches } = await load('@deepseek-ai/dsh-app-boot');
+  const patch = join(directory, 'engine-overlay.yml');
+  await writeFile(patch, (await readFile(join(core, 'android.patch.yml'), 'utf8')).replaceAll('@CORE@', core));
+  const entries = composeEntries([
+    loadOverlayPatches('engine-test', join(core, 'lib/node_modules/@deepseek-ai/dsh-base/cordis.patch.yml')),
+    loadOverlayPatches('engine-test', join(core, 'lib/node_modules/@deepseek-ai/dsh-web-app/cordis.patch.yml')),
+    loadOverlayPatches('engine-test', patch),
+  ], assert.fail);
+  assert.equal(entries.find(row => row.id === 'dshx-android-engine').name, `file:${core}/engine.mjs`);
+  for (const name of ['plugin-manager', 'plugin-market']) assert.equal(entries.find(row => row.id === `dshx-${name}-tools`).name, `@deepseek-ai/dsh-${name}/tools`);
+  assert.equal(entries.filter(row => row.id.startsWith('dshx-') && /skill/.test(row.name)).length, 0);
+});
+
+test('Android engine registered diagnostics validate arguments redact logs and fail closed on revoked modes', async t => {
+  const { Context } = await load('@deepseek-ai/cordis');
+  const { policyHost } = await import(pathToFileURL(join(core, 'host.mjs')));
+  const Engine = await import(pathToFileURL(join(core, 'engine.mjs')));
+  const ctx = new Context(), previous = { mode: policyHost.mode, engine: policyHost.engine };
+  t.after(async () => { Object.assign(policyHost, previous); await ctx.fiber.dispose(); });
+  for (const name of ['system-prompt', 'tools', 'agent']) {
+    const plugin = await load('@deepseek-ai/dsh-' + name); await ctx.plugin(plugin.default ?? plugin);
+  }
+  await ctx.plugin(Engine);
+  assert.deepEqual([...Engine.engineToolNames].sort(), [...ctx.tools.view().visible.keys()].sort());
+  const exec = { agent: { session: { id: 'root', header: {} } }, signal: new AbortController().signal };
+  let sends = 0;
+  policyHost.mode = async () => 'full';
+  policyHost.engine = async () => { sends++; return { lines: ['{"token":"private-web-token"}', 'Authorization: Bearer private-bearer', 'http://localhost/?token=private-url-token'] }; };
+  const logs = await ctx.tools.get('engine_logs').execute({ lines: 3 }, exec);
+  assert.doesNotMatch(JSON.stringify(logs), /private-web-token|private-bearer|private-url-token/);
+  await assert.rejects(ctx.tools.get('engine_logs').execute({ lines: '3' }, exec), { code: 'INVALID_ARGS' });
+  policyHost.mode = async () => 'unavailable';
+  await assert.rejects(ctx.tools.get('engine_status').execute({}, exec), /权限/);
+  assert.equal(sends, 1);
+  assert.equal((await Engine.callEngine(ctx, { mode: async () => 'read-only' }, 'plugins', {}, exec)).available, false);
+});
+
+test('Android engine status forwards original operationId after disconnect and logs use native lines', async t => {
+  const { callEngine } = await import(pathToFileURL(join(core, 'engine.mjs')));
+  const operationId = '58e9e21e-34b0-41af-8409-01bf199de3f8';
+  const requests = [], sockets = new Set();
+  let receiptSent;
+  const sent = new Promise(resolve => { receiptSent = resolve; });
+  const server = createServer(socket => {
+    sockets.add(socket); socket.on('close', () => sockets.delete(socket)); socket.on('error', () => {});
+    let buffer = ''; socket.setEncoding('utf8');
+    socket.on('data', chunk => {
+      buffer += chunk;
+      let newline;
+      while ((newline = buffer.indexOf('\n')) >= 0) {
+        const frame = JSON.parse(buffer.slice(0, newline)); buffer = buffer.slice(newline + 1);
+        requests.push(frame);
+        const result = frame.method === 'engine' ? frame.action === 'restart'
+          ? { operationId, state: 'accepted', done: false, accepted: true }
+          : frame.action === 'status' ? { operation: { operationId: frame.args.operationId, state: 'succeeded', done: true } }
+          : { text: 'safe diagnostic log' } : {};
+        socket.write(JSON.stringify({ id: frame.id ?? 0, ok: true, result, state: {
+          instance: 'engine-reconnect', connected: true, revision: 1, sessions: [{ id: 'root', mode: 'full' }],
+        } }) + '\n', () => { if (frame.action === 'restart') { socket.end(); receiptSent(); } });
+      }
+    });
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const config = { port: server.address().port, instance: 'engine-reconnect', token: 'fixture-only' };
+  const first = new PolicyHost(config), second = new PolicyHost(config);
+  t.after(async () => { first.close(); second.close(); for (const socket of sockets) socket.destroy(); await new Promise(resolve => server.close(resolve)); });
+  const exec = { agent: { session: { id: 'root', header: {} } }, signal: new AbortController().signal };
+  const receipt = await callEngine({ get() {} }, first, 'restart', {}, exec);
+  assert.equal(receipt.operationId, operationId);
+  await sent;
+  first.close();
+  const status = await callEngine({ get() {} }, second, 'status', { operationId }, exec);
+  assert.equal(status.operation.operationId, operationId);
+  assert.equal(status.operation.state, 'succeeded');
+  assert.equal(status.stableUrl, 'dshx://engine');
+  await callEngine({ get() {} }, second, 'logs', { lines: 7 }, exec);
+  assert.deepEqual(requests.at(-1).args, { lines: 7 });
+  const count = requests.length;
+  for (const args of [{ operationId: '' }, { operationId: 'a'.repeat(129) }, { operationId: '../invalid' }]) {
+    await assert.rejects(second.engine('status', args, 'root'), /参数/);
+  }
+  await assert.rejects(second.engine('logs', { limit: 10 }, 'root'), /参数/);
+  await assert.rejects(second.engine('logs', { lines: 201 }, 'root'), /参数/);
+  assert.equal(requests.length, count, 'invalid native arguments must not send requests');
+});
+
+test('Android engine official management uses real service for persistent bundle state and restart outcome', async t => {
+  const { Context } = await load('@deepseek-ai/cordis');
+  const { default: PluginManager } = await load('@deepseek-ai/dsh-plugin-manager');
+  const { policyHost } = await import(pathToFileURL(join(core, 'host.mjs')));
+  const { toolReason } = await import(pathToFileURL(join(core, 'policy.mjs')));
+  const dir = await mkdtemp(join(directory, 'engine-manager-'));
+  const bundle = join(dir, 'node_modules/dshx-engine-fixture');
+  await mkdir(bundle, { recursive: true });
+  await writeFile(join(bundle, 'package.json'), JSON.stringify({ name: 'dshx-engine-fixture', version: '1.0.0', dsh: { bundle: { patch: './cordis.patch.yml' } } }));
+  await writeFile(join(bundle, 'cordis.patch.yml'), '[]\n');
+  await writeFile(join(dir, 'package.json'), JSON.stringify({ private: true, dependencies: { 'dshx-engine-fixture': 'file:./node_modules/dshx-engine-fixture' }, dsh: { profile: { bundles: [] } } }));
+  await writeFile(join(dir, 'cordis.patch.yml'), '[]\n');
+  const ctx = new Context(), previous = policyHost.cachedMode;
+  t.after(async () => { await ctx.fiber.dispose(); policyHost.cachedMode = previous; });
+  policyHost.cachedMode = () => 'full';
+  ctx.provide('loader', { entries: () => [] });
+  ctx.provide('profileContext', { name: 'engine-fixture', dir, patchPath: join(dir, 'cordis.patch.yml'), installAnchor: require.resolve('@deepseek-ai/dsh/package.json'), cwd: dir, home: dir, startedBundles: [], overlays: [] });
+  ctx.provide('sandboxPolicy', { resolve: () => ({ mode: 'danger-full-access', workspaceRoot: workspace }) });
+  await ctx.plugin(PluginManager, { fallbackRegistries: [] });
+  for (const name of ['system-prompt', 'tools']) { const plugin = await load('@deepseek-ai/dsh-' + name); await ctx.plugin(plugin.default ?? plugin); }
+  await ctx.plugin(await load('@deepseek-ai/dsh-plugin-manager/tools'));
+  ctx.tools.guard(toolReason);
+  const call = args => ctx.tools.execute({ name: 'plugin_manager', arguments: args,
+    agent: { session: { id: 'root', header: {} } }, signal: new AbortController().signal, callId: 'real-manager' });
+  for (const enabled of [true, false]) {
+    const result = await call({ action: 'set_bundle', target: 'dshx-engine-fixture', enabled });
+    assert.equal(result.isError, false, JSON.stringify(result));
+    assert.equal(JSON.parse(result.value).application, 'restart-required', result.value);
+    assert.equal(JSON.parse(result.value).restartReason, 'no-hmr');
+    assert.equal(JSON.parse(await readFile(join(dir, 'package.json'), 'utf8')).dsh.profile.bundles.includes('dshx-engine-fixture'), enabled);
+  }
+  const { pluginStatus } = await import(pathToFileURL(join(core, 'engine.mjs')));
+  const status = await pluginStatus(ctx, { limit: 100 });
+  assert.equal(status.bundles.find(row => row.name === 'dshx-engine-fixture').enabled, false);
+  assert.equal(status.bundles.find(row => row.name === 'dshx-engine-fixture').installed, true);
+});
+
+// 供父 agent 追加到现有 core/test.mjs；使用该文件现有的 test、assert、core、directory、require、spawn 等。
+test('Android peer reports downgrade only actual compatible host dependencies per occurrence', async () => {
+  const { classifyPeerIssues } = await import(pathToFileURL(join(core, 'plugins.mjs')));
+  const zodVersion = require('zod/package.json').version;
+  const dshVersion = require('@deepseek-ai/dsh/package.json').version;
+  const issue = wantedRange => ({ wantedRange, optional: false, parents: [{ name: 'peer-fixture', version: '1.0.0' }] });
+  const result = await classifyPeerIssues(core, { '.': {
+    missing: {
+      zod: [issue(zodVersion), issue('>=9999.0.0'), issue(''), issue('not-a-range')],
+      '@deepseek-ai/dsh': [issue(dshVersion)],
+      'dshx-missing-peer-fixture': [issue('^1.0.0')]
+    },
+    bad: { zod: [{ ...issue(zodVersion), foundVersion: '0.0.1' }] },
+    conflicts: [], intersections: {}
+  } });
+  assert.equal(result.provided.length, 2);
+  assert.equal(result.provided.find(item => item.name === 'zod').version, zodVersion);
+  assert.equal(result.provided.find(item => item.name === '@deepseek-ai/dsh').version, dshVersion);
+  assert.deepEqual(result.missing.filter(item => item.name === 'zod').map(item => item.wantedRange), ['>=9999.0.0', '', 'not-a-range']);
+  assert.ok(result.missing.some(item => item.name === 'dshx-missing-peer-fixture'));
+  assert.equal(result.bad.length, 1);
+  assert.equal(result.bad[0].foundVersion, '0.0.1');
+});
+
+test('Android peer classifier refuses incomplete and unknown report formats', async () => {
+  const { classifyPeerIssues } = await import(pathToFileURL(join(core, 'plugins.mjs')));
+  for (const report of [undefined, null, {}, [], { '.': {} },
+    { '.': { missing: { zod: [{}] }, bad: {}, conflicts: [], intersections: {} } },
+    { '.': { missing: { zod: [] }, bad: {}, conflicts: [], intersections: {} } },
+    { '.': { missing: {}, bad: {}, conflicts: [], intersections: {}, futureIssues: {} } }
+  ]) await assert.rejects(classifyPeerIssues(core, report), /无法识别/);
+});
+
+test('Android pnpm output retains empty unknown reports stderr and nonzero exit codes', async () => {
+  const runtime = await mkdtemp(join(directory, 'peer-output-'));
+  const bin = join(runtime, 'lib/node_modules/pnpm/bin');
+  await mkdir(bin, { recursive: true });
+  const reports = [undefined, null, {}, [], { '.': {} },
+    { '.': { missing: { zod: [{}] }, bad: {}, conflicts: [], intersections: {} } },
+    { '.': { missing: {}, bad: {}, conflicts: [], intersections: {} } },
+    { '.': { missing: {}, bad: {}, conflicts: [], intersections: {}, futureIssues: {} } }
+  ];
+  const lines = reports.map(issuesByProjects => JSON.stringify({ name: 'pnpm:peer-dependency-issues', level: 'debug', issuesByProjects }));
+  lines.push('null', JSON.stringify('unknown'), JSON.stringify({ name: 'pnpm:future-warning', level: 'warn', message: 'retain this warning' }));
+  await writeFile(join(bin, 'pnpm.cjs'), `process.stdout.write(${JSON.stringify(lines.join('\n') + '\n')});process.stderr.write('unmodified stderr\\n');process.exitCode=37;`);
+  const source = `import {runPnpm} from ${JSON.stringify(pathToFileURL(join(core, 'plugins.mjs')).href)};process.exitCode=await runPnpm(${JSON.stringify(runtime)},['install']);`;
+  const child = spawn(process.execPath, ['--input-type=module', '-e', source], { cwd: runtime, stdio: ['ignore', 'pipe', 'pipe'] });
+  let stdout = '', stderr = '';
+  child.stdout.on('data', bytes => { stdout += bytes; });
+  child.stderr.on('data', bytes => { stderr += bytes; });
+  const code = await new Promise((resolve, reject) => { child.once('error', reject); child.once('close', resolve); });
+  assert.equal(code, 37);
+  for (const line of lines) assert.ok(stderr.includes(line), line);
+  assert.ok(stderr.includes('unmodified stderr'));
+  assert.doesNotMatch(stdout, /包安装和文件检查完成/);
+});
+
+test('Android engine cancelled upstream restart loses its result but a new connection recovers the same session receipt', { timeout: 10000 }, async t => {
+  const { Context } = await load('@deepseek-ai/cordis');
+  const { policyHost } = await import(pathToFileURL(join(core, 'host.mjs')));
+  const { toolReason } = await import(pathToFileURL(join(core, 'policy.mjs')));
+  const Engine = await import(pathToFileURL(join(core, 'engine.mjs')));
+  const operationId = 'e7332cf7-a407-4fb1-bb94-966c295d0610';
+  const otherId = 'c95f9210-c388-476d-86af-36b16e196096';
+  // 模拟宿主持久层：连接销毁后仍保留按会话归属的回执；真实写盘由原生测试覆盖。
+  const receipts = new Map(), requests = [], sockets = new Set();
+  const reserved = Promise.withResolvers();
+  let releaseReply, restartCount = 0, connections = 0;
+  const server = createServer(socket => {
+    connections++; sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket)); socket.on('error', () => {});
+    socket.setEncoding('utf8'); let buffer = '';
+    socket.on('data', chunk => {
+      buffer += chunk; let newline;
+      while ((newline = buffer.indexOf('\n')) >= 0) {
+        const frame = JSON.parse(buffer.slice(0, newline)); buffer = buffer.slice(newline + 1);
+        requests.push(frame);
+        const reply = result => socket.write(JSON.stringify({ id: frame.id ?? 0, ok: true, result,
+          state: { instance: 'engine-cancel', connected: true, revision: 1,
+            sessions: ['root-session', 'other-session', 'empty-session'].map(id => ({ id, mode: 'full' })) },
+        }) + '\n');
+        if (frame.method === 'engine' && frame.action === 'restart') {
+          const receipt = { operationId, state: 'accepted', done: false, accepted: true };
+          receipts.set(frame.session, receipt); restartCount++;
+          // 另一会话在全局顺序上更晚，防止测试误把全局 latest 当成本会话回执。
+          receipts.set('other-session', { operationId: otherId, state: 'succeeded', done: true });
+          releaseReply = () => reply(receipt);
+          reserved.resolve();
+        } else if (frame.method === 'engine' && frame.action === 'status') {
+          reply({ operation: receipts.get(frame.session) ?? { state: 'idle', done: true }, stableUrl: 'dshx://engine' });
+        } else reply({});
+      }
+    });
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const config = { port: server.address().port, instance: 'engine-cancel', token: 'fixture-only' };
+  const first = new PolicyHost(config), second = new PolicyHost(config), ctx = new Context();
+  const original = { mode: policyHost.mode, engine: policyHost.engine, cachedMode: policyHost.cachedMode };
+  let active = first;
+  t.after(async () => {
+    first.close(); second.close(); Object.assign(policyHost, original);
+    await ctx.fiber.dispose();
+    for (const socket of sockets) socket.destroy();
+    await new Promise(resolve => server.close(resolve));
+  });
+  policyHost.mode = (...args) => active.mode(...args);
+  policyHost.engine = (...args) => active.engine(...args);
+  policyHost.cachedMode = (...args) => active.cachedMode(...args);
+  for (const name of ['system-prompt', 'tools', 'agent']) {
+    const plugin = await load('@deepseek-ai/dsh-' + name); await ctx.plugin(plugin.default ?? plugin);
+  }
+  await ctx.plugin(Engine); ctx.tools.guard(toolReason);
+  await first.connect();
+  const call = (name, session, signal = new AbortController().signal) => ctx.tools.execute({ name, arguments: {},
+    agent: { session: { id: session, header: {} } }, signal, callId: 'cancelled-restart-check' });
+  const controller = new AbortController();
+  const pending = call('engine_restart', 'root-session', controller.signal);
+  await reserved.promise;
+  assert.equal(receipts.get('root-session').operationId, operationId, '宿主已保存回执后才模拟用户取消');
+  controller.abort(new Error('用户取消生成'));
+  releaseReply();
+  const cancelled = await pending;
+  assert.equal(cancelled.isError, true);
+  assert.equal(cancelled.error.info.code, 'ABORTED', '必须由真实上游执行器替换结果');
+  assert.equal(cancelled.value, undefined);
+  assert.equal(JSON.stringify(cancelled).includes(operationId), false, '被取消的工具结果确实丢失了编号');
+  first.close(); active = second;
+  await second.connect();
+  const recovered = await call('engine_status', 'root-session');
+  assert.equal(recovered.isError, false, JSON.stringify(recovered));
+  assert.equal(recovered.value.operation.operationId, operationId);
+  assert.equal(recovered.value.operation.state, 'accepted');
+  assert.equal(recovered.value.stableUrl, 'dshx://engine');
+  assert.deepEqual(requests.at(-1).args, {}, '恢复查询不依赖已经丢失的 operationId');
+  assert.equal(requests.at(-1).session, 'root-session');
+  const other = await call('engine_status', 'other-session');
+  assert.equal(other.value.operation.operationId, otherId);
+  const empty = await call('engine_status', 'empty-session');
+  assert.equal(empty.value.operation.state, 'idle');
+  assert.equal(empty.value.operation.operationId, undefined, '没有重启记录的会话不能读到全局最近记录');
+  assert.equal(restartCount, 1, '恢复查询不得自动重发重启');
+  assert.equal(connections, 2);
+  assert.match(ctx.tools.get('engine_status').description, /当前会话/);
+  assert.match(ctx.tools.get('engine_status').parameters.properties.operationId.description, /省略/);
+  assert.match(ctx.tools.get('engine_restart').description, /持久保存/);
+});
+
+// 供父 agent 追加到现有 core/test.mjs；在重建后的 Android 运行包内定向执行。
+test('Android dsh wrapper starts with actual scrubbedParentEnv without partial policy authentication', async () => {
+  const source = `
+    import assert from 'node:assert/strict';
+    import { spawn } from 'node:child_process';
+    import { scrubbedParentEnv } from ${JSON.stringify(pathToFileURL(require.resolve('@deepseek-ai/dsh-subprocess')).href)};
+    const env = scrubbedParentEnv();
+    assert.equal(env.DSHX_POLICY_PORT, '1');
+    assert.equal(env.DSHX_POLICY_INSTANCE, 'wrapper-test');
+    assert.equal(Object.hasOwn(env, 'DSHX_POLICY_TOKEN'), false);
+    const child = spawn(${JSON.stringify(join(core, 'bin/dsh'))}, ['--help'], {
+      env, stdio: ['ignore', 'pipe', 'pipe'], signal: AbortSignal.timeout(30000)
+    });
+    let stdout = '', stderr = '';
+    child.stdout.on('data', bytes => { stdout += bytes; });
+    child.stderr.on('data', bytes => { stderr += bytes; });
+    const code = await new Promise((resolve, reject) => {
+      child.once('error', reject); child.once('close', resolve);
+    });
+    assert.equal(code, 0, stderr);
+    assert.match(stdout, /Usage|usage|用法|Options|options/);
+    assert.doesNotMatch(stderr, /原生工具权限连接中断/);
+    process.stdout.write('scrubbedParentEnv wrapper help passed');
+  `;
+  const child = spawn(process.execPath, ['--input-type=module', '-e', source], {
+    cwd: directory,
+    env: { ...process.env, DSHX_POLICY_PORT: '1', DSHX_POLICY_INSTANCE: 'wrapper-test', DSHX_POLICY_TOKEN: 'fixture-only' },
+    stdio: ['ignore', 'pipe', 'pipe'], signal: AbortSignal.timeout(45000)
+  });
+  let stdout = '', stderr = '';
+  child.stdout.on('data', bytes => { stdout += bytes; });
+  child.stderr.on('data', bytes => { stderr += bytes; });
+  const code = await new Promise((resolve, reject) => {
+    child.once('error', reject); child.once('close', resolve);
+  });
+  assert.equal(code, 0, stderr);
+  assert.match(stdout, /scrubbedParentEnv wrapper help passed/);
+});

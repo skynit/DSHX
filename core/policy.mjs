@@ -6,11 +6,13 @@ import { phoneToolNames } from './phone.mjs';
 import { appToolNames } from './apps.mjs';
 import { isMemoryTool, memoryToolAvailable } from './memory.mjs';
 import { isKnowledgeTool, knowledgeToolAvailable } from './knowledge.mjs';
+import { engineToolNames, mainAgent } from './engine.mjs';
 
 // The workspace is the default directory, not a sandbox for Full sessions.
 const workspace = process.env.DSHX_WORKSPACE;
 const fileTools = new Set(['read', 'write', 'edit', 'glob', 'grep']);
 const commandTools = new Set(['bash', 'bash_isolated', 'terminal_open', 'terminal_send', 'terminal_read', 'terminal_signal', 'terminal_close', 'terminal_list']);
+const managementTools = new Set(['plugin_manager', 'plugin_market']);
 const access = new AsyncLocalStorage();
 
 export function inFileTool() { return access.getStore() !== undefined; }
@@ -18,6 +20,13 @@ export function fileMode() { return access.getStore()?.androidMode; }
 
 export async function runTool(exec, callback) {
   let scope = access.getStore();
+  if (exec.name === 'skill' || managementTools.has(exec.name)) {
+    const mode = await policyHost.mode(exec.agent?.session?.id);
+    if (mode === 'unavailable' || managementTools.has(exec.name) && (mode !== 'full' || !mainAgent(exec.agent))) {
+      throw new Error('原生会话权限不允许当前技能或插件管理操作。');
+    }
+    exec.signal?.throwIfAborted();
+  }
   if (fileTools.has(exec.name) || commandTools.has(exec.name)) {
     const mode = await policyHost.mode(exec.agent?.session?.id);
     if (mode === 'unavailable' || commandTools.has(exec.name) && mode !== 'full' || mode === 'read-only' && ['write', 'edit'].includes(exec.name)) {
@@ -63,7 +72,9 @@ export async function modelPath(path, cwd = workspace, signal) {
 
 export function toolAvailable(name, agent) {
   const mode = policyHost.cachedMode(agent?.session?.id);
-  return Boolean(workspace) && (fileTools.has(name) || memoryToolAvailable(name) || knowledgeToolAvailable(name, agent) || (commandTools.has(name) || phoneToolNames.has(name) || appToolNames.has(name)) && mode === 'full') && mode !== 'unavailable' &&
+  const engine = engineToolNames.has(name) && (name !== 'engine_restart' || mode === 'full' && mainAgent(agent));
+  const management = managementTools.has(name) && mode === 'full' && mainAgent(agent);
+  return Boolean(workspace) && (fileTools.has(name) || name === 'skill' || engine || management || memoryToolAvailable(name) || knowledgeToolAvailable(name, agent) || (commandTools.has(name) || phoneToolNames.has(name) || appToolNames.has(name)) && mode === 'full') && mode !== 'unavailable' &&
     !(mode === 'read-only' && ['write', 'edit'].includes(name));
 }
 
@@ -71,7 +82,7 @@ export function toolReason(exec) {
   if (!workspace) return 'Android 工作区尚未配置，工具不可用。';
   if (isMemoryTool(exec.name) && !memoryToolAvailable(exec.name)) return '记忆功能尚未启用或尚未生效。';
   if (isKnowledgeTool(exec.name) && !knowledgeToolAvailable(exec.name, exec.agent)) return '知识来源未启用、尚未就绪或无法确认当前用户请求。';
-  if (!fileTools.has(exec.name) && !commandTools.has(exec.name) && !phoneToolNames.has(exec.name) && !appToolNames.has(exec.name) && !isMemoryTool(exec.name) && !isKnowledgeTool(exec.name)) return '此 Android 开发版尚未适配该模型工具。';
+  if (!fileTools.has(exec.name) && exec.name !== 'skill' && !managementTools.has(exec.name) && !engineToolNames.has(exec.name) && !commandTools.has(exec.name) && !phoneToolNames.has(exec.name) && !appToolNames.has(exec.name) && !isMemoryTool(exec.name) && !isKnowledgeTool(exec.name)) return '此 Android 开发版尚未适配该模型工具。';
   if (!toolAvailable(exec.name, exec.agent)) return '当前会话尚未连接，工具暂不可用。';
   if (exec.arguments?.sandbox_permissions !== undefined) return 'Android 当前默认完全权限，不支持单次沙箱提权参数。';
   if (commandTools.has(exec.name) && exec.arguments?.run_in_background === true) return 'Android 当前仅开放前台命令。';

@@ -40,6 +40,7 @@ class EngineService : Service() {
     private var running = false
     private var retryDelay = 1_000L
     private var readySince = 0L
+    private var restartId: String? = null
     private val main = Handler(Looper.getMainLooper())
     private val retry = Runnable { startEngine() }
     private val taskPower = TaskPower(this)
@@ -47,6 +48,7 @@ class EngineService : Service() {
     private val listener: (EngineState) -> Unit = { state ->
         taskPower.setActive(running && state.taskRunning)
         if (state.url != null && readySince == 0L) readySince = SystemClock.elapsedRealtime()
+        restartId?.let { if (engine.restartStatus(it).optString("state") == "succeeded") restartId = null }
         getSystemService(NotificationManager::class.java).notify(1, notification(state.phase))
     }
 
@@ -67,6 +69,21 @@ class EngineService : Service() {
             if (!engine.stop()) finish()
             return START_NOT_STICKY
         }
+        if (intent?.action == "restart") {
+            val id = intent.getStringExtra("operationId")
+            if (id == null || !engine.beginRestart(id)) {
+                if (!running) finish()
+                return if (running) START_STICKY else START_NOT_STICKY
+            }
+            restartId = id
+            running = true
+            retryDelay = 1_000L
+            if (!engine.stop(cancelRestart = false)) {
+                if (engine.startingRestart(id)) startEngine()
+                else { running = false; restartId = null; finish() }
+            }
+            return START_STICKY
+        }
         running = true
         retryDelay = 1_000L
         startEngine()
@@ -79,6 +96,7 @@ class EngineService : Service() {
         taskPower.setActive(false)
         main.removeCallbacks(retry)
         engine.remove(listener)
+        engine.cancelRestart()
         if (engine.state.busy || engine.state.url != null) engine.stop()
         super.onDestroy()
     }
@@ -93,11 +111,36 @@ class EngineService : Service() {
 
     private fun finished(restart: Boolean) {
         taskPower.setActive(false)
+        val pending = restartId
+        if (pending != null) {
+            val operation = engine.restartStatus(pending)
+            if (!running || operation.optString("state") == "cancelled") {
+                restartId = null
+                running = false
+                finish()
+                return
+            }
+            if (operation.optString("state") == "stopping" && engine.state.phase != "需要恢复") {
+                if (engine.startingRestart(pending)) startEngine()
+                else { restartId = null; running = false; finish() }
+                return
+            }
+            if (operation.optString("state") == "starting" && restart && engine.retryPort()) {
+                startEngine()
+                return
+            }
+            engine.failRestart(pending, engine.state.message)
+            restartId = null
+            running = false
+            finish()
+            return
+        }
         if (!running || !restart) {
             running = false
             finish()
             return
         }
+        if (engine.retryPort()) { startEngine(); return }
         if (readySince != 0L && SystemClock.elapsedRealtime() - readySince >= 60_000L) retryDelay = 1_000L
         getSystemService(NotificationManager::class.java).notify(1, notification("等待恢复，${retryDelay / 1000} 秒后重试"))
         main.removeCallbacks(retry)

@@ -34,6 +34,12 @@
       name: 'file:@CORE@/files.mjs'
     - id: dshx-android-guard
       name: 'file:@CORE@/guard.mjs'
+    - id: dshx-android-engine
+      name: 'file:@CORE@/engine.mjs'
+    - id: dshx-plugin-manager-tools
+      name: '@deepseek-ai/dsh-plugin-manager/tools'
+    - id: dshx-plugin-market-tools
+      name: '@deepseek-ai/dsh-plugin-market/tools'
     - id: dshx-terminal-registry
       name: '@deepseek-ai/dsh-terminal'
     - id: dshx-terminal-bash

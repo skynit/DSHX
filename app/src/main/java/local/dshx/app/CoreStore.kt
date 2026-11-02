@@ -229,7 +229,7 @@ class CoreStore(private val root: File) {
 
     companion object {
         private val startupFiles = listOf(
-            "bin/node", "bin/npm", "bin/pnpm", "bin/git", "libexec/git-core/git-remote-http", "libexec/git-core/git-remote-https",
+            "bin/node", "bin/dsh", "bin/npm", "bin/pnpm", "bin/git", "libexec/git-core/git-remote-http", "libexec/git-core/git-remote-https",
             "share/git-core/templates/info/exclude", "start.mjs", "plugins.mjs", "assistant.mjs", "hosting.mjs", "specimen.mjs", "specimen-store.mjs", "background.mjs", "apps.mjs",
             "memory.mjs", "memory-store.mjs", "memory-extract.mjs", "read-budget.mjs", "knowledge.mjs", "knowledge-store.mjs", "knowledge-search.mjs", "knowledge-model.mjs", "phone.mjs",
             "lib/node_modules/@deepseek-ai/dsh/lib/bin.js",
@@ -244,7 +244,7 @@ class CoreStore(private val root: File) {
             "lib/libtermux-exec-ld-preload.so", "lib/libtermux-exec.so", "lib/libtermux-exec_nos_c_tre.so",
             "lib/python3.14/encodings/__init__.py", "lib/python3.14/venv/__init__.py", "lib/python3.14/site-packages/pip/__main__.py",
             "lib/node_modules/npm/bin/npx-cli.js", "lib/node_modules/pnpm/bin/pnpx.cjs",
-            "android.patch.yml", "guard.mjs", "native.node"
+            "android.patch.yml", "guard.mjs", "engine.mjs", "native.node"
         )
 
         fun sha256(input: InputStream, cancelled: () -> Boolean = { false }): String {

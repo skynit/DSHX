@@ -2031,6 +2031,16 @@ class CoreTest {
         assertFalse(catalog.getJSONObject("wake").toString().contains("silero_vad"))
     }
 
+    @Test fun engineLinksAcceptOnlyKnownLocalActionsWithoutCredentials() {
+        assertEquals("chat", MainActivity.engineLink("dshx://engine"))
+        assertEquals("chat", MainActivity.engineLink("dshx://engine/"))
+        assertEquals("restart", MainActivity.engineLink("dshx://engine/restart"))
+        assertEquals("logs", MainActivity.engineLink("dshx://engine/logs"))
+        listOf("https://engine", "dshx://other", "dshx://user@engine", "dshx://engine:80",
+            "dshx://engine?token=private", "dshx://engine/logs#other", "dshx://engine/delete",
+            "dshx://engine//restart", "dshx://engine/%72estart").forEach { assertNull(it, MainActivity.engineLink(it)) }
+    }
+
     @Test fun chatUrlOpensTheVoiceSessionAndKeepsInstanceAuthentication() {
         val instance = "http://127.0.0.1:3080/?token=test-token"
         assertEquals(instance, MainActivity.chatUrl(instance, null))
@@ -3135,6 +3145,7 @@ class CoreTest {
 
     private val contents = linkedMapOf(
         "bin/node" to "node".toByteArray(),
+        "bin/dsh" to "dsh launcher".toByteArray(),
         "bin/npm" to "npm launcher".toByteArray(),
         "bin/pnpm" to "pnpm launcher".toByteArray(),
         "bin/git" to "git".toByteArray(),
@@ -3142,6 +3153,7 @@ class CoreTest {
         "libexec/git-core/git-remote-https" to "git https".toByteArray(),
         "share/git-core/templates/info/exclude" to "git excludes".toByteArray(),
         "start.mjs" to "start".toByteArray(),
+        "engine.mjs" to "engine tools".toByteArray(),
         "plugins.mjs" to "plugins".toByteArray(),
         "phone.mjs" to "phone".toByteArray(),
         "assistant.mjs" to "assistant".toByteArray(),
@@ -3239,7 +3251,7 @@ class CoreTest {
     }
 
     @Test fun missingPluginLauncherRequiresRepairWithoutScanningOtherFiles() {
-        for (name in listOf("start.mjs", "plugins.mjs", "memory.mjs", "phone.mjs", "hosting.mjs", "specimen.mjs", "specimen-store.mjs", "background.mjs", "bin/git",
+        for (name in listOf("bin/dsh", "engine.mjs", "start.mjs", "plugins.mjs", "memory.mjs", "phone.mjs", "hosting.mjs", "specimen.mjs", "specimen-store.mjs", "background.mjs", "bin/git",
             "libexec/git-core/git-remote-http", "libexec/git-core/git-remote-https", "share/git-core/templates/info/exclude",
             "bin/npm", "bin/pnpm", "lib/node_modules/pnpm/dist/pnpm.cjs", "lib/node_modules/npm/lib/cli.js") + commandFiles) {
             val store = CoreStore(folder.newFolder())
@@ -6479,6 +6491,337 @@ class CoreTest {
             assertEquals(0, dispatched.get())
             assertTrue(shadowOf(handle).performedActions.isEmpty())
         } finally { controller.destroy() }
+    }
+
+    @Test fun engineDiagnosticsAreRedactedBeforeDiskAndSurviveRecreationWithBounds() {
+        val root = folder.newFolder("engine-diagnostics")
+        val log = EngineLog(root, maxBytes = 256, fileCount = 3)
+        log.remember("opaque-web-secret")
+        log.append("ready opaque-web-secret {\"access_token\":\"private token value\"} Authorization: Bearer hidden-bearer")
+        val first = root.listFiles()!!.joinToString { it.readText() }
+        listOf("opaque-web-secret", "private token value", "hidden-bearer").forEach { assertFalse(first.contains(it)) }
+        repeat(60) { log.append("row-$it " + "诊断".repeat(35)) }
+        assertTrue(root.listFiles()!!.size <= 3)
+        assertTrue(root.listFiles()!!.all { it.length() <= 256 })
+        val restored = EngineLog(root, maxBytes = 256, fileCount = 3)
+        assertTrue(restored.tail(10).contains("row-59"))
+        assertFalse(restored.tail(10).contains("row-0 "))
+    }
+
+    @Test fun engineRestartOperationsCoalesceAndNeverOverwriteTerminalStates() {
+        val control = EngineControl()
+        val first = control.request()
+        val id = first.getString("operationId")
+        assertEquals(id, control.request().getString("operationId"))
+        assertFalse(control.status(id).getBoolean("done"))
+        assertTrue(control.move(id, "accepted", "stopping"))
+        assertTrue(control.move(id, "stopping", "starting"))
+        control.cancel()
+        assertEquals("cancelled", control.status(id).getString("state"))
+        assertFalse(control.move(id, "starting", "succeeded"))
+        val next = control.request().getString("operationId")
+        assertNotEquals(id, next)
+        assertEquals("cancelled", control.status(id).getString("state"))
+        assertThrows(IllegalArgumentException::class.java) { control.status("unknown") }
+    }
+
+    @Test fun engineControlExposesSafeHostInfoAndRejectsInvalidArguments() {
+        val context = RuntimeEnvironment.getApplication() as DshApp
+        val engine = context.engine
+        ReflectionHelpers.setField(engine, "state", EngineState(url = "http://127.0.0.1:3080/?token=web-private"))
+        val info = engine.control("info", JSONObject())
+        assertEquals("dshx://engine", info.getString("stableUrl"))
+        assertEquals("127.0.0.1:3080", info.getString("currentAddress"))
+        assertTrue(info.has("version")); assertTrue(info.has("abis")); assertTrue(info.has("logPath"))
+        assertFalse(info.toString().contains("web-private"))
+        assertFalse(engine.control("status", JSONObject()).toString().contains("web-private"))
+        assertThrows(IllegalArgumentException::class.java) { engine.control("logs", JSONObject().put("lines", 10000)) }
+        assertThrows(IllegalArgumentException::class.java) { engine.control("info", JSONObject().put("token", "unwanted")) }
+    }
+
+    @Test fun engineRestartWaitsForCleanupAndRequiresBothWebAndPolicyReady() {
+        val engine = (RuntimeEnvironment.getApplication() as DshApp).engine
+        val jobs = mutableListOf<Runnable>()
+        ReflectionHelpers.setField(engine, "worker", Executor { jobs.add(it) })
+        val controller = Robolectric.buildService(EngineService::class.java).create()
+        val service = controller.get()
+        try {
+            service.onStartCommand(Intent(), 0, 1)
+            val receipt = engine.requestRestart()
+            val id = receipt.getString("operationId")
+            assertTrue(receipt.getBoolean("accepted"))
+            assertEquals("accepted", receipt.getString("state"))
+            service.onStartCommand(Intent().setAction("restart").putExtra("operationId", id), 0, 2)
+            assertEquals("stopping", engine.restartStatus(id).getString("state"))
+            assertEquals(1, jobs.size)
+            ReflectionHelpers.setField(engine, "active", false)
+            ReflectionHelpers.setField(engine, "state", EngineState(phase = "已停止"))
+            ReflectionHelpers.callInstanceMethod<Unit>(service, "finished", ReflectionHelpers.ClassParameter.from(Boolean::class.javaPrimitiveType, false))
+            assertEquals(2, jobs.size)
+            assertEquals("starting", engine.restartStatus(id).getString("state"))
+            val ready = EngineState(phase = "运行中", url = "http://127.0.0.1:3080/?token=new-private")
+            ReflectionHelpers.callInstanceMethod<Unit>(engine, "update", ReflectionHelpers.ClassParameter.from(EngineState::class.java, ready))
+            assertEquals("starting", engine.restartStatus(id).getString("state"))
+            val policy = ReflectionHelpers.getField<ToolPolicy>(engine, "tools")
+            policy.begin("new-engine"); policy.connected("new-engine")
+            shadowOf(Looper.getMainLooper()).idle()
+            assertEquals("succeeded", engine.restartStatus(id).getString("state"))
+            val status = engine.control("status", JSONObject().put("operationId", id))
+            assertTrue(status.getBoolean("ready"))
+            assertTrue(status.getJSONObject("operation").getBoolean("done"))
+            assertFalse(status.toString().contains("new-private"))
+            assertTrue(engine.stop())
+            assertEquals("succeeded", engine.restartStatus(id).getString("state"))
+        } finally { controller.destroy() }
+    }
+
+    @Test fun engineRestartStopCancelsDeferredStartAndFailedStartupIsTerminal() {
+        val app = RuntimeEnvironment.getApplication() as DshApp
+        val engine = app.engine
+        val jobs = mutableListOf<Runnable>()
+        ReflectionHelpers.setField(engine, "worker", Executor { jobs.add(it) })
+        val controller = Robolectric.buildService(EngineService::class.java).create()
+        val service = controller.get()
+        try {
+            val cancelled = engine.requestRestart().getString("operationId")
+            service.onStartCommand(Intent().setAction("stop"), 0, 1)
+            shadowOf(Looper.getMainLooper()).idleFor(1, TimeUnit.SECONDS)
+            assertEquals("cancelled", engine.restartStatus(cancelled).getString("state"))
+            assertTrue(jobs.isEmpty())
+            assertNull(shadowOf(app).nextStartedService)
+            val failed = engine.requestRestart().getString("operationId")
+            service.onStartCommand(Intent().setAction("restart").putExtra("operationId", failed), 0, 2)
+            assertEquals("starting", engine.restartStatus(failed).getString("state"))
+            ReflectionHelpers.setField(engine, "active", false)
+            ReflectionHelpers.setField(engine, "state", EngineState("无法启动", "缺少运行环境 token=private"))
+            ReflectionHelpers.callInstanceMethod<Unit>(service, "finished", ReflectionHelpers.ClassParameter.from(Boolean::class.javaPrimitiveType, false))
+            val result = engine.restartStatus(failed)
+            assertEquals("failed", result.getString("state"))
+            assertTrue(result.getBoolean("done"))
+            assertFalse(result.toString().contains("private"))
+            shadowOf(Looper.getMainLooper()).idleFor(2, TimeUnit.MINUTES)
+            assertEquals(1, jobs.size)
+        } finally { controller.destroy() }
+    }
+
+    @Test fun engineBridgeChecksLiveReadOnlySessionsAndSendsRestartReceiptBeforeDispatch() {
+        val app = RuntimeEnvironment.getApplication() as DshApp
+        val engine = app.engine
+        val policy = ReflectionHelpers.getField<ToolPolicy>(engine, "tools").apply { begin("engine-bridge") }
+        val delivered = CountDownLatch(1)
+        PolicyBridge(policy, "engine-bridge", engine = engine::engine, engineReply = { result, sent ->
+            assertTrue(sent); engine.restartReply(result, sent); delivered.countDown()
+        }) {}.use { bridge ->
+            ReflectionHelpers.setField(engine, "bridge", bridge)
+            bridge.start()
+            PolicyConnection(bridge).use { connection ->
+                fun query(id: Int, action: String, args: JSONObject = JSONObject()) = connection.query(id, "engine") {
+                    put("action", action); put("args", args)
+                }
+                assertFalse(query(1, "status").getBoolean("ok"))
+                policy.register(bridge.instance, "root", "诊断", null)
+                ReflectionHelpers.setField(policy, "state", policy.state.copy(sessions = policy.state.sessions.map { it.copy(mode = "read") }))
+                assertTrue(query(2, "status").getBoolean("ok"))
+                assertEquals("dshx://engine", query(3, "info").getJSONObject("result").getString("stableUrl"))
+                assertTrue(query(4, "logs", JSONObject().put("lines", 5)).getBoolean("ok"))
+                assertFalse(query(5, "restart").getBoolean("ok"))
+                assertFalse(query(6, "info", JSONObject().put("url", true)).getBoolean("ok"))
+                policy.end(bridge.instance, "root")
+                assertFalse(query(7, "logs").getBoolean("ok"))
+                policy.register(bridge.instance, "root", "重启", null)
+                val result = query(8, "restart").getJSONObject("result")
+                assertTrue(result.getBoolean("accepted"))
+                assertTrue(delivered.await(3, TimeUnit.SECONDS))
+                assertNull(shadowOf(app).nextStartedService)
+                shadowOf(Looper.getMainLooper()).idleFor(750, TimeUnit.MILLISECONDS)
+                val intent = shadowOf(app).nextStartedService!!
+                assertEquals("restart", intent.action)
+                assertEquals(result.getString("operationId"), intent.getStringExtra("operationId"))
+                engine.stop()
+            }
+        }
+    }
+
+    @Test fun enginePreferredPortFallsBackWhenOccupiedAndCanBeReusedWhenReleased() {
+        val socket = java.net.ServerSocket(0, 1, java.net.InetAddress.getByName("127.0.0.1"))
+        val port = socket.localPort
+        try { assertEquals(0, Engine.preferredPort(port)) } finally { socket.close() }
+        assertEquals(port, Engine.preferredPort(port))
+        assertEquals(0, Engine.preferredPort(-1))
+        assertEquals(0, Engine.preferredPort(65536))
+    }
+
+    @Test fun engineControlRevisionChangesForAcceptedFailedAndCancelledWithoutChangingPhase() {
+        val engine = (RuntimeEnvironment.getApplication() as DshApp).engine
+        val initial = engine.state
+        val receipt = engine.requestRestart()
+        val accepted = engine.state
+        assertEquals(initial.phase, accepted.phase)
+        assertTrue(accepted.controlRevision > initial.controlRevision)
+        engine.restartReply(receipt, false)
+        val failed = engine.state
+        assertEquals(accepted.phase, failed.phase)
+        assertTrue(failed.controlRevision > accepted.controlRevision)
+        assertEquals("failed", engine.engineStatus().getJSONObject("operation").getString("state"))
+        engine.requestRestart()
+        val next = engine.state.controlRevision
+        engine.stop()
+        assertTrue(engine.state.controlRevision > next)
+        assertEquals("cancelled", engine.engineStatus().getJSONObject("operation").getString("state"))
+    }
+
+    @Test fun engineInfoDistinguishesBundledVersionFromAnInstalledCoreReceipt() {
+        val files = folder.newFolder("engine-core-info")
+        val context = object : ContextWrapper(RuntimeEnvironment.getApplication()) {
+            override fun getFilesDir() = files
+        }
+        val engine = Engine(context, Executor {})
+        val bundled = engine.engineInfo()
+        val manifest = context.assets.open("core.json").bufferedReader().use { JSONObject(it.readText()) }
+        assertEquals(manifest.getString("version"), bundled.getString("coreVersion"))
+        assertEquals(manifest.getString("sha256"), bundled.getString("coreSha256"))
+        assertEquals(manifest.getString("dsh"), bundled.getString("dshVersion"))
+        assertEquals(manifest.getString("node"), bundled.getString("nodeVersion"))
+        assertTrue(bundled.isNull("installedCoreVersion"))
+        val directory = File(files, "core/" + manifest.getString("version") + "-" + manifest.getString("sha256").take(16)).apply { mkdirs() }
+        File(directory, ".verified").writeText(manifest.getString("sha256"))
+        assertEquals(manifest.getString("version"), engine.engineInfo().getString("installedCoreVersion"))
+        File(directory, ".verified").writeText("0".repeat(64))
+        assertTrue(engine.engineInfo().isNull("installedCoreVersion"))
+    }
+
+    @Test fun engineRestartRecordsRemainQueryableAfterBridgeReplacement() {
+        val engine = (RuntimeEnvironment.getApplication() as DshApp).engine
+        val policy = ReflectionHelpers.getField<ToolPolicy>(engine, "tools")
+        val receipt = engine.requestRestart()
+        engine.restartReply(receipt, false)
+        val id = receipt.getString("operationId")
+        policy.begin("replacement-engine")
+        PolicyBridge(policy, "replacement-engine", engine = engine::engine, engineReply = engine::restartReply) {}.use { bridge ->
+            ReflectionHelpers.setField(engine, "bridge", bridge)
+            bridge.start()
+            PolicyConnection(bridge).use { connection ->
+                policy.register(bridge.instance, "root", "新连接", null)
+                val response = connection.query(1, "engine") {
+                    put("action", "status"); put("args", JSONObject().put("operationId", id))
+                }
+                assertTrue(response.getBoolean("ok"))
+                val operation = response.getJSONObject("result").getJSONObject("operation")
+                assertEquals(id, operation.getString("operationId"))
+                assertEquals("failed", operation.getString("state"))
+                assertTrue(operation.getBoolean("done"))
+            }
+        }
+    }
+
+    @Test fun engineDiagnosticsHideEscapedCredentialValuesAndWholeCookieHeaders() {
+        val text = Engine.redact(JSONObject().put("api_key", "private\"remaining secret").toString())
+        assertFalse(text.contains("private"))
+        assertFalse(text.contains("remaining secret"))
+        assertFalse(Engine.redact("Cookie: session=private; refresh=another-secret").contains("another-secret"))
+        assertFalse(Engine.redact("request Bearer private-bearer").contains("private-bearer"))
+    }
+
+    @Test fun engineRestartAcceptanceSurvivesAnAbortedToolResultAndScopesSessionQueries() {
+        val app = RuntimeEnvironment.getApplication() as DshApp
+        val engine = app.engine
+        val policy = ReflectionHelpers.getField<ToolPolicy>(engine, "tools").apply { begin("restart-aborted") }
+        PolicyBridge(policy, "restart-aborted", engine = engine::engine, engineReply = engine::restartReply) {}.use { bridge ->
+            ReflectionHelpers.setField(engine, "bridge", bridge)
+            bridge.start()
+            PolicyConnection(bridge).use { connection ->
+                policy.register(bridge.instance, "first", "第一会话", null)
+                policy.register(bridge.instance, "second", "第二会话", null)
+                fun query(id: Int, action: String, session: String) = connection.query(id, "engine", session) {
+                    put("action", action); put("args", JSONObject())
+                }
+                // 上游将成功回执替换为 tool aborted：调用方丢弃结果，不保留 operationId。
+                assertTrue(query(1, "restart", "first").getBoolean("ok"))
+                val first = query(2, "status", "first").getJSONObject("result").getJSONObject("operation")
+                val firstId = first.getString("operationId")
+                assertEquals("accepted", first.getString("state"))
+                val disk = JSONObject(File(app.filesDir, "diagnostics/restarts.json").readText())
+                assertEquals(firstId, disk.getJSONArray("operations").getJSONObject(0).getString("operationId"))
+                assertEquals("first", disk.getJSONArray("operations").getJSONObject(0).getString("session"))
+                assertFalse(disk.toString().contains(bridge.token))
+                assertEquals("idle", query(3, "status", "second").getJSONObject("result").getJSONObject("operation").getString("state"))
+                assertFalse(query(4, "restart", "second").getBoolean("ok"))
+                engine.stop()
+                assertTrue(query(5, "restart", "second").getBoolean("ok"))
+                val second = query(6, "status", "second").getJSONObject("result").getJSONObject("operation")
+                assertNotEquals(firstId, second.getString("operationId"))
+                assertEquals(firstId, query(7, "status", "first").getJSONObject("result").getJSONObject("operation").getString("operationId"))
+                assertEquals(second.getString("operationId"), engine.engineStatus().getJSONObject("operation").getString("operationId"))
+                engine.stop()
+            }
+        }
+    }
+
+    @Test fun engineRestartRecordsRecoverOnHostRecreationWithoutReplayingUnfinishedWork() {
+        val file = File(folder.newFolder("restart-recovery"), "restarts.json")
+        val control = EngineControl(file)
+        val finished = control.request("finished").getString("operationId")
+        assertTrue(control.move(finished, "accepted", "stopping"))
+        assertTrue(control.move(finished, "stopping", "starting"))
+        assertTrue(control.move(finished, "starting", "succeeded"))
+        val unfinished = control.request("unfinished").getString("operationId")
+        assertTrue(control.move(unfinished, "accepted", "stopping"))
+        val restored = EngineControl(file)
+        assertEquals("succeeded", restored.status(finished).getString("state"))
+        assertEquals("failed", restored.status(unfinished).getString("state"))
+        assertTrue(restored.status(unfinished).getBoolean("done"))
+        assertEquals(unfinished, restored.status(session = "unfinished").getString("operationId"))
+        val secondRestore = EngineControl(file)
+        assertEquals("failed", secondRestore.status(unfinished).getString("state"))
+        repeat(20) { restored.request("session-$it"); restored.cancel() }
+        assertEquals(16, JSONObject(file.readText()).getJSONArray("operations").length())
+    }
+
+    @Test fun engineRestartRefusesAcceptanceAndDispatchWhenTheRecordCannotBeSaved() {
+        val app = RuntimeEnvironment.getApplication() as DshApp
+        val engine = app.engine
+        val blocked = File(folder.newFolder("restart-failed-write"), "blocked").apply { writeText("file blocks directory") }
+        val control = EngineControl(File(blocked, "restarts.json"))
+        ReflectionHelpers.setField(engine, "control", control)
+        assertThrows(IllegalStateException::class.java) { engine.requestRestart() }
+        assertFalse(control.status().has("operationId"))
+        shadowOf(Looper.getMainLooper()).idleFor(1, TimeUnit.SECONDS)
+        assertNull(shadowOf(app).nextStartedService)
+    }
+
+    @Test fun engineRestartHostRecoveryDoesNotSchedulePersistedRequests() {
+        val app = RuntimeEnvironment.getApplication() as DshApp
+        for (phase in listOf("accepted", "stopping", "starting")) {
+            val files = folder.newFolder("restart-host-$phase")
+            val control = EngineControl(File(files, "diagnostics/restarts.json"))
+            val id = control.request("owner").getString("operationId")
+            if (phase != "accepted") assertTrue(control.move(id, "accepted", "stopping"))
+            if (phase == "starting") assertTrue(control.move(id, "stopping", "starting"))
+            val context = object : ContextWrapper(app) { override fun getFilesDir() = files }
+            val engine = Engine(context, Executor { fail("恢复历史操作不能自动启动引擎") })
+            val operation = engine.engineStatus(JSONObject().put("operationId", id)).getJSONObject("operation")
+            assertEquals("failed", operation.getString("state"))
+            assertTrue(operation.getBoolean("done"))
+            assertFalse(engine.active)
+            assertEquals("failed", EngineControl(File(files, "diagnostics/restarts.json")).status(id).getString("state"))
+        }
+        shadowOf(Looper.getMainLooper()).idleFor(1, TimeUnit.SECONDS)
+        assertNull(shadowOf(app).nextStartedService)
+    }
+
+    @Test fun engineRestartStopsBeforeDispatchIfAStateTransitionCannotBeSaved() {
+        val root = folder.newFolder("restart-state-write")
+        val file = File(root, "restarts.json")
+        val control = EngineControl(file)
+        val id = control.request("owner").getString("operationId")
+        assertTrue(file.delete())
+        assertTrue(file.mkdir())
+        File(file, "blocked").writeText("prevent atomic replacement")
+        assertFalse(control.move(id, "accepted", "stopping"))
+        assertEquals("failed", control.status(id).getString("state"))
+        assertTrue(control.status(id).getBoolean("done"))
+        assertTrue(control.status(id).has("error"))
+        assertThrows(IllegalStateException::class.java) { control.request("owner") }
     }
 
 }

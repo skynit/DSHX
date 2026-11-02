@@ -26,6 +26,8 @@ class PolicyBridge(
     private val smallModel: (() -> JSONObject)? = null,
     private val phoneStatus: (() -> JSONObject)? = null,
     private val apps: ((String, JSONObject) -> JSONObject)? = null,
+    private val engine: ((String, JSONObject, String) -> JSONObject)? = null,
+    private val engineReply: ((JSONObject, Boolean) -> Unit)? = null,
     private val taskState: ((Boolean) -> Unit)? = null,
     private val lost: () -> Unit,
 ) : Closeable {
@@ -187,6 +189,7 @@ class PolicyBridge(
                         "register" -> setOf("id", "method", "session", "title", "parent")
                         "phone" -> setOf("id", "method", "session", "action", "args")
                         "apps" -> setOf("id", "method", "session", "action", "args")
+                        "engine" -> setOf("id", "method", "session", "action", "args")
                         "phone-cancel" -> setOf("id", "method", "session", "call")
                         "local-model" -> setOf("id", "method", "session", "messages", "model")
                         "local-cancel" -> setOf("id", "method", "session", "call")
@@ -194,6 +197,20 @@ class PolicyBridge(
                     }
                     require(request.keys().asSequence().all { it in allowed }) { "查询不接受额外字段" }
                     val session = request.optString("session")
+                    if (method == "engine") {
+                        require(frame.toByteArray(Charsets.UTF_8).size <= 4096) { "引擎请求过大。" }
+                        val mode = policy.mode(instance, session)
+                        val action = request.getString("action")
+                        require(action in setOf("status", "logs", "restart", "info"))
+                        require(action != "restart" || mode == ToolPolicy.FULL) { "重启引擎需要 Full 权限。" }
+                        val args = request.getJSONObject("args")
+                        val result = requireNotNull(engine) { "引擎管理未配置。" }.invoke(action, args, session)
+                        response.put("ok", true).put("result", result)
+                        var delivered = false
+                        try { send(socket, response); delivered = true }
+                        finally { if (action == "restart") engineReply?.invoke(result, delivered) }
+                        continue
+                    }
                     if (method == "apps") {
                         require(frame.toByteArray().size <= AppPackage.MAX_BYTES + 16 * 1024) { "微应用请求过大。" }
                         require(policy.mode(instance, session) == ToolPolicy.FULL)

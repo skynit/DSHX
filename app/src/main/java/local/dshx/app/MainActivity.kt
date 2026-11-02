@@ -41,6 +41,7 @@ class MainActivity : ComponentActivity() {
     @Volatile private var chatScrollRight = false
     private var phoneRevision by mutableIntStateOf(0)
     private var startup by mutableStateOf(true)
+    private var enginePage by mutableStateOf<String?>(null)
     private var accessibilityNotice by mutableStateOf(false)
     private var accessibilityHandled = false
     private val engine get() = (application as DshApp).engine
@@ -209,6 +210,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (intent.action == Intent.ACTION_VIEW && engineLink(intent.dataString.orEmpty()) == "chat") enginePage = "chat"
         startup = savedInstanceState?.getBoolean("startup", true) ?: true
         accessibilityHandled = savedInstanceState?.getBoolean("accessibilityHandled") ?: false
         backupPicking = savedInstanceState?.getBoolean("backupPicking") ?: false
@@ -250,6 +252,14 @@ class MainActivity : ComponentActivity() {
                 onStart = ::startEngine,
                 onStop = { startService(Intent(this, EngineService::class.java).setAction("stop")) },
                 diagnostics = engine::diagnostics, pageError = pageError,
+                onRestart = ::restartEngine,
+                onCopyEntry = {
+                    getSystemService(android.content.ClipboardManager::class.java)
+                        .setPrimaryClip(android.content.ClipData.newPlainText("DSHX", "dshx://engine"))
+                    Toast.makeText(this, "已复制入口，在本机打开 DSHX", Toast.LENGTH_SHORT).show()
+                },
+                enginePage = enginePage, onEnginePageHandled = { enginePage = null },
+                engineInfo = engine::engineInfo, engineStatus = { engine.engineStatus() },
                 onReload = { pageError = null; browser?.reload() },
                 assistantStore = assistantStore,
                 memoryStore = memoryStore, onMemory = engine::memory,
@@ -287,6 +297,21 @@ class MainActivity : ComponentActivity() {
     private fun startEngine() {
         try { startForegroundService(Intent(this, EngineService::class.java)) }
         catch (_: RuntimeException) { Toast.makeText(this, "无法启动 dsh，请在工作台重试。", Toast.LENGTH_LONG).show() }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (intent.action == Intent.ACTION_VIEW && engineLink(intent.dataString.orEmpty()) == "chat") {
+            enginePage = "chat"
+            if (!engine.active && !engine.state.busy) startEngine()
+        }
+    }
+
+    private fun restartEngine() {
+        runCatching { engine.requestRestart() }.onFailure {
+            Toast.makeText(this, it.message ?: "重启请求未受理，请查看运行诊断。", Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun knowledgeFile(action: String, data: JSONObject) {
@@ -481,8 +506,21 @@ class MainActivity : ComponentActivity() {
                     }
                 }
                 webViewClient = object : WebViewClient() {
-                    override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean =
-                        !sameOrigin(instance, request.url.toString())
+                    override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                        val action = engineLink(request.url.toString())
+                        if (action != null) {
+                            if (request.isForMainFrame && request.hasGesture() && browser === view &&
+                                engine.state.url == instance && sameOrigin(instance, view.url.orEmpty())) {
+                                when (action) {
+                                    "restart" -> restartEngine()
+                                    "logs" -> enginePage = "logs"
+                                    "chat" -> enginePage = "chat"
+                                }
+                            }
+                            return true
+                        }
+                        return !sameOrigin(instance, request.url.toString())
+                    }
                     override fun onPageFinished(view: WebView, url: String) {
                         if (engine.state.url != instance || !sameOrigin(instance, url)) return
                         val css = assets.open("chat.css").bufferedReader().use { it.readText() }
@@ -562,6 +600,19 @@ class MainActivity : ComponentActivity() {
     }
 
     companion object {
+        /** 稳定入口只选择本机页面；重启动作仅接受网页中真实点击产生的导航。 */
+        internal fun engineLink(target: String): String? = runCatching {
+            val uri = URI(target)
+            if (uri.scheme != "dshx" || uri.host != "engine" || uri.userInfo != null || uri.port != -1 ||
+                uri.rawQuery != null || uri.rawFragment != null) return null
+            when (uri.rawPath) {
+                "", "/" -> "chat"
+                "/restart" -> "restart"
+                "/logs" -> "logs"
+                else -> null
+            }
+        }.getOrNull()
+
         internal fun chatUrl(instance: String, session: String?): String =
             if (session == null) instance else Uri.parse(instance).buildUpon().appendQueryParameter("dshx-session", session).build().toString()
 

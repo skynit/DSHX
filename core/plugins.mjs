@@ -1,7 +1,9 @@
 import { spawn } from 'node:child_process';
+import { createRequire } from 'node:module';
 import { lstat, open, readFile, readdir, realpath, stat } from 'node:fs/promises';
 import { join, relative, isAbsolute } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { createInterface } from 'node:readline';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 // The upstream profile owns installation, cancellation, locking and activation.
 // Supply an executable invocation so Android never needs a shell shebang or Corepack download.
@@ -79,6 +81,90 @@ export async function checkPlugins(modules) {
   await visit(root);
 }
 
+// pnpm's native ignoreMissing is name-wide, so it cannot safely exempt only
+// one compatible occurrence when another plugin requires an incompatible range.
+// Read its structured report instead; never filter the child's stderr text.
+export async function classifyPeerIssues(core, projects) {
+  const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+  if (!object(projects) || Object.keys(projects).length === 0 || Object.values(projects).some(issues =>
+    !object(issues) || !object(issues.missing) || !object(issues.bad) ||
+    Object.keys(issues).some(key => !['missing', 'bad', 'conflicts', 'intersections'].includes(key)) ||
+    !Array.isArray(issues.conflicts) || !object(issues.intersections) ||
+    [...Object.values(issues.missing), ...Object.values(issues.bad)].some(entries =>
+      !Array.isArray(entries) || entries.length === 0 || entries.some(issue =>
+        !object(issue) || typeof issue.wantedRange !== 'string' || !Array.isArray(issue.parents) ||
+        issue.parents.some(parent => !object(parent) || typeof parent.name !== 'string'))))) {
+    throw new Error('无法识别 pnpm peer 依赖报告');
+  }
+  const require = createRequire(join(core, 'lib/node_modules/@deepseek-ai/dsh/package.json'));
+  const { createRuntimeResolution } = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-app-boot')));
+  const { satisfies, valid, validRange } = require('semver');
+  const resolution = await createRuntimeResolution({
+    installAnchor: join(core, 'lib/node_modules/@deepseek-ai/dsh/package.json')
+  });
+  const host = new Map(resolution.entries.filter(entry => entry.scope === 'installation').map(entry => [entry.name, entry.version]));
+  const result = { provided: [], missing: [], bad: [] };
+  for (const [project, issues] of Object.entries(projects)) {
+    for (const [name, entries] of Object.entries(issues.missing ?? {})) {
+      for (const issue of entries) {
+        const version = host.get(name);
+        const provided = typeof version === 'string' && valid(version) !== null &&
+          issue.wantedRange.trim() !== '' && validRange(issue.wantedRange) !== null && satisfies(version, issue.wantedRange);
+        result[provided ? 'provided' : 'missing'].push({ ...issue, project, name, version });
+      }
+    }
+    for (const [name, entries] of Object.entries(issues.bad ?? {})) {
+      result.bad.push(...entries.map(issue => ({ ...issue, project, name })));
+    }
+  }
+  return result;
+}
+
+async function reportPnpm(core, stream) {
+  const lines = createInterface({ input: stream, crlfDelay: Infinity });
+  let progress = 0;
+  for await (const line of lines) {
+    let event;
+    try { event = JSON.parse(line); }
+    catch { console.log(line); continue; }
+    if (event === null || typeof event !== 'object' || typeof event.name !== 'string' || typeof event.level !== 'string') {
+      console.warn(line);
+      continue;
+    }
+    if (event.name === 'pnpm:peer-dependency-issues') {
+      let issues;
+      try { issues = await classifyPeerIssues(core, event.issuesByProjects); }
+      catch {
+        // Unknown report format or unavailable host facts: retain the complete
+        // diagnostic rather than risk treating a real problem as host-provided.
+        console.warn(line);
+        continue;
+      }
+      if (issues.provided.length + issues.missing.length + issues.bad.length === 0) console.warn(line);
+      for (const issue of issues.provided) {
+        console.log(`DSHX：宿主已提供 ${issue.name}@${issue.version}，满足 ${issue.wantedRange}。`);
+      }
+      for (const issue of [...issues.missing, ...issues.bad]) {
+        const parent = (issue.parents ?? []).map(item => `${item.name}@${item.version}`).join(' > ') || issue.project;
+        console.warn(`DSHX 依赖警告：${parent} 需要 ${issue.name}@${issue.wantedRange}；${
+          issue.foundVersion !== undefined ? `已安装版本 ${issue.foundVersion} 不满足要求` :
+          issue.version !== undefined ? `宿主版本 ${issue.version} 不满足要求` : '插件安装目录与宿主均未提供该依赖'}。`);
+      }
+      continue;
+    }
+    if (event.level === 'warn' || event.level === 'error') {
+      // Preserve all other diagnostics, including error codes and metadata.
+      console.warn(line);
+    } else if (event.name === 'pnpm:progress' && Date.now() - progress >= 1000) {
+      console.log(`DSHX：正在安装依赖（${event.status}）。`);
+      progress = Date.now();
+    } else if (event.name === 'pnpm:root') {
+      const change = event.added ?? event.removed;
+      if (change?.name !== undefined) console.log(`DSHX：${event.added ? '安装' : '卸载'} ${change.name}@${change.version ?? '未知版本'}。`);
+    }
+  }
+}
+
 export async function runPnpm(core, args) {
   const command = args[0];
   if (!['add', 'remove', 'install', 'view', 'config'].includes(command) ||
@@ -107,23 +193,33 @@ export async function runPnpm(core, args) {
     '--config.update-notifier=false'
   ];
   if (command === 'add') fixed.push('--save-exact');
+  const install = ['add', 'install', 'remove'].includes(command);
+  if (install) fixed.push('--reporter=ndjson');
   // pnpm delegates `view` to npm. Invoke its pinned JS entry with the same
   // Android Node so no missing npm executable or foreign shebang is involved.
   const entry = command === 'view' ? 'npm/bin/npm-cli.js' : 'pnpm/bin/pnpm.cjs';
   const child = spawn(process.execPath, [join(core, 'lib/node_modules', entry), ...args, ...fixed], {
-    env, stdio: 'inherit'
+    env, stdio: ['inherit', install ? 'pipe' : 'inherit', 'inherit']
   });
+  const output = install ? reportPnpm(core, child.stdout) : Promise.resolve();
   const signals = ['SIGTERM', 'SIGINT', 'SIGHUP'];
   const handlers = signals.map(signal => () => child.kill(signal));
   signals.forEach((signal, index) => process.on(signal, handlers[index]));
   let code;
   try {
-    code = await new Promise((resolve, reject) => {
+    [code] = await Promise.all([new Promise((resolve, reject) => {
       child.once('error', reject);
-      child.once('exit', code => resolve(code ?? 1));
-    });
+      child.once('close', code => resolve(code ?? 1));
+    }), output]);
+  } catch (error) {
+    child.kill('SIGTERM');
+    throw error;
   } finally { signals.forEach((signal, index) => process.off(signal, handlers[index])); }
-  if (code === 0 && ['add', 'install', 'remove'].includes(command)) await checkPlugins(join(process.cwd(), 'node_modules'));
+  if (code === 0 && install) {
+    await checkPlugins(join(process.cwd(), 'node_modules'));
+    console.log(command === 'remove' ? 'DSHX：包卸载和文件检查完成；当前插件运行状态请查看插件管理页面。' :
+      'DSHX：包安装和文件检查完成；是否已加载请查看插件管理页面，需要重启时选择“重启以生效”。');
+  }
   return code;
 }
 
