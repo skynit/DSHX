@@ -460,7 +460,7 @@ function merge(next, candidate, job, events, base) {
   // 提取等待期间被删除的相同正文不能换主题重新写回，包括已省略冗余出处的重复轮次。
   const previousDuplicate = base.entries.find(row => sameScope(row.scope, scope) && normalize(row.content) === normalize(candidate.content));
   if (previousDuplicate && !next.entries.some(row => row.id === previousDuplicate.id)) return;
-  const duplicate = next.entries.find(row => sameScope(row.scope, scope) && normalize(row.content) === normalize(candidate.content));
+  const duplicate = next.entries.find(row => row.state === 'active' && sameScope(row.scope, scope) && normalize(row.content) === normalize(candidate.content));
   if (duplicate) {
     const refs = sourceRows(duplicate.source);
     if (!refs.some(ref => ref.session === job.session && candidate.events.every(seq => ref.events.includes(seq)))) {
@@ -472,13 +472,15 @@ function merge(next, candidate, job, events, base) {
   if (candidate.action === 'ignore') return;
   const previous = old && base.entries.find(row => row.id === old.id);
   const changed = old && (!previous || previous.updatedAt !== old.updatedAt || previous.content !== old.content);
-  const state = candidate.state === 'pending' || candidate.explicit || old && (old.locked || changed || candidate.corrects !== old.id) ? 'pending' : 'active';
-  if (next.entries.some(row => sameScope(row.scope, scope) && row.key === key && normalize(row.content) === normalize(candidate.content))) return;
-  const entry = { id: old && state === 'active' ? old.id : randomUUID(), type: candidate.type, scope, key,
+  // 自动保存无需逐条确认；锁定或提取期间变化的主题直接跳过，不能覆盖或留下确认任务。
+  if (old && (old.locked || changed || candidate.corrects !== old.id) || candidate.corrects && !old) return;
+  const legacy = next.entries.find(row => row.state === 'pending' && sameScope(row.scope, scope) && row.key === key && normalize(row.content) === normalize(candidate.content));
+  const prior = old ?? legacy;
+  const entry = { id: prior ? prior.id : randomUUID(), type: candidate.type, scope, key,
     summary: candidate.summary, content: candidate.content, source: { kind: 'auto', session: job.session, events: candidate.events,
-      ...(specimen ? { origin: 'specimen' } : {}), ...(old && state === 'active' ? { refs: sourceRows(old.source).slice(0, 31) } : {}) }, state, locked: false,
-    createdAt: old && state === 'active' ? old.createdAt : now, updatedAt: now, expiresAt: null };
-  next.entries = next.entries.filter(row => row.id !== entry.id); next.entries.push(entry);
+      ...(specimen ? { origin: 'specimen' } : {}), ...(prior ? { refs: sourceRows(prior.source).slice(0, 31) } : {}) }, state: 'active', locked: false,
+    createdAt: prior ? prior.createdAt : now, updatedAt: now, expiresAt: null };
+  next.entries = next.entries.filter(row => row.id !== entry.id && row.id !== legacy?.id); next.entries.push(entry);
 }
 export async function apply(ctx) {
   const memory = memorySession(ctx);

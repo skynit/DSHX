@@ -5017,7 +5017,7 @@ async function localMemoryWait(check, label) {
   assert.fail(label);
 }
 
-for (const action of ['remove', 'remove-renamed-source', 'clear', 'settings', 'llm/adapters-updated']) {
+for (const action of ['remove', 'remove-renamed-source', 'save', 'update', 'clear', 'settings', 'llm/adapters-updated']) {
   test(`Android memory local P2 ${action} prevents a delayed extraction from restoring obsolete memory`, { timeout: 10000 }, async t => {
     const f = await localMemoryFixture(t);
     const { createUserMessage } = await load('@deepseek-ai/dsh-llm');
@@ -5077,6 +5077,10 @@ for (const action of ['remove', 'remove-renamed-source', 'clear', 'settings', 'l
       assert.equal(f.store.read().jobs[0].attempts, 1);
       const epoch = f.store.read().epoch;
       if (action.startsWith('remove')) await f.memory.call('remove', { id: old.id, revision: f.store.read().revision });
+      else if (action === 'save') await f.store.save(f.data('coffee', { id: old.id, scope: old.scope, content: '手动保存的新内容' }));
+      else if (action === 'update') await f.store.change(next => {
+        next.entries[0].content = '已经发布的更新'; next.entries[0].updatedAt++;
+      });
       else if (action === 'clear') await f.memory.call('clear', { revision: f.store.read().revision });
       else if (action === 'settings') await f.memory.call('settings', { enabled: false, autoSave: false, revision: f.store.read().revision });
       else {
@@ -5085,9 +5089,10 @@ for (const action of ['remove', 'remove-renamed-source', 'clear', 'settings', 'l
         await f.store.queue;
       }
       const afterAction = f.store.read();
-      assert.equal(extraction.signal.aborted, !action.startsWith('remove'));
+      const unchangedEpoch = action.startsWith('remove') || action === 'save' || action === 'update';
+      assert.equal(extraction.signal.aborted, !unchangedEpoch);
       if (action.startsWith('remove')) assert.equal(afterAction.blocked[0].key, 'coffee');
-      else {
+      else if (!unchangedEpoch) {
         assert.ok(afterAction.epoch > epoch);
         assert.deepEqual(afterAction.jobs, []); assert.deepEqual(afterAction.cursors, {});
       }
@@ -5101,7 +5106,7 @@ for (const action of ['remove', 'remove-renamed-source', 'clear', 'settings', 'l
       assert.equal(final.entries.some(row => row.content === '新的咖啡偏好'), false, action);
       if (action.startsWith('remove') || action === 'clear') assert.deepEqual(final.entries, []);
       else assert.deepEqual(final.entries, afterAction.entries);
-      if (action.startsWith('remove')) { assert.deepEqual(final.jobs, []); assert.equal(final.cursors[session.id].next, events.length); }
+      if (unchangedEpoch) { assert.deepEqual(final.jobs, []); assert.equal(final.cursors[session.id].next, events.length); }
       else assert.equal(final.revision, afterAction.revision, 'an obsolete result cannot publish even an empty revision');
     } finally { flush.resolve(true); release.resolve([]); }
   });
@@ -5145,7 +5150,7 @@ test('Android memory local extraction validates whole batches and rejects invent
   const valid = validateCandidates([candidate], selection)[0];
   assert.equal(valid.scope, 'user'); assert.deepEqual(valid.events, [10]);
   const explicit = validateCandidates([{ ...candidate, key: 'commute', summary: '地铁通勤', content: '我乘坐地铁通勤', events: [12] }], selection)[0];
-  assert.equal(explicit.explicit, true); assert.equal(explicit.state, 'pending');
+  assert.equal(explicit.explicit, true); assert.equal(explicit.state, undefined, '明确要求记住时不应要求再次确认');
   for (const invalid of [
     { ...candidate, events: [999] }, { ...candidate, content: '用户住在月球' },
     { ...candidate, scope: 'workspace' }, { ...candidate, workspace: '/another-project' },
@@ -6774,6 +6779,50 @@ async function localMemoryFlow(t, options = {}) {
   });
 }
 
+test('Android memory local auto save activates explicit requests and topic updates without confirmation', async t => {
+  const f = await localMemoryFlow(t);
+  await f.store.save(f.data('reply-language', { type: 'preference', scope: { kind: 'workspace', workspace },
+    summary: '我喜欢中文回答', content: '我喜欢中文回答' }));
+  await f.store.change(next => {
+    next.entries[0].state = 'pending'; next.entries[0].locked = false;
+    next.entries[0].source = { kind: 'auto', session: 'legacy-session', events: [99] };
+  });
+  const legacy = f.store.read().entries[0];
+  f.flow.llm.prepareCall = async (config, signal, refine) => ({
+    config: refine(config, { provider: 'fixture', id: 'source-model', context: { contextWindow: 32768 }, defaultMaxTokens: 256 }),
+    async *stream(request) {
+      const input = JSON.parse(request.messages[0].content[0].text);
+      const row = input.messages.find(row => row.role === 'user');
+      const content = row.text.split('：').at(-1);
+      yield { type: 'text-delta', index: 0, text: JSON.stringify([{ action: 'add', type: 'preference', key: 'reply-language',
+        summary: content, content, events: [row.id] }]) };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    },
+  });
+  await f.turn('请记住：我喜欢中文回答');
+  await localMemoryWait(() => f.store.read().entries.length === 1 && !f.store.read().jobs.length, '明确记住请求没有自动保存');
+  const first = f.store.read().entries[0];
+  assert.equal(first.state, 'active'); assert.equal(first.locked, false);
+  assert.equal(first.id, legacy.id, '新来源重复旧版候选时应直接生效并复用条目');
+  assert.equal((await f.memory.call('status')).pending, 0);
+  assert.equal(f.searchMemory(f.store.read(), '中文回答', workspace)[0].id, first.id);
+  await f.turn('我喜欢简短回答');
+  await f.memory.call('organize');
+  await localMemoryWait(() => !f.store.read().jobs.length, '同主题更新没有完成');
+  const updated = f.store.read().entries[0];
+  assert.equal(f.store.read().entries.length, 1);
+  assert.equal(updated.id, first.id); assert.equal(updated.createdAt, first.createdAt);
+  assert.equal(updated.content, '我喜欢简短回答'); assert.equal(updated.state, 'active');
+  await f.store.save(f.data('reply-language', { id: updated.id, type: updated.type, scope: updated.scope, content: '手动保留的回答习惯' }));
+  await f.turn('请记住：我喜欢详细回答');
+  await localMemoryWait(() => !f.store.read().jobs.length, '锁定主题的自动整理没有完成');
+  assert.equal(f.store.read().entries.length, 1);
+  assert.equal(f.store.read().entries[0].content, '手动保留的回答习惯');
+  assert.equal((await f.memory.call('status')).pending, 0, '锁定冲突应跳过，不再要求确认');
+  await f.memory.close(); f.store = await f.openMemory(f.ctx); await f.start();
+  assert.equal(f.store.read().entries[0].content, '手动保留的回答习惯');
+});
+
 test('Android memory local specimen auto save works independently of conversation recall and survives reopen', async t => {
   const f = await localMemoryFlow(t);
   await f.settings(false, true);
@@ -6891,7 +6940,9 @@ test('Android memory local specimen namespaced keys remain stable and locked mem
   assert.equal(candidate.action, 'ignore', '相同经验不应反复生成待确认条目');
   events[1].data.message = createAssistantMessage({ source: { provider: 'fixture', model: 'source-model' }, content: [{ type: 'text', text: '结果不明，暂时停止' }] });
   const changed = selectEvents(events, { entries: f.store.read().entries, scope: { kind: 'workspace', workspace } });
-  assert.equal(validateCandidates([{ ...row, content: '结果不明，暂时停止' }], changed)[0].state, 'pending', '手动锁定的经验不能被自动覆盖');
+  const protectedCandidate = validateCandidates([{ ...row, content: '结果不明，暂时停止' }], changed)[0];
+  assert.equal(protectedCandidate.action, 'ignore', '手动锁定的经验不能被自动覆盖');
+  assert.equal(protectedCandidate.state, undefined, '跳过锁定经验，不再生成待确认条目');
 });
 
 for (const wait of [true, false]) {

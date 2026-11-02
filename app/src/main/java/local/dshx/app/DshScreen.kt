@@ -845,10 +845,10 @@ internal fun MemorySettings(store: MemoryStore, running: Boolean, visible: Boole
                 saved?.let { change(it.copy(enabled = enabled)) }
             }
             Divider()
-            SettingsSwitch("自动整理", "自动保存对话中的长期信息与实验体经验。使用云端模型时，相关片段会发送至该模型。",
+            SettingsSwitch("自动整理", "自动保存对话中的长期信息与实验体经验，无需逐条确认。使用云端模型时，相关片段会发送至该模型。",
                 saved?.autoSave ?: false, available,
                 if (saved == null) "状态未知" else null) { enabled ->
-                if (enabled) confirmation = "auto" else saved?.let { change(it.copy(autoSave = false)) }
+                saved?.let { change(it.copy(autoSave = enabled)) }
             }
             Divider()
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -942,22 +942,20 @@ internal fun MemorySettings(store: MemoryStore, running: Boolean, visible: Boole
         feedback()
     }
     confirmation?.takeIf { visible }?.let { action ->
-        MemoryDialog(when (action) { "auto" -> "开启自动整理"; "remove" -> "删除这条记忆"; else -> "清空全部记忆" }, { confirmation = null }) {
+        MemoryDialog(if (action == "remove") "删除这条记忆" else "清空全部记忆", { confirmation = null }) {
             Note(when (action) {
-                "auto" -> "开启后，将自动整理新对话与每轮培养结果，保存到本机记忆。无需开启对话读取。若使用云端模型，相关片段会发送给该模型。"
                 "remove" -> "删除后不再用于后续对话，并阻止从原来源重新提取。此操作无法撤销。"
                 else -> "将删除全部记忆、待确认候选和旧整理任务。开关保持原值。此操作无法撤销，会话备份不能恢复记忆。"
             })
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Action("取消", onClick = { confirmation = null })
-                Action(if (action == "auto") "开启" else "确认${if (action == "remove") "删除" else "清空"}", onClick = {
+                Action("确认${if (action == "remove") "删除" else "清空"}", onClick = {
                     confirmation = null
                     when (action) {
-                        "auto" -> saved?.let { change(it.copy(autoSave = true)) }
                         "remove" -> current?.let { request("remove", org.json.JSONObject().put("revision", editRevision).put("id", it.id)) { editing = false } }
                         else -> listRevision?.let { request("clear", org.json.JSONObject().put("revision", it)) }
                     }
-                }, enabled = available, primary = action == "auto", danger = action != "auto")
+                }, enabled = available, danger = true)
             }
         }
     }
