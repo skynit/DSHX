@@ -14,7 +14,7 @@ import java.util.concurrent.Executor
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.UUID
 
-data class EngineState(val phase: String = "未启动", val message: String = "准备在这台设备运行 dsh", val url: String? = null, val busy: Boolean = false, val policy: ToolPolicy.State = ToolPolicy.State(), val backup: SessionBackup.State = SessionBackup.State(), val knowledgeFiles: KnowledgeStore.Transfer = KnowledgeStore.Transfer())
+data class EngineState(val phase: String = "未启动", val message: String = "准备在这台设备运行 dsh", val url: String? = null, val busy: Boolean = false, val policy: ToolPolicy.State = ToolPolicy.State(), val backup: SessionBackup.State = SessionBackup.State(), val knowledgeFiles: KnowledgeStore.Transfer = KnowledgeStore.Transfer(), val taskRunning: Boolean = false)
 
 /** Owned by the Application; only the foreground service starts or stops it. */
 class Engine(private val context: Context, private val worker: Executor = Executors.newSingleThreadExecutor()) {
@@ -228,7 +228,11 @@ class Engine(private val context: Context, private val worker: Executor = Execut
                 val instance = UUID.randomUUID().toString()
                 tools.begin(instance)
                 val policyBridge = PolicyBridge(tools, instance, phone::execute, phone::finish, LocalModel(context)::reply, SmallModel(context)::status, phone::status,
-                    apps = ::apps) {
+                    apps = ::apps, taskState = { active ->
+                        main.post {
+                            if (bridge?.instance == instance) update(state.copy(taskRunning = active && !cancelled.get()))
+                        }
+                    }) {
                     main.post {
                         if (bridge?.instance == instance && !cancelled.get()) {
                             record("原生工具权限连接中断，已请求停止 dsh；旧会话权限不会恢复。")

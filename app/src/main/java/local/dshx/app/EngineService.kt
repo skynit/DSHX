@@ -42,8 +42,10 @@ class EngineService : Service() {
     private var readySince = 0L
     private val main = Handler(Looper.getMainLooper())
     private val retry = Runnable { startEngine() }
+    private val taskPower = TaskPower(this)
     private val engine get() = (application as DshApp).engine
     private val listener: (EngineState) -> Unit = { state ->
+        taskPower.setActive(running && state.taskRunning)
         if (state.url != null && readySince == 0L) readySince = SystemClock.elapsedRealtime()
         getSystemService(NotificationManager::class.java).notify(1, notification(state.phase))
     }
@@ -61,6 +63,7 @@ class EngineService : Service() {
         main.removeCallbacks(retry)
         if (intent?.action == "stop") {
             running = false
+            taskPower.setActive(false)
             if (!engine.stop()) finish()
             return START_NOT_STICKY
         }
@@ -73,6 +76,7 @@ class EngineService : Service() {
 
     override fun onDestroy() {
         running = false
+        taskPower.setActive(false)
         main.removeCallbacks(retry)
         engine.remove(listener)
         if (engine.state.busy || engine.state.url != null) engine.stop()
@@ -88,6 +92,7 @@ class EngineService : Service() {
     }
 
     private fun finished(restart: Boolean) {
+        taskPower.setActive(false)
         if (!running || !restart) {
             running = false
             finish()

@@ -1750,6 +1750,115 @@ test('phone bridge real agent bounds stopped planning allows an explanation and 
   } finally { finishExplanation.resolve(); policyHost.cachedMode = previousMode; await ctx.fiber.dispose(); }
 });
 
+test('Android task power guard aggregates concurrent agents and releases at idle disposal and shutdown', async () => {
+  const { apply } = await import(pathToFileURL(join(core, 'guard.mjs')));
+  const { policyHost } = await import(pathToFileURL(join(core, 'host.mjs')));
+  const original = { taskState: policyHost.taskState, close: policyHost.close };
+  const states = [], handlers = new Map(), effects = [];
+  const root = { session: { id: 'power-root' }, status: 'running' };
+  const child = { session: { id: 'power-child' }, status: 'idle' };
+  const initialSent = Promise.withResolvers(), acknowledge = Promise.withResolvers();
+  let closes = 0;
+  policyHost.taskState = async active => {
+    states.push(active);
+    if (states.length === 1) { initialSent.resolve(); await acknowledge.promise; }
+  };
+  policyHost.close = () => { closes++; };
+  try {
+    const applying = apply({
+      agents: { list: () => [root, child], isOwnedBy: () => false },
+      tools: { guard() {} }, systemPrompt: { section() {} },
+      on: (event, handler) => { handlers.set(event, handler); }, effect: callback => effects.push(callback()), get() {},
+    });
+    await initialSent.promise;
+    assert.deepEqual(states, [true], 'already running agents must be included');
+    handlers.get('agent/status')({ agent: child, status: 'running' });
+    acknowledge.resolve();
+    await applying;
+    handlers.get('agent/status')({ agent: root, status: 'idle' });
+    assert.deepEqual(states, [true], 'another running agent still needs power');
+    const request = { provider: 'fixture' };
+    assert.equal(await handlers.get('agent/request')({ agent: child }, async () => request), request);
+    assert.deepEqual(states, [true], 'model requests must not toggle power');
+    handlers.get('agent/status')({ agent: child, status: 'idle' });
+    handlers.get('agent/status')({ agent: child, status: 'idle' });
+    handlers.get('agent/status')({ agent: child, status: 'running' });
+    await handlers.get('agent/disposed')({ agent: child });
+    handlers.get('agent/status')({ agent: root, status: 'running' });
+    await effects.at(-1)();
+    assert.deepEqual(states, [true, false, true, false, true, false]);
+    assert.equal(closes, 1);
+  } finally { acknowledge.resolve(); Object.assign(policyHost, original); }
+});
+
+test('Android task power real agent releases on completion failure and cancellation without gaps between queued turns', async () => {
+  const { Context } = await load('@deepseek-ai/cordis');
+  const { default: SystemPrompt } = await load('@deepseek-ai/dsh-system-prompt');
+  const { default: Tools } = await load('@deepseek-ai/dsh-tools');
+  const { default: LlmRuntime, LlmAdapter, createUserMessage } = await load('@deepseek-ai/dsh-llm');
+  const { default: Agents } = await load('@deepseek-ai/dsh-agent');
+  const { default: Sessions } = await load('@deepseek-ai/dsh-session');
+  const { default: Projections } = await load('@deepseek-ai/dsh-session-projection');
+  const { default: AgentLoop } = await load('@deepseek-ai/dsh-agent-loop');
+  const { apply } = await import(pathToFileURL(join(core, 'guard.mjs')));
+  const { policyHost } = await import(pathToFileURL(join(core, 'host.mjs')));
+  const original = { taskState: policyHost.taskState, close: policyHost.close };
+  const ctx = new Context(), states = [];
+  let gate, started, fail = false;
+  policyHost.taskState = async active => { states.push(active); };
+  policyHost.close = () => {};
+  class Adapter extends LlmAdapter {
+    async *stream(options) {
+      if (gate) {
+        started.resolve();
+        await Promise.race([gate.promise, new Promise((_, reject) => {
+          options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true });
+        })]);
+      }
+      if (fail) throw new Error('fixture task failure');
+      yield { type: 'text-delta', index: 0, text: '任务完成' };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    }
+  }
+  try {
+    for (const plugin of [SystemPrompt, Tools, LlmRuntime, Agents, Sessions, Projections]) await ctx.plugin(plugin);
+    await ctx.plugin(AgentLoop, { agents: [] });
+    ctx.llm.registerAdapter(['fixture'], new Adapter());
+    await apply(ctx);
+    const agent = await ctx.agentLoop.create('task-power', { provider: 'fixture', model: 'single' });
+    const send = () => agent.followup(createUserMessage({ content: [{ type: 'text', text: '执行任务' }], source: { kind: 'user' } }));
+    send(); await agent.whenIdle();
+    assert.deepEqual(states, [false, true, false]);
+    gate = Promise.withResolvers(); started = Promise.withResolvers();
+    send(); await started.promise; send(); gate.resolve(); await agent.whenIdle();
+    assert.deepEqual(states, [false, true, false, true, false], 'queued turns share one continuous running period');
+    gate = undefined; fail = true;
+    send(); await agent.whenIdle();
+    assert.deepEqual(states.slice(-2), [true, false]);
+    fail = false; gate = Promise.withResolvers(); started = Promise.withResolvers();
+    send(); await started.promise; agent.cancel({ kind: 'user' }); await agent.whenIdle();
+    assert.deepEqual(states, [false, true, false, true, false, true, false, true, false]);
+  } finally {
+    gate?.resolve();
+    await ctx.fiber.dispose();
+    Object.assign(policyHost, original);
+  }
+});
+
+test('Android task power PolicyHost sends task state without requiring a conversation', async () => {
+  const fixture = await policyServer();
+  const host = new PolicyHost(fixture.config);
+  try {
+    await host.taskState(true);
+    await host.taskState(false);
+    const requests = fixture.requests.filter(row => row.method === 'task-state');
+    assert.deepEqual(requests.map(({ id, ...row }) => row), [
+      { method: 'task-state', active: true }, { method: 'task-state', active: false },
+    ]);
+    assert.equal(fixture.requests.some(row => row.method === 'register'), false);
+  } finally { host.close(); await fixture.close(); }
+});
+
 test('phone window guard finishes only when the agent is idle, never between model requests', async () => {
   const { apply } = await import(pathToFileURL(join(core, 'guard.mjs')));
   const { policyHost } = await import(pathToFileURL(join(core, 'host.mjs')));

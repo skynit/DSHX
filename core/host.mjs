@@ -285,6 +285,10 @@ export class PolicyHost {
     if (this.configured) await this.query('phone-finish', { session });
   }
 
+  async taskState(active) {
+    if (this.configured) await this.query('task-state', { active });
+  }
+
   async phone(action, args, session, signal) {
     if (!this.configured || typeof session !== 'string' || !session) throw new Error('手机操作需要当前原生会话连接。');
     return this.query('phone', { action, args, session }, signal);

@@ -26,6 +26,7 @@ class PolicyBridge(
     private val smallModel: (() -> JSONObject)? = null,
     private val phoneStatus: (() -> JSONObject)? = null,
     private val apps: ((String, JSONObject) -> JSONObject)? = null,
+    private val taskState: ((Boolean) -> Unit)? = null,
     private val lost: () -> Unit,
 ) : Closeable {
     val token = UUID.randomUUID().toString() + UUID.randomUUID().toString()
@@ -181,6 +182,7 @@ class PolicyBridge(
                 try {
                     val method = request.getString("method")
                     val allowed = when (method) {
+                        "task-state" -> setOf("id", "method", "active")
                         "phone-status" -> setOf("id", "method")
                         "register" -> setOf("id", "method", "session", "title", "parent")
                         "phone" -> setOf("id", "method", "session", "action", "args")
@@ -266,6 +268,13 @@ class PolicyBridge(
                         continue
                     }
                     when (method) {
+                        "task-state" -> {
+                            require(request.get("active") is Boolean)
+                            synchronized(this) {
+                                check(!closed && client === socket)
+                                taskState?.invoke(request.getBoolean("active"))
+                            }
+                        }
                         "phone-status" -> response.put("result", requireNotNull(phoneStatus).invoke())
                         "register" -> policy.register(instance, session, request.getString("title"), if (request.isNull("parent")) null else request.getString("parent"))
                         "mode" -> policy.mode(instance, session)
@@ -320,6 +329,7 @@ class PolicyBridge(
     }
 
     private fun release() {
+        taskState?.invoke(false)
         nativeCalls.values.forEach { it.completeExceptionally(IllegalStateException("引擎连接已停止。")) }
         nativeCalls.clear()
         voiceEvents.clear()

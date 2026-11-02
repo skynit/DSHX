@@ -9,6 +9,7 @@
 | 入口 | 说明 |
 |---|---|
 | [`EngineService.kt`](src/main/java/local/dshx/app/EngineService.kt) 中的 `DshApp`、`EngineService` | 由系统创建应用共享状态及后台服务，持有引擎和语音对象。[生命周期](../docs/engine.md) |
+| [`TaskPower.kt`](src/main/java/local/dshx/app/TaskPower.kt) | 由引擎服务管理，只在会话任务执行期间持有带超时续期的唤醒锁和一秒静音循环，任务结束或服务停止时释放。[后台保活](../docs/engine.md#任务执行期间的后台保活) |
 | [`Engine.kt`](src/main/java/local/dshx/app/Engine.kt)、[`CoreStore.kt`](src/main/java/local/dshx/app/CoreStore.kt) | 准备运行资源、数据目录、启动认证和进程收尾。[运行包安装](../docs/runtime.md) |
 | [`MainActivity.kt`](src/main/java/local/dshx/app/MainActivity.kt)、[`DshScreen.kt`](src/main/java/local/dshx/app/DshScreen.kt) | 系统页面、原生管理与官方聊天网页交接。[界面说明](../docs/interface.md) |
 | [`SettingsScreen.kt`](src/main/java/local/dshx/app/SettingsScreen.kt) | 由原生页面调用，组织设置总览、助手与资料、语音交互、任务分工、权限及备份表单。 |

@@ -361,6 +361,88 @@ class CoreTest {
         assertEquals(2, jobs.size)
     }
 
+    @Test @Config(sdk = [26, 34]) fun taskPowerPlaysOneSecondOfSilenceOnlyWhileTasksRun() {
+        val context = RuntimeEnvironment.getApplication()
+        val written = mutableListOf<ByteArray>()
+        val listener = org.robolectric.shadows.ShadowAudioTrack.OnAudioDataWrittenListener { _, bytes, _ -> written.add(bytes.copyOf()) }
+        org.robolectric.shadows.ShadowAudioTrack.addAudioDataListener(listener)
+        val power = TaskPower(context)
+        try {
+            assertNull(ReflectionHelpers.getField<android.media.AudioTrack?>(power, "audio"))
+            power.setActive(true)
+            val wake = ReflectionHelpers.getField<PowerManager.WakeLock>(power, "wake")
+            val audio = ReflectionHelpers.getField<android.media.AudioTrack>(power, "audio")
+            assertTrue(wake.isHeld)
+            assertEquals(android.media.AudioTrack.PLAYSTATE_PLAYING, audio.playState)
+            assertEquals(8000, audio.sampleRate)
+            assertEquals(1, audio.channelCount)
+            assertEquals(android.media.AudioFormat.ENCODING_PCM_16BIT, audio.audioFormat)
+            assertEquals(16000, written.single().size)
+            assertTrue(written.single().all { it == 0.toByte() })
+            power.setActive(true)
+            assertEquals(1, written.size)
+            power.setActive(false)
+            assertFalse(wake.isHeld)
+            assertEquals(android.media.AudioTrack.STATE_UNINITIALIZED, audio.state)
+            shadowOf(Looper.getMainLooper()).idleFor(15, TimeUnit.MINUTES)
+            assertEquals(1, written.size)
+            assertFalse(wake.isHeld)
+        } finally {
+            power.setActive(false)
+            org.robolectric.shadows.ShadowAudioTrack.removeAudioDataListener(listener)
+        }
+    }
+
+    @Test fun taskPowerRenewsLongTasksAndKeepsWakeLockWhenAudioFails() {
+        val power = TaskPower(RuntimeEnvironment.getApplication())
+        org.robolectric.shadows.ShadowAudioTrack.enableIllegalStateOnPlay(true)
+        try {
+            power.setActive(true)
+            val wake = ReflectionHelpers.getField<PowerManager.WakeLock>(power, "wake")
+            assertTrue(wake.isHeld)
+            assertNull(ReflectionHelpers.getField<android.media.AudioTrack?>(power, "audio"))
+            org.robolectric.shadows.ShadowAudioTrack.enableIllegalStateOnPlay(false)
+            shadowOf(Looper.getMainLooper()).idleFor(21, TimeUnit.MINUTES)
+            assertTrue(wake.isHeld)
+            val audio = ReflectionHelpers.getField<android.media.AudioTrack>(power, "audio")
+            assertEquals(android.media.AudioTrack.PLAYSTATE_PLAYING, audio.playState)
+            power.setActive(false)
+            assertFalse(wake.isHeld)
+            assertEquals(android.media.AudioTrack.STATE_UNINITIALIZED, audio.state)
+        } finally {
+            org.robolectric.shadows.ShadowAudioTrack.enableIllegalStateOnPlay(false)
+            power.setActive(false)
+        }
+    }
+
+    @Test fun engineServiceReleasesTaskPowerOnStopAndDestroy() {
+        val engine = (RuntimeEnvironment.getApplication() as DshApp).engine
+        ReflectionHelpers.setField(engine, "worker", Executor {})
+        val controller = Robolectric.buildService(EngineService::class.java).create()
+        val service = controller.get()
+        val listener = ReflectionHelpers.getField<(EngineState) -> Unit>(service, "listener")
+        try {
+            service.onStartCommand(Intent(), 0, 1)
+            listener(EngineState(url = "http://127.0.0.1:1234"))
+            val power = ReflectionHelpers.getField<TaskPower>(service, "taskPower")
+            assertNull(ReflectionHelpers.getField<PowerManager.WakeLock?>(power, "wake"))
+            listener(EngineState(taskRunning = true))
+            val wake = ReflectionHelpers.getField<PowerManager.WakeLock>(power, "wake")
+            assertTrue(wake.isHeld)
+            service.onStartCommand(Intent().setAction("stop"), 0, 2)
+            assertFalse(wake.isHeld)
+            listener(EngineState(taskRunning = true))
+            assertFalse(wake.isHeld)
+            service.onStartCommand(Intent(), 0, 3)
+            listener(EngineState(taskRunning = true))
+            assertTrue(ReflectionHelpers.getField<PowerManager.WakeLock>(power, "wake").isHeld)
+        } finally { controller.destroy() }
+        val power = ReflectionHelpers.getField<TaskPower>(service, "taskPower")
+        assertNull(ReflectionHelpers.getField<PowerManager.WakeLock?>(power, "wake"))
+        shadowOf(Looper.getMainLooper()).idleFor(15, TimeUnit.MINUTES)
+        assertNull(ReflectionHelpers.getField<PowerManager.WakeLock?>(power, "wake"))
+    }
+
     @Test fun accessibilityAuthorizationMatchesOurServiceEvenBeforeItConnects() {
         val context = RuntimeEnvironment.getApplication()
         val control = PhoneControl(context)
@@ -3486,6 +3568,38 @@ class CoreTest {
         policy.disconnect("instance")
         assertTrue(policy.state.sessions.isEmpty())
         assertThrows(IllegalArgumentException::class.java) { policy.mode("instance", "root") }
+    }
+
+    @Test fun policyBridgeValidatesTaskStateAndClearsItOnDisconnect() {
+        val policy = ToolPolicy().apply { begin("tasks") }
+        val states = java.util.Collections.synchronizedList(mutableListOf<Boolean>())
+        val lost = CountDownLatch(1)
+        PolicyBridge(policy, "tasks", taskState = { states.add(it) }) { lost.countDown() }.use { bridge ->
+            bridge.start()
+            Socket("127.0.0.1", bridge.port).use { stranger ->
+                stranger.soTimeout = 3000
+                stranger.getOutputStream().write("{\"id\":1,\"method\":\"task-state\",\"active\":true}\n".toByteArray())
+                assertEquals(-1, stranger.getInputStream().read())
+            }
+            assertTrue(states.isEmpty())
+            PolicyConnection(bridge).use { connection ->
+                fun state(id: Int, active: Any?, extra: Boolean = false) = connection.query(id, "task-state") {
+                    remove("session")
+                    if (active != null) put("active", active)
+                    if (extra) put("other", true)
+                }.getBoolean("ok")
+                assertFalse(state(1, "true"))
+                assertFalse(state(2, null))
+                assertFalse(state(3, true, true))
+                assertTrue(states.isEmpty())
+                assertTrue(state(4, true))
+                assertTrue(state(5, false))
+                assertTrue(state(6, true))
+                assertEquals(listOf(true, false, true), states.toList())
+            }
+            assertTrue(lost.await(3, TimeUnit.SECONDS))
+            assertEquals(listOf(true, false, true, false), states.toList())
+        }
     }
 
     @Test fun policyBridgeAuthenticatesAndNeverAcceptsNetworkModeChanges() {

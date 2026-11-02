@@ -20,19 +20,32 @@ export async function apply(ctx) {
       ctx.get('sessionTitle')?.get(agent.session)?.title ?? '未命名会话', parent?.session.id ?? null);
   };
   for (const agent of ctx.agents.list()) await register(agent);
+  const running = new Set(ctx.agents.list().filter(agent => agent.status === 'running'));
+  const taskState = (agent, active) => {
+    const before = running.size > 0;
+    if (active) running.add(agent); else running.delete(agent);
+    if (before !== (running.size > 0)) policyHost.taskState(running.size > 0).catch(() => {});
+  };
   ctx.on('agent/created', async ({ agent }) => { await register(agent); });
   ctx.on('agent/disposed', ({ agent }) => {
+    taskState(agent, false);
     forgetActions(agent.session.id);
     return policyHost.end(agent.session.id).catch(() => {});
   });
   ctx.on('agent/request', async ({ agent }, next) => { await register(agent); return next(); });
   ctx.on('agent/status', ({ agent, status }) => {
+    taskState(agent, status === 'running');
     if (status === 'idle') {
       forgetActions(agent.session.id);
       policyHost.finishPhone(agent.session.id).catch(() => {});
     }
   });
-  ctx.effect(() => () => policyHost.close());
+  ctx.effect(() => () => {
+    running.clear();
+    policyHost.taskState(false).catch(() => {});
+    policyHost.close();
+  });
+  await policyHost.taskState(running.size > 0);
   ctx.tools.guard(toolReason);
   ctx.systemPrompt.section({
     name: 'android:tools', order: 100,
