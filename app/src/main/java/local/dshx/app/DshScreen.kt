@@ -177,7 +177,6 @@ fun DshScreen(
     accessibilityNotice: Boolean = false, onAccessibilityDismiss: () -> Unit = {},
     onApps: (String, org.json.JSONObject) -> org.json.JSONObject = { _, _ -> error("微应用管理尚未连接。") },
     onCreateApp: (org.json.JSONObject) -> org.json.JSONObject = { error("微应用创建尚未连接。") },
-    onRestart: () -> Unit = {}, onCopyEntry: () -> Unit = {},
     enginePage: String? = null, onEnginePageHandled: () -> Unit = {},
     engineInfo: () -> org.json.JSONObject = { org.json.JSONObject() },
     engineStatus: () -> org.json.JSONObject = { org.json.JSONObject() },
@@ -379,8 +378,6 @@ fun DshScreen(
                                                 icon = if (running) Lucide.ChevronRight else Lucide.Play)
                                             if (active) Action(if (running) "停止服务" else "取消启动", onClick = onStop,
                                                 enabled = state.phase != "正在停止", icon = Lucide.Square, danger = true)
-                                            if (running) Action("重启引擎", onClick = onRestart, enabled = !state.busy, icon = Lucide.RotateCcw)
-                                            Action("复制入口", onClick = onCopyEntry)
                                         }
                                         val operation = engineStatus().optJSONObject("operation")
                                         if (operation != null && operation.optString("state") != "idle") {

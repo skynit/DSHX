@@ -252,12 +252,6 @@ class MainActivity : ComponentActivity() {
                 onStart = ::startEngine,
                 onStop = { startService(Intent(this, EngineService::class.java).setAction("stop")) },
                 diagnostics = engine::diagnostics, pageError = pageError,
-                onRestart = ::restartEngine,
-                onCopyEntry = {
-                    getSystemService(android.content.ClipboardManager::class.java)
-                        .setPrimaryClip(android.content.ClipData.newPlainText("DSHX", "dshx://engine"))
-                    Toast.makeText(this, "已复制入口，在本机打开 DSHX", Toast.LENGTH_SHORT).show()
-                },
                 enginePage = enginePage, onEnginePageHandled = { enginePage = null },
                 engineInfo = engine::engineInfo, engineStatus = { engine.engineStatus() },
                 onReload = { pageError = null; browser?.reload() },

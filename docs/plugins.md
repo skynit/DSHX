@@ -35,7 +35,7 @@ Android 运行包预装 Git，包含 HTTP/HTTPS 传输助手、证书、仓库�
 
 运行包生成可直接调用的 `dsh` 命令，自动寻找同一目录的 Node 和 `start.mjs`，因此不依赖带版本号的绝对路径。`start.mjs` 向官方命令入口传入 Android 包管理配置；插件安装仍使用固定 pnpm，并执行原生依赖检查。例如使用 `dsh plugin --profile web --help` 核对本版本命令，随后按帮助安装或移除。普通 `pnpm add` 只安装依赖，不等同于完成插件登记和加载。
 
-**热更新（HMR）**是引擎加载的运行配置更新组件。官方管理器在修改插件后主动请求它重新组合配置，不只依赖文件变化监听。以回执中的 `application` 为准：`applied` 表示已应用，`restart-required` 表示仍需重启，并携带 `restartReason`；`failed`、`cancelled` 和 `overridden` 不能报告为正常生效。插件页需要重启时显示“重启以生效”和“查看日志”，工作台也提供重启入口。
+**热更新（HMR）**是引擎加载的运行配置更新组件。官方管理器在修改插件后主动请求它重新组合配置，不只依赖文件变化监听。以回执中的 `application` 为准：`applied` 表示已应用，`restart-required` 表示仍需重启，并携带 `restartReason`；`failed`、`cancelled` 和 `overridden` 不能报告为正常生效。插件页需要重启时显示“重启以生效”和“查看日志”。
 
 `engine_plugins` 由 Android 适配插件注册，实时查询官方管理器中的运行条目和安装包清单；`enabled` 只代表选择启用，实际运行阶段看 `fiberPhase`。缓存文件生成、安装命令成功或页面出现名称，均不能代替最小功能验证。该工具分页返回字段，不读取插件配置或网页凭据。
 
