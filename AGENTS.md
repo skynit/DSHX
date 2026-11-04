@@ -47,3 +47,20 @@
 解释代码、代码设计、接口、数据结构或执行流程时，要详细说明。
 
 首次使用项目内部术语、组件名、缩写或可能不熟悉的技术概念时，立即用通俗中文解释它是什么、由谁创建或配置、负责什么，以及与相近概念的区别。可以先提供术语表再说明调用流程，后文不必重复定义。
+
+## Agent skills
+
+### Issue tracker
+
+需求、规格和实施任务统一记录在 `skynit/DSHX` 的 GitHub Issues。
+读取、创建或更新任务前，先读 `docs/agents/issue-tracker.md`。
+
+### Triage labels
+
+任务分类使用五个默认状态标签。
+评估任务、变更状态或按状态筛选任务前，先读 `docs/agents/triage-labels.md`。
+
+### Domain docs
+
+采用 single-context 布局：根目录 `GLOSSARY.md` 和 `docs/adr/`。
+探索代码、编写规格或评估架构方案前，先读 `docs/agents/domain.md`。
