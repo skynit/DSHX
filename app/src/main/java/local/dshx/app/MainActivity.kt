@@ -395,6 +395,9 @@ class MainActivity : ComponentActivity() {
         if (action == "download-local") {
             voice.download(); return
         }
+        if (action == "download-speech") {
+            voice.download("speech"); return
+        }
         if (action == "send") { voice.start(action); return }
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED && action != "send") {
             pendingVoice = action; microphone.launch(Manifest.permission.RECORD_AUDIO); return

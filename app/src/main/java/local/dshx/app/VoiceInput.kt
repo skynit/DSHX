@@ -28,12 +28,13 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.sqrt
 
-/** 关键词检测释放麦克风后，整句识别由手机配置的系统服务负责。 */
+/** 关键词检测释放麦克风后，使用选定的本地或系统服务进行整句识别。 */
 class VoiceInput(private val context: Context, private val models: VoiceModels) : AutoCloseable {
     private class ServiceError(val code: Int) : IllegalStateException(errorMessage(code))
 
     /** 一次 listen 共用的插话判断；切换识别服务时仍然只通知一次。 */
-    private class Speech(private val onSpeech: () -> Unit, private val echoText: () -> String) {
+    internal class Speech(private val onSpeech: () -> Unit, private val echoText: () -> String,
+                         private val echoMillis: Long = 2_000, private val echoLimit: Int = 4) {
         private data class Echo(val text: String, var time: Long)
         private val echoes = mutableListOf<Echo>()
         private var current = ""
@@ -46,11 +47,11 @@ class VoiceInput(private val context: Context, private val models: VoiceModels) 
                 echoes.firstOrNull { it.text == current }?.time = now
                 current = echo
             }
-            echoes.removeAll { now - it.time > 2_000 }
+            echoes.removeAll { now - it.time > echoMillis }
             if (echo.isNotEmpty()) {
                 val saved = echoes.firstOrNull { it.text == echo }
                 if (saved == null) echoes.add(Echo(echo, now)) else saved.time = now
-                while (echoes.size > 4) echoes.removeAt(0)
+                while (echoes.size > echoLimit) echoes.removeAt(0)
             }
         }
 
@@ -151,6 +152,7 @@ class VoiceInput(private val context: Context, private val models: VoiceModels) 
     private val main = Handler(Looper.getMainLooper())
     @Volatile private var request: Request? = null
     @Volatile private var recorder: AudioRecord? = null
+    @Volatile private var localInput: LocalSpeech? = null
     private var wakeVerified = false
 
     fun listen(wake: String?, cancelled: () -> Boolean, timeoutSeconds: Int = 5, allowEmpty: Boolean = false,
@@ -170,10 +172,22 @@ class VoiceInput(private val context: Context, private val models: VoiceModels) 
                onSpeech: () -> Unit = {}, echoText: () -> String = { "" }, state: (String) -> Unit): String {
         check(Looper.myLooper() != Looper.getMainLooper()) { "语音识别需要在后台执行。" }
         check(context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) { "请先允许麦克风权限。" }
-        check(available(context)) { "手机没有可用的系统语音识别服务，请在系统语音设置中安装或启用。" }
+        val local = source(context) == "local"
+        check(if (local) models.ready("speech") else available(context)) {
+            if (local) "请先在语音设置中下载本地识别模型。" else "手机没有可用的系统语音识别服务，请在系统语音设置中安装或启用。"
+        }
         if (cancelled()) throw CancellationException()
         if (wake != null) awaitWake(wake, cancelled, playback, onWake, onLevel, state)
         if (cancelled()) throw CancellationException()
+        if (local) {
+            val input = localInput ?: LocalSpeech(context, models).also { localInput = it }
+            // 本地整句识别没有中间结果，保留本次收音期间的播报文本供最终回声过滤。
+            val speech = Speech(onSpeech, echoText, echoMillis = 90_000, echoLimit = 64)
+            val text = input.listen(cancelled, timeoutSeconds, allowEmpty, playback, speech::text, speech::playing, onLevel, state)
+            if (cancelled()) throw CancellationException()
+            if (text.isNotBlank()) main.post { if (!cancelled()) speech.notifySpeech() }
+            return text
+        }
         val onDevice = onDeviceAvailable(context)
         val deadline = SystemClock.elapsedRealtime() + 60_000
         val speech = Speech(onSpeech, echoText)
@@ -393,12 +407,16 @@ class VoiceInput(private val context: Context, private val models: VoiceModels) 
 
     fun stop() {
         request?.finish(failure = CancellationException())
+        localInput?.stop()
         runCatching { recorder?.stop() }
     }
-    override fun close() = stop()
+    override fun close() { stop(); localInput?.close() }
 
     companion object {
         const val RATE = 16000
+
+        internal fun source(context: Context): String =
+            if (context.getSharedPreferences("voice", Context.MODE_PRIVATE).getString("recognition", "local") == "system") "system" else "local"
 
         fun available(context: Context): Boolean = SpeechRecognizer.isRecognitionAvailable(context) || onDeviceAvailable(context)
 

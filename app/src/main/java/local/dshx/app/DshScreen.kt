@@ -572,7 +572,9 @@ private fun VoiceChat(
                 when {
                     !state.active && !running -> Action(if (busy) "正在启动…" else "启动 dsh", onClick = onStart,
                         enabled = !busy, primary = true, icon = Lucide.Play)
-                    !state.active && !state.speechAvailable -> Action("系统语音设置", onClick = { action("speech-settings") }, primary = true, icon = Lucide.Settings2)
+                    !state.active && !state.speechAvailable -> if (state.recognition == "local") {
+                        Action("下载识别模型", onClick = { action("download-speech") }, primary = true)
+                    } else Action("系统语音设置", onClick = { action("speech-settings") }, primary = true, icon = Lucide.Settings2)
                 }
             }
         }

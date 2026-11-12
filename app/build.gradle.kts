@@ -94,7 +94,7 @@ tasks.matching { it.name == "preBuild" }.configureEach { dependsOn(prepareMicroA
 tasks.matching { it.name == "preBuild" }.configureEach {
     doFirst {
         val voiceRuntime = file("libs/sherpa-onnx-1.13.2.aar")
-        check(voiceRuntime.isFile && file("src/main/assets/voice/models.json").isFile) {
+        check(voiceRuntime.isFile && file("src/main/assets/voice/models.json").isFile && file("src/main/assets/voice/vad/silero_vad.onnx").isFile) {
             "缺少本地语音依赖，请先执行 python3 tools/voice.py prepare"
         }
         val runtimeHash = MessageDigest.getInstance("SHA-256").digest(voiceRuntime.readBytes())

@@ -1246,6 +1246,7 @@ class CoreTest {
     @Test fun voiceStartExplainsMissingSystemSpeechBeforeOpeningTheMicrophone() {
         ShadowSpeechRecognizer.setIsOnDeviceRecognitionAvailable(false)
         val app = RuntimeEnvironment.getApplication()
+        app.getSharedPreferences("voice", 0).edit().putString("recognition", "system").commit()
         val root = folder.newFolder()
         val context = object : ContextWrapper(app) { override fun getFilesDir() = root }
         val engine = Engine(context)
@@ -1270,6 +1271,7 @@ class CoreTest {
     private fun enableSystemSpeech() {
         ShadowSpeechRecognizer.setIsOnDeviceRecognitionAvailable(false)
         val app = RuntimeEnvironment.getApplication()
+        app.getSharedPreferences("voice", 0).edit().putString("recognition", "system").commit()
         shadowOf(app).grantPermissions(android.Manifest.permission.RECORD_AUDIO)
         shadowOf(app.packageManager).addResolveInfoForIntent(Intent(RecognitionService.SERVICE_INTERFACE), ResolveInfo().apply {
             serviceInfo = ServiceInfo().apply { packageName = "test.phone.voice"; name = "test.phone.voice.RecognitionService" }
@@ -1370,6 +1372,7 @@ class CoreTest {
     @Test @Config(sdk = [34]) @LooperMode(LooperMode.Mode.PAUSED)
     fun voiceSystemSpeechUsesAndroidOnDeviceServiceWhenAvailable() {
         val app = RuntimeEnvironment.getApplication()
+        app.getSharedPreferences("voice", 0).edit().putString("recognition", "system").commit()
         shadowOf(app).grantPermissions(android.Manifest.permission.RECORD_AUDIO)
         ShadowSpeechRecognizer.setIsOnDeviceRecognitionAvailable(true)
         assertTrue(VoiceInput.available(app))
@@ -2025,10 +2028,185 @@ class CoreTest {
         assertFalse(File(root, "voice/models/wake-20251220-1/silero_vad.onnx").exists())
         for (name in listOf("wake-20251220-1", "local-50968a44", "custom-model")) assertEquals("model", File(root, "voice/models/$name/keep").readText())
         val catalog = JSONObject(app.assets.open("voice/models.json").bufferedReader().use { it.readText() })
-        assertFalse(catalog.has("speech"))
+        assertTrue(catalog.has("speech"))
+        assertEquals("20240717-vad1", catalog.getJSONObject("speech").getString("version"))
         assertTrue(catalog.has("wake"))
         assertTrue(catalog.has("local"))
         assertFalse(catalog.getJSONObject("wake").toString().contains("silero_vad"))
+    }
+
+    @Test fun voiceLocalRecognitionIsDefaultAndMissingModelsHaveAnActionableError() {
+        val app = RuntimeEnvironment.getApplication()
+        app.getSharedPreferences("voice", 0).edit().clear().commit()
+        val context = object : ContextWrapper(app) { override fun getFilesDir() = folder.root }
+        val engine = Engine(context)
+        ReflectionHelpers.setField(engine, "state", EngineState(url = "http://127.0.0.1:3080/"))
+        val voice = VoiceControl(context, engine)
+        assertEquals("local", voice.state.recognition)
+        assertFalse(voice.state.speechReady)
+        for (mode in listOf("input", "talk", "wake")) {
+            voice.start(mode)
+            assertFalse(voice.state.active)
+            assertEquals("请先在语音设置中下载本地识别模型。", voice.state.error)
+        }
+        voice.saveRecognition("system")
+        assertEquals("system", VoiceInput.source(context))
+        assertEquals("system", VoiceControl(context, engine).state.recognition)
+        enableSystemSpeech()
+        voice.refreshSpeech()
+        assertTrue(voice.state.speechAvailable)
+        voice.saveRecognition("local")
+        assertFalse(voice.state.speechAvailable)
+        assertThrows(IllegalArgumentException::class.java) { voice.saveRecognition("unknown") }
+        ReflectionHelpers.setField(voice, "state", voice.state.copy(active = true))
+        assertThrows(IllegalStateException::class.java) { voice.saveRecognition("system") }
+        assertEquals("local", VoiceInput.source(context))
+    }
+
+    private class SpeechDetector : LocalSpeech.Detector {
+        var speech = false
+        var segment: FloatArray? = null
+        var accepts = 0
+        override fun accept(samples: FloatArray) { accepts++ }
+        override fun detected() = speech
+        override fun take(): FloatArray? = segment.also { segment = null }
+    }
+
+    @Test fun voiceLocalVadOnlyDecodesCompletedSegmentsAndKeepsSpeechBeyondTheNoInputDeadline() {
+        val detector = SpeechDetector()
+        val utterance = floatArrayOf(0.1f, 0.2f, 0.3f)
+        val states = mutableListOf<String>()
+        val levels = mutableListOf<Float>()
+        var clock = 0L
+        var reads = 0
+        var decodes = 0
+        val result = LocalSpeech.collect(detector, read = {
+            reads++
+            clock += 1_000
+            detector.speech = reads >= 2
+            if (reads == 8) detector.segment = utterance
+            floatArrayOf(0.125f)
+        }, decode = {
+            decodes++
+            assertEquals(8, reads)
+            assertArrayEquals(utterance, it, 0f)
+            "完整问题"
+        }, cancelled = { false }, timeoutSeconds = 5, allowEmpty = false, state = states::add, onLevel = levels::add, now = { clock })
+        assertEquals("完整问题", result)
+        assertEquals(1, decodes)
+        assertEquals(8, detector.accepts)
+        assertEquals(listOf("正在听", "正在识别"), states)
+        assertTrue(levels.all { kotlin.math.abs(it - 0.5f) < 0.001f })
+    }
+
+    @Test fun voiceLocalVadTimesOutSilenceWithoutRunningRecognitionAndBoundsContinuousSpeech() {
+        for (allowEmpty in listOf(false, true)) {
+            var clock = 0L
+            val task = {
+                LocalSpeech.collect(SpeechDetector(), read = { clock += 1_000; FloatArray(0) },
+                    decode = { fail("无语音片段不能启动识别"); "" }, cancelled = { false }, timeoutSeconds = 5,
+                    allowEmpty = allowEmpty, now = { clock })
+            }
+            if (allowEmpty) assertEquals("", task())
+            else assertEquals("没有识别到有效文字，请重新说一次。", assertThrows(IllegalStateException::class.java) { task() }.message)
+            assertEquals(5_000L, clock)
+        }
+        var clock = 0L
+        val detector = SpeechDetector().apply { speech = true }
+        val failure = assertThrows(IllegalStateException::class.java) {
+            LocalSpeech.collect(detector, read = { clock += 1_000; floatArrayOf(0.1f) }, decode = { "不应执行" },
+                cancelled = { false }, timeoutSeconds = 5, allowEmpty = true, now = { clock })
+        }
+        assertTrue(failure.message!!.contains("30 秒"))
+        assertEquals(31_000L, clock)
+    }
+
+    @Test fun voiceLocalVadFiltersRecordedPlaybackBeforeAcceptingAnInterruption() {
+        var playing = "这是助手正在播报的内容"
+        val speech = VoiceInput.Speech({}, { playing }, echoMillis = 90_000, echoLimit = 64)
+        val detector = SpeechDetector()
+        var reads = 0
+        var decodes = 0
+        val states = mutableListOf<String>()
+        val result = LocalSpeech.collect(detector, read = {
+            reads++
+            if (reads == 2) {
+                playing = "下一句播报"
+                org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofSeconds(3))
+            }
+            detector.segment = floatArrayOf(reads.toFloat())
+            floatArrayOf(0.1f)
+        }, decode = {
+            decodes++
+            when (decodes) { 1 -> "这是助手正在播报的内容"; 2 -> "嗯"; else -> "停下，我换一个问题" }
+        }, cancelled = { false }, timeoutSeconds = 8, allowEmpty = true,
+            filter = speech::text, onAudio = speech::playing, state = states::add)
+        assertEquals("停下，我换一个问题", result)
+        assertEquals(3, reads)
+        assertEquals(listOf("正在听", "正在识别", "正在听", "正在识别", "正在听", "正在识别"), states)
+        assertEquals("不", speech.text("不"))
+    }
+
+    @Test fun voiceLocalVadDoesNotPublishResultsAfterCancellationOrHideRecordingFailures() {
+        var cancelled = false
+        var decodes = 0
+        val detector = SpeechDetector()
+        assertThrows(java.util.concurrent.CancellationException::class.java) {
+            LocalSpeech.collect(detector, read = { cancelled = true; detector.segment = floatArrayOf(1f); floatArrayOf(1f) },
+                decode = { decodes++; "迟到结果" }, cancelled = { cancelled }, timeoutSeconds = 5, allowEmpty = true)
+        }
+        assertEquals(0, decodes)
+        cancelled = false
+        detector.segment = floatArrayOf(1f)
+        assertThrows(java.util.concurrent.CancellationException::class.java) {
+            LocalSpeech.collect(detector, read = { floatArrayOf(1f) }, decode = { cancelled = true; "识别中取消" },
+                cancelled = { cancelled }, timeoutSeconds = 5, allowEmpty = true)
+        }
+        val error = assertThrows(java.io.IOException::class.java) {
+            LocalSpeech.collect(SpeechDetector(), read = { throw java.io.IOException("录音断开") }, decode = { "" },
+                cancelled = { false }, timeoutSeconds = 5, allowEmpty = true)
+        }
+        assertEquals("录音断开", error.message)
+    }
+
+    @Test fun voiceLocalModelsPinVadAndAsrWithTheOfficialAudioFormat() {
+        val app = RuntimeEnvironment.getApplication()
+        val catalog = JSONObject(app.assets.open("voice/models.json").bufferedReader().use { it.readText() })
+        val files = catalog.getJSONObject("speech").getJSONArray("files")
+        assertEquals(3, files.length())
+        val vad = files.getJSONObject(0)
+        val bundled = app.assets.open(vad.getString("asset")).use { it.readBytes() }
+        assertEquals(vad.getLong("bytes"), bundled.size.toLong())
+        assertEquals(vad.getString("sha256"), UpdateStore.hash(bundled))
+        for (i in 1 until files.length()) {
+            val model = files.getJSONObject(i)
+            assertTrue(model.getString("url").contains("2365baeacb507f821a0c8120fcee3d484dba7a07"))
+            assertEquals(64, model.getString("sha256").length)
+        }
+        val config = LocalSpeech.vadConfig("/models/vad.onnx")
+        assertEquals(16000, config.sampleRate)
+        assertEquals(512, config.sileroVadModelConfig.windowSize)
+        assertEquals(0.5f, config.sileroVadModelConfig.minSilenceDuration, 0f)
+        val asr = LocalSpeech.recognizerConfig(File("/models"))
+        assertEquals(16000, asr.featConfig.sampleRate)
+        assertEquals("/models/model.int8.onnx", asr.modelConfig.senseVoice.model)
+        assertEquals("/models/tokens.txt", asr.modelConfig.tokens)
+        assertTrue(asr.modelConfig.senseVoice.useInverseTextNormalization)
+    }
+
+    @Test fun voiceLocalVadKeepsLeadingAudioWithoutDuplicatingOrReadingOverwrittenSamples() {
+        val buffer = LocalSpeech.AudioBuffer(16)
+        buffer.add(FloatArray(10) { it.toFloat() })
+        assertArrayEquals(FloatArray(10) { it.toFloat() }, buffer.prepend(6, floatArrayOf(6f, 7f, 8f, 9f)), 0f)
+        buffer.add(FloatArray(14) { (it + 10).toFloat() })
+        assertArrayEquals(FloatArray(13) { (it + 8).toFloat() }, buffer.prepend(18, floatArrayOf(18f, 19f, 20f)), 0f)
+        assertArrayEquals(floatArrayOf(1f), buffer.prepend(1, floatArrayOf(1f)), 0f)
+        val long = LocalSpeech.AudioBuffer(32_000)
+        long.add(FloatArray(20_000) { it.toFloat() })
+        val padded = long.prepend(16_000, floatArrayOf(16_000f))
+        assertEquals(4_801, padded.size)
+        assertEquals(11_200f, padded.first(), 0f)
+        assertEquals(16_000f, padded.last(), 0f)
     }
 
     @Test fun engineLinksAcceptOnlyKnownLocalActionsWithoutCredentials() {

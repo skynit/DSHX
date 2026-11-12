@@ -50,6 +50,7 @@ class VoiceModels(private val context: Context) {
         // Preserve Android's low-memory reserve; this is admission control, not a reservation.
         // Qwen3 f16 KV is 112 KiB per token on this model (448 MiB / 4096).
         val minimum = when (name) {
+            "speech" -> 512L * 1024 * 1024
             "local" -> 700L * 1024 * 1024 + (contextTokens.coerceIn(512, 4096) - 512L) * 112 * 1024
             else -> error("未知模型类型")
         }

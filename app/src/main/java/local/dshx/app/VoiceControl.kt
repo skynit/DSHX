@@ -27,6 +27,7 @@ class VoiceControl(private val context: Context, private val engine: Engine) {
         val draft: String = "", val session: String? = null, val error: String? = null,
         val turns: List<Turn> = emptyList(),
         val speechAvailable: Boolean = false, val localReady: Boolean = false,
+        val recognition: String = "local", val speechReady: Boolean = false,
         val smallModel: SmallModel.Settings = SmallModel.Settings(), val smallReady: Boolean = false,
         val customModel: String = "",
         val output: VoiceOutput.Settings = VoiceOutput.Settings(),
@@ -55,7 +56,8 @@ class VoiceControl(private val context: Context, private val engine: Engine) {
     private val preferences = context.getSharedPreferences("voice", Context.MODE_PRIVATE)
     val models = VoiceModels(context)
     val smallModel = SmallModel(context)
-    @Volatile var state = State(speechAvailable = VoiceInput.available(context), localReady = models.ready("local"),
+    @Volatile var state = State(speechAvailable = speechAvailable(), recognition = VoiceInput.source(context),
+        speechReady = models.ready("speech"), localReady = models.ready("local"),
         output = VoiceOutput.settings(context),
         smallModel = smallModel.settings(), smallReady = smallReady(smallModel.settings()), customModel = smallModel.name())
         private set
@@ -160,26 +162,42 @@ class VoiceControl(private val context: Context, private val engine: Engine) {
     }
 
     fun refreshSpeech() {
-        val available = VoiceInput.available(context)
-        if (available != state.speechAvailable) update(state.copy(speechAvailable = available))
+        val available = speechAvailable()
+        val ready = models.ready("speech")
+        val source = VoiceInput.source(context)
+        if (available != state.speechAvailable || ready != state.speechReady || source != state.recognition) {
+            update(state.copy(speechAvailable = available, speechReady = ready, recognition = source))
+        }
     }
 
-    fun download() {
+    private fun speechAvailable(): Boolean = if (VoiceInput.source(context) == "local") models.ready("speech") else VoiceInput.available(context)
+
+    fun saveRecognition(source: String) {
+        check(!state.active) { "请先停止语音再修改识别方式。" }
+        require(source in setOf("local", "system")) { "未知语音识别方式。" }
+        check(preferences.edit().putString("recognition", source).commit()) { "语音设置保存失败，请重试。" }
+        update(state.copy(recognition = source, speechAvailable = speechAvailable(), error = null))
+    }
+
+    fun download(name: String = "local") {
+        require(name in setOf("local", "speech"))
         if (state.active) return
         val current = ++version
         val cancel = AtomicBoolean(false); stopped = cancel
-        update(state.copy(active = true, downloading = true, error = null, status = "正在准备本地模型"))
+        val label = if (name == "speech") "本地识别模型" else "本地模型"
+        update(state.copy(active = true, downloading = true, error = null, status = "正在准备$label"))
         worker.execute {
             try {
                 var last = 0L
-                models.install("local", mirror, cancel::get) { done, total ->
+                models.install(name, mirror, cancel::get) { done, total ->
                     val now = System.nanoTime()
                     if (now - last > 250_000_000 || done == total) {
                         last = now
-                        publish(current) { it.copy(status = "正在下载本地模型 ${done * 100 / total}%") }
+                        publish(current) { it.copy(status = "正在下载$label ${done * 100 / total}%") }
                     }
                 }
-                publish(current) { it.copy(status = "本地模型已就绪", localReady = models.ready("local"), smallReady = smallReady(it.smallModel)) }
+                publish(current) { it.copy(status = "${label}已就绪", speechReady = models.ready("speech"), speechAvailable = speechAvailable(),
+                    localReady = models.ready("local"), smallReady = smallReady(it.smallModel)) }
             } catch (error: Throwable) { failed(current, cancel, error) }
             finally { publish(current) { it.copy(active = false, downloading = false) } }
         }
@@ -193,7 +211,8 @@ class VoiceControl(private val context: Context, private val engine: Engine) {
             update(state.copy(error = "请先启动 dsh，再使用语音对话。")); return
         }
         if (mode != "send" && !state.speechAvailable) {
-            update(state.copy(error = "手机没有可用的系统语音识别服务，请在系统语音设置中安装或启用。")); return
+            update(state.copy(error = if (state.recognition == "local") "请先在语音设置中下载本地识别模型。"
+                else "手机没有可用的系统语音识别服务，请在系统语音设置中安装或启用。")); return
         }
         val text = state.draft.trim()
         if (mode == "send" && text.isEmpty()) return
@@ -311,7 +330,7 @@ class VoiceControl(private val context: Context, private val engine: Engine) {
             try {
                 while (!cancel.get() && (!finished.get() || cut.get())) {
                     val next = input.listen(null, { cancel.get() || finished.get() && !cut.get() },
-                        timeoutSeconds = 8, allowEmpty = true, onSpeech = interruptNow, echoText = { audio.speakingText },
+                        timeoutSeconds = 8, allowEmpty = true, playback = true, onSpeech = interruptNow, echoText = { audio.speakingText },
                         onLevel = { level -> if (cut.get()) publishLevel(current, level) }) { status ->
                         if (cut.get()) publish(current) { if (cancel.get()) it else it.inputStatus(status) }
                     }

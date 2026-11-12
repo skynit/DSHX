@@ -26,6 +26,7 @@ app/libs/*.aar
 app/.cxx/
 app/src/main/assets/voice/wake/
 app/src/main/assets/voice/clean/
+app/src/main/assets/voice/vad/
 
 # python
 __pycache__/

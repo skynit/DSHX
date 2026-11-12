@@ -418,13 +418,27 @@ private fun VoiceSettings(voice: VoiceControl, state: VoiceControl.State, action
             Note(if (state.active) "停止语音后可修改。后台监听会显示持续通知。" else "说出短语，进入收音状态后再说问题。")
         }
         Divider()
-        SettingsFold("系统语音识别", if (state.speechAvailable) "使用手机配置的识别服务" else "系统识别服务不可用") {
-            Note(if (state.speechAvailable) "由手机系统服务把声音转成文字，无需下载识别模型。是否联网取决于该服务。"
-                else "手机没有可用的语音识别服务，请先在系统设置中安装或启用。")
-            Action("打开系统语音设置", { action("speech-settings") }, enabled = !state.active, icon = Lucide.Settings2)
+        SettingsFold("语音识别", if (state.recognition == "local") {
+            if (state.speechReady) "本地识别 · 模型已就绪" else "本地识别 · 待下载模型"
+        } else if (state.speechAvailable) "系统识别 · 服务可用" else "系统识别 · 服务不可用") {
+            SettingsSelect("识别方式", state.recognition, listOf("local" to "本地识别", "system" to "系统识别"), !state.active) { source ->
+                runCatching { voice.saveRecognition(source) }
+                    .onSuccess { message = "识别方式已保存"; error = null }
+                    .onFailure { error = it.message ?: "保存失败，请重试。"; message = null }
+            }
+            if (state.recognition == "local") {
+                Note("停顿后自动识别，录音在本机处理。首次需下载约 229 MiB 模型，单次讲话限 30 秒。")
+                if (!state.speechReady) Action("下载识别模型", { action("download-speech") }, enabled = !state.active, primary = true)
+                Note("本地识别在说完插话后确认打断，也可点麦克风立即打断。")
+            } else {
+                Note(if (state.speechAvailable) "使用手机配置的识别服务，是否联网取决于该服务。"
+                    else "请在系统设置中安装或启用语音识别服务。")
+                Action("打开系统语音设置", { action("speech-settings") }, enabled = !state.active, icon = Lucide.Settings2)
+            }
+            SettingsFeedback(message, error)
         }
     }
-    if (!state.speechAvailable) Note("先在系统语音设置中启用识别服务，即可开启唤醒。")
+    if (!state.speechAvailable) Note(if (state.recognition == "local") "下载识别模型后即可开启语音。" else "先启用系统识别服务，即可开启语音。")
     Section("回答播报")
     VoiceOutputSettings(voice, state, action)
     Section("对话体验")
@@ -434,8 +448,9 @@ private fun VoiceSettings(voice: VoiceControl, state: VoiceControl.State, action
         }
     }
     Panel(padding = 0) {
-        SettingsFold("语音数据如何使用", "识别、聊天和播报由不同服务处理") {
-            Note("声音交给手机系统识别；识别后的对话文字交给聊天模型；回答文字交给播报服务。播报失败时保留文字回答。")
+        SettingsFold("语音数据如何使用", "录音、对话文字与播报分别处理") {
+            Note(if (state.recognition == "local") "录音在本机识别；对话文字交给聊天模型；回答文字交给播报服务。播报失败时保留文字回答。"
+                else "声音交给手机系统识别；对话文字交给聊天模型；回答文字交给播报服务。播报失败时保留文字回答。")
         }
     }
 }
