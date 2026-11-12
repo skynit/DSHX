@@ -8165,8 +8165,9 @@ test('Android micro apps register all tools through the official schema and pres
     effect: effect => cleanups.push(effect()), sessionController: {}, agents: {},
     storageDomain: { open: async () => ({ global: { get: () => ({ requests: [] }) }, close: async () => {} }) } });
   try {
-    assert.equal(registered.length, 8);
+    assert.equal(registered.length, 9);
     assert.equal(appToolNames.has('app_install'), true);
+    assert.equal(appToolNames.has('app_export'), true);
     assert.equal(appToolNames.has('app_shell'), false);
     assert.equal(sections.length, 1);
   } finally { cleanups.forEach(cleanup => cleanup?.()); }
@@ -8192,6 +8193,8 @@ test('Android micro apps recover the original creation session without resubmitt
 
 test('Android micro apps forward management with a live session and refuse unknown or cancelled calls', async () => {
   const { callApp } = await import(pathToFileURL(join(core, 'apps.mjs')));
+  const { toolAvailable, toolReason } = await import(pathToFileURL(join(core, 'policy.mjs')));
+  const { policyHost } = await import(pathToFileURL(join(core, 'host.mjs')));
   const calls = [];
   const host = { query: async (...args) => { calls.push(args); return { revision: 2 }; } };
   const exec = { agent: { session: { id: 'micro-session' } }, signal: new AbortController().signal };
@@ -8203,6 +8206,16 @@ test('Android micro apps forward management with a live session and refuse unkno
   const abort = new AbortController(); abort.abort();
   await assert.rejects(callApp(host, 'install', {}, { ...exec, signal: abort.signal }));
   assert.equal(calls.length, 1);
+  const previous = policyHost.cachedMode;
+  try {
+    policyHost.cachedMode = () => 'full';
+    assert.equal(toolAvailable('app_export', exec.agent), true);
+    assert.equal(toolReason({ ...exec, name: 'present', arguments: {} }), undefined);
+    policyHost.cachedMode = () => 'read-only';
+    assert.equal(toolAvailable('app_export', exec.agent), false);
+    policyHost.cachedMode = () => 'unavailable';
+    assert.equal(toolAvailable('present', exec.agent), false);
+  } finally { policyHost.cachedMode = previous; }
 });
 
 test('Android micro apps create one ordinary session per stable request and pass user text without shell execution', async () => {
@@ -8219,11 +8232,37 @@ test('Android micro apps create one ordinary session per stable request and pass
   assert.equal(created, 1); assert.equal(prompts.length, 1);
   assert.match(prompts[0][0].content[0].text, /skills\/create-dshx-app\/SKILL.md/);
   assert.equal(prompts[0][0].content[0].text.endsWith(request.prompt), true);
+  assert.match(prompts[0][0].content[0].text, /先创建微应用/);
+  assert.doesNotMatch(prompts[0][0].content[0].text, /不要生成独立 APK/);
   assert.equal(prompts[0][1].kind, 'user');
   await assert.rejects(create({ ...request, prompt: '不同需求' }));
   agent.session.header.parentSession = 'parent';
   await assert.rejects(create({ operationId: 'child-request', prompt: '创建', session: 'child' }));
   assert.equal(prompts.length, 1);
+});
+
+test('Android micro apps create APK requests through native export and keep delivery choices in the request identity', async () => {
+  const { appCreator, callApp } = await import(pathToFileURL(join(core, 'apps.mjs')));
+  const prompts = [], calls = [];
+  let created = 0;
+  const create = appCreator({ sessionController: {
+    create: async () => ({ sessionId: `apk-session-${++created}` }),
+    commands: { resolveAgent: async () => ({ status: 'idle', inbox: { hasPending: false }, session: { header: {} } }),
+      prompt: async value => prompts.push(value) },
+  } }, '/test/home/.dsh');
+  const request = { operationId: 'create-apk', prompt: '做一个记账本', output: 'apk' };
+  assert.deepEqual(await create(request), { session: 'apk-session-1' });
+  assert.deepEqual(await create({ ...request }), { session: 'apk-session-1' });
+  assert.match(prompts[0].content[0].text, /直接交付 APK.*app_export.*present/s);
+  assert.equal(prompts[0].content[0].text.endsWith(request.prompt), true);
+  await assert.rejects(create({ ...request, output: 'micro' }), /编号已用于其他需求/);
+  await assert.rejects(create({ ...request, operationId: 'bad-output', output: 'native' }), /无效/);
+  assert.equal(created, 1); assert.equal(prompts.length, 1);
+  const exec = { agent: { session: { id: 'apk-session-1' } }, signal: new AbortController().signal };
+  await callApp({ query: async (...args) => { calls.push(args); return { path: '/private/app.apk' }; } },
+    'export', { id: 'notes', version: '1.0.0' }, exec);
+  assert.deepEqual(calls[0][1], { action: 'export', args: { id: 'notes', version: '1.0.0' }, session: 'apk-session-1' });
+  await assert.rejects(callApp({ query: async () => { throw new Error('不应调用'); } }, 'export', {}, {}), /有效会话/);
 });
 
 test('Android micro apps SDK connects once and performs real asynchronous storage calls', async () => {

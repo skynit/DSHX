@@ -6007,6 +6007,22 @@ class CoreTest {
             listOf(org.bouncycastle.cert.jcajce.JcaX509CertificateConverter().getCertificate(certificate))).build()
     }
 
+    @Test fun microApkExportRejectsStaleVersionsAndInvalidRequestsWithoutEnablingTheApp() {
+        val context = RuntimeEnvironment.getApplication()
+        val store = AppStore(folder.root)
+        val check = store.call("check", JSONObject().put("package", notesPackage()))
+        store.call("install", JSONObject().put("checkId", check.getString("checkId")).put("hash", check.getString("hash"))
+            .put("operationId", "install-notes").put("expectedRevision", store.status().getLong("revision")))
+        val exporter = AppApk(context, store)
+        assertThrows(IllegalArgumentException::class.java) { exporter.export(JSONObject().put("id", "quick-notes")) }
+        assertThrows(IllegalArgumentException::class.java) { exporter.export(JSONObject().put("id", "quick-notes").put("version", "../1")) }
+        assertThrows(IllegalArgumentException::class.java) { exporter.export(JSONObject().put("id", "quick-notes").put("version", "1.0.0").put("path", "/tmp/other.apk")) }
+        val stale = assertThrows(IllegalArgumentException::class.java) { exporter.export(JSONObject().put("id", "quick-notes").put("version", "9.0.0")) }
+        assertTrue(stale.message.orEmpty().contains("版本已变化"))
+        assertFalse(store.status("quick-notes").getJSONArray("apps").getJSONObject(0).getBoolean("enabled"))
+        assertFalse(File(context.filesDir, "micro-apk/exports").exists())
+    }
+
     @Test fun microApkExportsSignedIndependentPackagesAndKeepsUpdatesCompatible() {
         val context = RuntimeEnvironment.getApplication()
         val template = folder.newFile("runtime.apk")

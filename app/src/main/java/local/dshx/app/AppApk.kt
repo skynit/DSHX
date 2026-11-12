@@ -24,11 +24,37 @@ import javax.security.auth.x500.X500Principal
 internal class AppApk(private val context: Context, private val store: AppStore) {
     data class Result(val file: File, val name: String)
 
-    fun build(id: String): Result = synchronized(lock) {
+    fun export(data: JSONObject): JSONObject {
+        AppPackage.keys(data, setOf("id", "version"), true)
+        val version = data.getString("version")
+        require(version.matches(Regex("[0-9]{1,8}\\.[0-9]{1,8}\\.[0-9]{1,8}"))) { "应用版本无效。" }
+        val result = build(data.getString("id"), version)
+        val directory = File(context.filesDir, "micro-apk/exports/${UUID.randomUUID()}")
+        try {
+            check(directory.mkdirs()) { "无法创建 APK 交付目录。" }
+            val file = File(directory, result.file.name)
+            result.file.copyTo(file)
+            val receipt = JSONObject().put("id", data.getString("id")).put("version", version)
+                .put("path", file.absolutePath).put("name", result.name).put("size", file.length())
+                .put("sha256", file.inputStream().use { input ->
+                    val hash = MessageDigest.getInstance("SHA-256")
+                    val bytes = ByteArray(8192)
+                    while (true) { val size = input.read(bytes); if (size < 0) break; hash.update(bytes, 0, size) }
+                    hash.digest().joinToString("") { "%02x".format(it.toInt() and 255) }
+                }).put("signatureVerified", true)
+            check(context.getSharedPreferences("micro-app-creation", Context.MODE_PRIVATE).edit()
+                .putString("apk", receipt.toString()).commit()) { "无法保存 APK 交付记录。" }
+            return receipt
+        } catch (error: Exception) { directory.deleteRecursively(); throw error }
+        finally { result.file.parentFile?.deleteRecursively() }
+    }
+
+    fun build(id: String, expectedVersion: String? = null): Result = synchronized(lock) {
         require(store.verify()) { store.error ?: "应用包需要重新检查。" }
         val row = store.status(id).getJSONArray("apps").optJSONObject(0) ?: error("应用已移除。")
         require(!row.has("error")) { "应用包校验失败，不能打包。" }
         val app = AppPackage.parse(row.getJSONObject("package"))
+        require(expectedVersion == null || expectedVersion == app.version) { "应用版本已变化，请重新查询后打包。" }
         val cache = File(context.cacheDir, "micro-apk").apply { check(isDirectory || mkdirs()) }
         cache.listFiles()?.filter { System.currentTimeMillis() - it.lastModified() > 86_400_000 }?.forEach { it.deleteRecursively() }
         val work = File(cache, UUID.randomUUID().toString()).apply { check(mkdir()) }

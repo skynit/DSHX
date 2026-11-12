@@ -214,6 +214,7 @@ class Engine(private val context: Context, private val worker: Executor = Execut
 
     fun apps(action: String, data: org.json.JSONObject = org.json.JSONObject()): org.json.JSONObject {
         val store = (context.applicationContext as DshApp).apps
+        if (action == "export") return AppApk(context.applicationContext, store).export(data)
         return store.call(action, data).also { result ->
             if (action == "status" && !data.has("operationId")) {
                 result.put("phone", phone.status())

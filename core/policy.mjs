@@ -10,7 +10,7 @@ import { engineToolNames, mainAgent } from './engine.mjs';
 
 // The workspace is the default directory, not a sandbox for Full sessions.
 const workspace = process.env.DSHX_WORKSPACE;
-const fileTools = new Set(['read', 'write', 'edit', 'glob', 'grep']);
+const fileTools = new Set(['read', 'write', 'edit', 'glob', 'grep', 'present']);
 const commandTools = new Set(['bash', 'bash_isolated', 'terminal_open', 'terminal_send', 'terminal_read', 'terminal_signal', 'terminal_close', 'terminal_list']);
 const managementTools = new Set(['plugin_manager', 'plugin_market']);
 const access = new AsyncLocalStorage();

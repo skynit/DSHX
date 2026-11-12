@@ -84,10 +84,19 @@ internal fun AppsSettings(running: Boolean, phoneRevision: Int, call: (String, J
     val query = rememberTextFieldState()
     var createId by rememberSaveable { mutableStateOf(UUID.randomUUID().toString()) }
     var createText by rememberSaveable { mutableStateOf("") }
-    var createSession by rememberSaveable { mutableStateOf<String?>(null) }
+    var createOutput by rememberSaveable { mutableStateOf("micro") }
+    var submittedOutput by rememberSaveable { mutableStateOf("micro") }
+    val creation = remember { context.getSharedPreferences("micro-app-creation", android.content.Context.MODE_PRIVATE) }
+    var recentSession by remember { mutableStateOf(creation.getString("session", null)) }
+    var recentPrompt by remember { mutableStateOf(creation.getString("prompt", "").orEmpty()) }
+    var latestApk by remember { mutableStateOf<JSONObject?>(null) }
 
     suspend fun refresh() {
         status = runInterruptible(Dispatchers.IO) { call("status", JSONObject()) }
+        latestApk = runInterruptible(Dispatchers.IO) {
+            creation.getString("apk", null)?.let { runCatching { JSONObject(it) }.getOrNull() }
+                ?.takeIf { File(it.optString("path")).isFile }
+        }
         if (selected != null) events = runInterruptible(Dispatchers.IO) { call("logs", JSONObject().put("id", selected)) }.getJSONArray("events")
     }
     fun work(action: suspend () -> Unit) {
@@ -100,10 +109,13 @@ internal fun AppsSettings(running: Boolean, phoneRevision: Int, call: (String, J
             finally { loading = false }
         }
     }
+    fun clearTemporaryApk(file: File?) {
+        if (file?.parentFile?.parentFile == File(context.cacheDir, "micro-apk")) file.parentFile?.deleteRecursively()
+    }
     val saveApk = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/vnd.android.package-archive")) { uri ->
         val file = pendingApk?.let(::File); pendingApk = null
         if (uri == null) {
-            file?.parentFile?.deleteRecursively()
+            clearTemporaryApk(file)
             message = "已取消保存 APK。"
         } else if (file != null) work {
             try {
@@ -116,16 +128,22 @@ internal fun AppsSettings(running: Boolean, phoneRevision: Int, call: (String, J
             } catch (error: Exception) {
                 runInterruptible(Dispatchers.IO) { runCatching { android.provider.DocumentsContract.deleteDocument(context.contentResolver, uri) } }
                 throw error
-            } finally { file.parentFile?.deleteRecursively() }
+            } finally { clearTemporaryApk(file) }
         }
     }
     fun exportApk(id: String) = work {
         packing = true
         try {
-            val result = runInterruptible(Dispatchers.IO) { AppApk(context.applicationContext, (context.applicationContext as DshApp).apps).build(id) }
-            pendingApk = result.file.absolutePath
-            try { saveApk.launch(result.name) }
-            catch (error: Exception) { result.file.parentFile?.deleteRecursively(); pendingApk = null; throw error }
+            val apps = status?.getJSONArray("apps") ?: error("请先刷新应用列表。")
+            val app = (0 until apps.length()).map { apps.getJSONObject(it) }.firstOrNull { it.getString("id") == id }
+                ?: error("应用已移除，请刷新列表。")
+            val result = runInterruptible(Dispatchers.IO) {
+                call("export", JSONObject().put("id", id).put("version", app.getString("version")))
+            }
+            latestApk = result
+            pendingApk = result.getString("path")
+            try { saveApk.launch(result.getString("name")) }
+            catch (error: Exception) { pendingApk = null; throw error }
         } finally { packing = false }
     }
     fun mutate(action: String, data: JSONObject) = work {
@@ -179,6 +197,27 @@ internal fun AppsSettings(running: Boolean, phoneRevision: Int, call: (String, J
         LibraryIcon(Lucide.RotateCcw, if (loading) "正在刷新微应用" else "刷新微应用", { work { refresh() } }, enabled = !loading)
     }
     if (app == null) {
+        Panel { Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text("把想法做成应用", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+            Note("描述你要的功能，创建后可在这里使用，也能打包为独立 APK。")
+            Action("创建应用", { adding = true },
+                modifier = Modifier.fillMaxWidth(), enabled = !loading, primary = true, icon = Lucide.Plus)
+            recentSession?.let { session ->
+                Divider()
+                Text(recentPrompt, fontSize = 13.sp, lineHeight = 20.sp, maxLines = 2,
+                    overflow = TextOverflow.Ellipsis, color = colors.onSurfaceVariantSummary)
+                Action("继续最近创建", { openSession(session) }, enabled = running && !loading)
+            }
+            latestApk?.let { apk ->
+                Divider()
+                Note("最近生成：${apk.optString("name")}")
+                Action("保存已生成 APK", { work {
+                    pendingApk = apk.getString("path")
+                    try { saveApk.launch(apk.getString("name")) }
+                    catch (error: Exception) { pendingApk = null; throw error }
+                } }, enabled = !loading && pendingApk == null, modifier = Modifier.fillMaxWidth(), icon = Lucide.Save)
+            }
+        } }
         Row(Modifier.fillMaxWidth().padding(top = 20.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
             Text("我的微应用", fontSize = 12.sp, lineHeight = 18.sp, fontWeight = FontWeight.Medium,
                 color = colors.onSurfaceVariantSummary, modifier = Modifier.semantics { heading() })
@@ -210,7 +249,7 @@ internal fun AppsSettings(running: Boolean, phoneRevision: Int, call: (String, J
             }
         }
         if (status == null) Note(if (failure == null) "正在读取微应用…" else "请点击刷新重试。")
-        else if (rows.isEmpty()) Note("点击添加应用，让 dsh 创建功能或安装示例。")
+        else if (rows.isEmpty()) Note("还没有应用。创建一个待办清单、记账本或你需要的小工具。")
         else Text("点击应用查看配置与运行记录", fontSize = 12.sp, lineHeight = 18.sp, color = colors.onSurfaceVariantSummary,
             modifier = Modifier.fillMaxWidth().padding(top = 16.dp), textAlign = TextAlign.Center)
     } else {
@@ -284,7 +323,7 @@ internal fun AppsSettings(running: Boolean, phoneRevision: Int, call: (String, J
             }
         }
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Action("让 dsh 修改", { prompt.setTextAndPlaceCursorAtEnd("修改微应用 ${app.getString("id")}："); createSession = null; createId = UUID.randomUUID().toString(); adding = true }, enabled = running && !loading, icon = Lucide.Pencil)
+            Action("让 dsh 修改", { prompt.setTextAndPlaceCursorAtEnd("修改微应用 ${app.getString("id")}："); createId = UUID.randomUUID().toString(); adding = true }, enabled = running && !loading, icon = Lucide.Pencil)
             Action("刷新记录", { work { refresh() } }, enabled = !loading, icon = Lucide.RotateCcw)
             Action("删除", { deleting = true }, enabled = !loading, danger = true, icon = Lucide.Trash2)
         }
@@ -306,22 +345,38 @@ internal fun AppsSettings(running: Boolean, phoneRevision: Int, call: (String, J
         export = if (!loading && pendingApk == null) ({ exportApk(id) }) else null,
         exportMessage = failure ?: message, exportFailed = failure != null) { opening = null } }
 
-    if (adding) MemoryDialog("添加微应用", { if (!loading) adding = false }) {
-        AssistantField("功能需求", prompt, 4000, loading, 5, "例如：为选定应用添加开屏广告跳过功能")
+    if (adding) MemoryDialog("创建应用", { if (!loading) adding = false }) {
+        Note("说清应用用途和主要操作，制作过程中可以继续补充需求。")
+        AssistantField("你想创建什么应用", prompt, 4000, loading, 5, "例如：做一个待办清单，支持添加、完成和删除，重新打开后保留记录。")
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            listOf(
+                "待办清单" to "创建一个待办清单，支持添加、完成、删除和筛选任务，重新打开后保留记录。",
+                "记账本" to "创建一个记账本，支持记录收入和支出、选择分类、查看本月汇总，重新打开后保留记录。",
+                "文本工具" to "创建一个文本整理工具，支持统计字数、去除空行和重复行，显示处理前后的结果。",
+            ).forEach { (label, text) -> Action(label, { prompt.setTextAndPlaceCursorAtEnd(text) }, enabled = !loading) }
+        }
+        MemoryChoice("交付方式", listOf("micro" to "先创建微应用", "apk" to "直接交付 APK"), createOutput, !loading) { createOutput = it }
+        Note(if (createOutput == "apk") "完成后生成 APK，返回此页即可保存并独立安装。" else "在 DSHX 中查看并使用，满意后随时打包 APK。")
         if (!running) Note("启动 dsh 后可按需求创建；示例可以直接添加。")
         failure?.let { AppNotice(it, error = true) }
-        Action(if (loading) "正在处理…" else "让 dsh 创建", {
+        Action(if (loading) "正在创建会话…" else if (createOutput == "apk") "开始创建 APK" else "开始创建应用", {
             work {
                 val text = prompt.text.toString().trim()
-                require(text.isNotEmpty()) { "请填写功能需求。" }
-                if (text != createText) { createId = UUID.randomUUID().toString(); createSession = null; createText = text }
-                val result = runInterruptible(Dispatchers.IO) {
-                    create(JSONObject().put("operationId", createId).put("prompt", text).apply { createSession?.let { put("session", it) } })
+                require(text.isNotEmpty() && text.length <= 4000) { "请填写 1 至 4000 字的功能需求。" }
+                if (text != createText || createOutput != submittedOutput) {
+                    createId = UUID.randomUUID().toString(); createText = text; submittedOutput = createOutput
                 }
-                createSession = result.getString("session"); adding = false
+                val result = runInterruptible(Dispatchers.IO) {
+                    create(JSONObject().put("operationId", createId).put("prompt", text).put("output", createOutput))
+                }
+                recentSession = result.getString("session"); recentPrompt = text
+                creation.edit().putString("session", recentSession).putString("prompt", text).apply()
+                createId = UUID.randomUUID().toString()
+                adding = false
                 openSession(result.getString("session"))
             }
-        }, enabled = running && !loading, primary = true, icon = Lucide.Plus)
+        }, enabled = running && !loading && prompt.text.isNotBlank() && prompt.text.toString().trim().length <= 4000,
+            modifier = Modifier.fillMaxWidth(), primary = true, icon = if (createOutput == "apk") Lucide.Package else Lucide.Plus)
         Divider()
         Section("从示例开始")
         Action("添加便签示例", {
