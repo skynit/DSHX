@@ -64,7 +64,7 @@ export function appCreator(ctx, home = process.env.DSH_HOME, history) {
         ? '用户选择直接交付 APK：安装并核实版本后，调用 app_export({id,version}) 在手机内打包，再用 present 交付返回的 path。必须取得真实 APK 文件，不能仅提供源码或让用户自行寻找打包入口；失败时说明当前步骤与恢复方式，不伪造成功。'
         : '用户选择先创建微应用：安装并核实版本后交付应用入口；如用户需求还要求 APK，继续调用 app_export({id,version}) 并用 present 交付文件。已安装的微应用也可在详情中打包。';
       await ctx.sessionController.commands.prompt({ sessionId: session, requestId: data.operationId, mode: 'queue', content: [{ type: 'text',
-        text: `请先读取技能 ${join(home, 'skills/create-dshx-app/SKILL.md')} 及所需参考文件，再通过 app_status 查询真实能力。根据下面需求创建或修改微应用，生成 app.json，验证核心逻辑并检查后安装为停用状态。${delivery} 安装后由用户在设置查看能力并启用；仅屏幕功能需要选择适用应用，不要自行开启持续手机操作。先简短说明要做的应用与主要操作，制作中说明真实进展，缺少关键外部服务配置时明确提示。用户需求：\n\n${data.prompt.trim()}`,
+        text: `使用 skill({name:"create-dshx-app"}) 加载应用制作流程，在本会话完成需求、制作、检查及交付；技能文件位于 ${join(home, 'skills/create-dshx-app/SKILL.md')}，所需参考文件按技能指引读取。${delivery} 用户后续在本对话补充或修改需求时沿用本技能。用户需求：\n\n${data.prompt.trim()}`,
       }] }, { kind: 'user', rpcId: data.operationId, clientTimeZone: 'Asia/Shanghai' });
       await save({ stage: 'accepted', session });
       return { session };
@@ -103,6 +103,6 @@ export async function apply(ctx) {
   policyHost.createApp = create;
   ctx.effect(() => async () => { if (policyHost.createApp === create) policyHost.createApp = undefined; await queue; await domain.close(); });
   ctx.systemPrompt.section({ name: 'android:apps', order: 106,
-    text: 'DSHX 支持 web-v1 通用微应用，包含HTML页面、JavaScript逻辑、独立存储及可选后台入口。广告跳过只是一个示例，不把所有需求变成点击规则。创建或修改前读取 create-dshx-app 技能并用 app_status 核对真实能力，app_check 检查 app.json，app_install 安装为停用；用户在设置选择应用并启用。用户要求 APK 时，在核实安装版本后调用 app_export 并用 present 交付返回的持久文件，不能只交源码或声称已安装 APK。修改工具须传稳定 operationId 和当前 expectedRevision；断连或超时先按原编号查询，不能盲目重做。微应用本机监听与聊天会话独立，页面、存储和后台运行不依赖dsh模型持续在线；屏幕能力须声明并受用户选择的应用范围限制，持续操作须有用户明确授权。设置或文件声明不能代替系统授权。不能直接改 micro-apps 安装目录或伪造手机会话。日志 completed 只代表动作回执，不能将其当作业务成功确认，未知结果不重放。',
+    text: '用户在当前对话要求创建、修改应用或制作、打包 APK 时，先用 skill({name:"create-dshx-app"}) 加载完整流程；本轮已有该技能正文时直接沿用。在当前会话制作并交付，用户无需先打开创建页面或另建会话。DSHX 通过 app_* 工具管理应用，通过 app_export 和 present 交付 APK；具体步骤、权限、重试和验证要求以技能及其运行契约为准。',
   });
 }

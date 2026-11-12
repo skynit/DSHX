@@ -2,7 +2,7 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { mkdtemp, open, writeFile, readFile, readdir, rm, link, stat, mkdir, symlink, rename, chmod, realpath } from 'node:fs/promises';
+import { mkdtemp, open, writeFile, readFile, readdir, rm, link, stat, mkdir, symlink, rename, chmod, realpath, cp } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
@@ -8263,6 +8263,55 @@ test('Android micro apps create APK requests through native export and keep deli
     'export', { id: 'notes', version: '1.0.0' }, exec);
   assert.deepEqual(calls[0][1], { action: 'export', args: { id: 'notes', version: '1.0.0' }, session: 'apk-session-1' });
   await assert.rejects(callApp({ query: async () => { throw new Error('不应调用'); } }, 'export', {}, {}), /有效会话/);
+});
+
+test('Android micro apps load the bundled creation skill through the official tool in an ordinary chat', async t => {
+  const { Context } = await load('@deepseek-ai/cordis');
+  const { createScope } = await load('@deepseek-ai/dsh-scope');
+  const { createUserMessage } = await load('@deepseek-ai/dsh-llm');
+  const home = await mkdtemp(join(directory, 'creation-skill-'));
+  const source = join(process.env.DSHX_APP_ASSETS, 'skills/create-dshx-app');
+  const installed = join(home, 'skills/create-dshx-app');
+  await cp(source, installed, { recursive: true });
+  const ctx = new Context();
+  t.after(() => ctx.fiber.dispose());
+  ctx.provide('workingDirectory', { ensure: async () => workspace });
+  for (const name of ['system-prompt', 'tools', 'agent', 'skill']) {
+    const plugin = await load('@deepseek-ai/dsh-' + name);
+    await ctx.plugin(plugin.default ?? plugin);
+  }
+  await ctx.plugin(await load('@deepseek-ai/dsh-skill-filesystem'), { dshHome: home, agentsHome: join(home, 'agents'), watch: false });
+  await ctx.plugin(await load('@deepseek-ai/dsh-tool-skill'));
+  const scope = createScope(ctx, {});
+  const agent = { id: 'ordinary-chat', ctx: scope.ctx,
+    session: { id: 'ordinary-chat', header: {}, seq: 0, surface: { nodes: [] } } };
+  const detach = ctx.agents.enter(agent);
+  try {
+    const summary = (await ctx.skills.list({ cwd: workspace, scope: agent })).find(skill => skill.name === 'create-dshx-app');
+    assert.ok(summary, 'the installed skill must be discoverable without the creation page');
+    assert.deepEqual(summary.invocation, { modelInvocable: true, userInvocable: true });
+    const signal = new AbortController().signal;
+    const result = await ctx.tools.execute({ name: 'skill', arguments: { name: summary.name }, agent, signal, callId: 'load-creation' });
+    assert.equal(result.isError, false, JSON.stringify(result));
+    const body = (await readFile(join(source, 'SKILL.md'), 'utf8')).replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, '').trim();
+    assert.equal(result.value.content, body);
+    assert.deepEqual(result.value.resourceBase, { kind: 'directory', path: installed });
+    for (const resource of ['references/runtime.md', 'assets/quick-notes.json']) {
+      assert.equal(await readFile(join(result.value.resourceBase.path, resource), 'utf8'), await readFile(join(source, resource), 'utf8'));
+    }
+    const step = async text => {
+      const messages = [createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } })];
+      return ctx.waterfall('agent/pre-step', { agent, messages, signal }, async () => ({ kind: 'enter', messages }));
+    };
+    const natural = await step('帮我做一个记账本，直接给我 APK');
+    const catalog = natural.messages.find(message => message.source.kind === 'skill-catalog');
+    assert.ok(catalog.source.entries.some(entry => entry.name === summary.name && entry.description === summary.description));
+    const explicit = await step('/create-dshx-app 帮我做一个记账本，直接给 APK');
+    const injections = explicit.messages.filter(message => message.source.kind === 'skill-invocation');
+    assert.equal(injections.length, 1);
+    assert.equal(injections[0].source.name, summary.name);
+    assert.ok(injections[0].content.some(block => block.type === 'text' && block.text.includes(body)));
+  } finally { detach(); scope.dispose(); }
 });
 
 test('Android micro apps SDK connects once and performs real asynchronous storage calls', async () => {

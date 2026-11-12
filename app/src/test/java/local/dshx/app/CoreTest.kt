@@ -6314,8 +6314,12 @@ class CoreTest {
         val store = LibraryStore(folder.root)
         store.prepareSkills(assets)
         val root = File(folder.root, "home/.dsh/skills/create-dshx-app")
+        val entry = store.skills().single { it.name == "create-dshx-app" }
+        assertEquals("user:create-dshx-app/SKILL.md", entry.id)
+        assertEquals(assets.open("skills/create-dshx-app/SKILL.md").bufferedReader().use { it.readText() }, store.readSkill(entry).text)
         assertTrue(File(root, "references/runtime.md").isFile)
         assertTrue(File(root, "references/ad-skip.md").isFile)
+        assertTrue(File(root, "assets/quick-notes.json").isFile)
         assertTrue(File(root, "assets/skip-startup-ads.json").isFile)
         val skill = File(root, "SKILL.md")
         skill.appendText("\n用户自己的规则")
