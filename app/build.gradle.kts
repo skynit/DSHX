@@ -18,8 +18,8 @@ android {
         applicationId = "local.dshx.app"
         minSdk = 26
         targetSdk = 28
-        versionCode = providers.gradleProperty("dshxVersionCode").orElse("5").get().toInt()
-        versionName = providers.gradleProperty("dshxVersionName").orElse("0.1.3").get()
+        versionCode = providers.gradleProperty("dshxVersionCode").orElse("6").get().toInt()
+        versionName = providers.gradleProperty("dshxVersionName").orElse("0.2.0").get()
         resValue("string", "update_url", updateUrl.get())
         val info = file("src/main/assets/core-info.json")
         val abi = providers.gradleProperty("dshxAbi").orNull
