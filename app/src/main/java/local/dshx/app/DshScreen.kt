@@ -1008,7 +1008,8 @@ internal fun MemoryChoice(title: String, options: List<Pair<String, String>>, se
 }
 
 @Composable
-internal fun MemoryDialog(title: String, close: () -> Unit, scroll: Boolean = true, content: @Composable ColumnScope.() -> Unit) {
+internal fun MemoryDialog(title: String, close: () -> Unit, scroll: Boolean = true,
+    footer: (@Composable ColumnScope.() -> Unit)? = null, content: @Composable ColumnScope.() -> Unit) {
     androidx.compose.ui.window.Dialog(onDismissRequest = close,
         properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false)) {
         val window = (LocalView.current.parent as? androidx.compose.ui.window.DialogWindowProvider)?.window
@@ -1027,6 +1028,7 @@ internal fun MemoryDialog(title: String, close: () -> Unit, scroll: Boolean = tr
                 if (scroll) Column(Modifier.weight(1f, fill = false).verticalScroll(remember { ScrollState(0) }),
                     verticalArrangement = Arrangement.spacedBy(8.dp), content = content)
                 else content()
+                footer?.invoke(this)
             }
         }
     }

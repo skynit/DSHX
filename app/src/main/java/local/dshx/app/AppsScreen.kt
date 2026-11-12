@@ -7,6 +7,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.input.rememberTextFieldState
 import androidx.compose.foundation.text.input.setTextAndPlaceCursorAtEnd
@@ -20,12 +22,14 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -39,8 +43,11 @@ import org.json.JSONObject
 import java.util.UUID
 import java.io.File
 import com.composables.icons.lucide.ArrowLeft
+import com.composables.icons.lucide.ArrowRight
 import com.composables.icons.lucide.Check
+import com.composables.icons.lucide.ChevronDown
 import com.composables.icons.lucide.ChevronLeft
+import com.composables.icons.lucide.ChevronUp
 import com.composables.icons.lucide.CircleAlert
 import com.composables.icons.lucide.Clock
 import com.composables.icons.lucide.LayoutGrid
@@ -66,6 +73,7 @@ internal fun AppsSettings(running: Boolean, phoneRevision: Int, call: (String, J
     var selected by rememberSaveable { mutableStateOf<String?>(null) }
     var opening by rememberSaveable { mutableStateOf<String?>(null) }
     var adding by rememberSaveable { mutableStateOf(false) }
+    var examples by rememberSaveable { mutableStateOf(false) }
     var deleting by remember { mutableStateOf(false) }
     var picker by rememberSaveable { mutableStateOf<String?>(null) }
     var available by remember { mutableStateOf<List<Pair<String, String>>>(emptyList()) }
@@ -124,7 +132,7 @@ internal fun AppsSettings(running: Boolean, phoneRevision: Int, call: (String, J
                     file.inputStream().use { input -> (context.contentResolver.openOutputStream(uri, "wt")
                         ?: error("无法写入所选位置。")).use { input.copyTo(it) } }
                 }
-                message = "APK 已保存，可在其他安卓手机上独立安装。"
+                message = "APK 已保存。"
             } catch (error: Exception) {
                 runInterruptible(Dispatchers.IO) { runCatching { android.provider.DocumentsContract.deleteDocument(context.contentResolver, uri) } }
                 throw error
@@ -198,24 +206,30 @@ internal fun AppsSettings(running: Boolean, phoneRevision: Int, call: (String, J
     }
     if (app == null) {
         Panel { Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("把想法做成应用", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
-            Note("描述你要的功能，创建后可在这里使用，也能打包为独立 APK。")
             Action("创建应用", { adding = true },
                 modifier = Modifier.fillMaxWidth(), enabled = !loading, primary = true, icon = Lucide.Plus)
             recentSession?.let { session ->
                 Divider()
-                Text(recentPrompt, fontSize = 13.sp, lineHeight = 20.sp, maxLines = 2,
-                    overflow = TextOverflow.Ellipsis, color = colors.onSurfaceVariantSummary)
-                Action("继续最近创建", { openSession(session) }, enabled = running && !loading)
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Note("最近创建")
+                        Text(recentPrompt, fontSize = 13.sp, lineHeight = 20.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                    LibraryIcon(Lucide.ArrowRight, "继续创建", { openSession(session) }, enabled = running && !loading)
+                }
             }
             latestApk?.let { apk ->
                 Divider()
-                Note("最近生成：${apk.optString("name")}")
-                Action("保存已生成 APK", { work {
-                    pendingApk = apk.getString("path")
-                    try { saveApk.launch(apk.getString("name")) }
-                    catch (error: Exception) { pendingApk = null; throw error }
-                } }, enabled = !loading && pendingApk == null, modifier = Modifier.fillMaxWidth(), icon = Lucide.Save)
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Icon(Lucide.Package, contentDescription = null, modifier = Modifier.size(20.dp), tint = colors.onSurfaceVariantSummary)
+                    Text(apk.optString("name"), fontSize = 13.sp, lineHeight = 20.sp,
+                        modifier = Modifier.weight(1f), maxLines = 2, overflow = TextOverflow.Ellipsis)
+                    LibraryIcon(Lucide.Save, "保存 APK", { work {
+                        pendingApk = apk.getString("path")
+                        try { saveApk.launch(apk.getString("name")) }
+                        catch (error: Exception) { pendingApk = null; throw error }
+                    } }, enabled = !loading && pendingApk == null)
+                }
             }
         } }
         Row(Modifier.fillMaxWidth().padding(top = 20.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -249,9 +263,7 @@ internal fun AppsSettings(running: Boolean, phoneRevision: Int, call: (String, J
             }
         }
         if (status == null) Note(if (failure == null) "正在读取微应用…" else "请点击刷新重试。")
-        else if (rows.isEmpty()) Note("还没有应用。创建一个待办清单、记账本或你需要的小工具。")
-        else Text("点击应用查看配置与运行记录", fontSize = 12.sp, lineHeight = 18.sp, color = colors.onSurfaceVariantSummary,
-            modifier = Modifier.fillMaxWidth().padding(top = 16.dp), textAlign = TextAlign.Center)
+        else if (rows.isEmpty()) Note("还没有应用")
     } else {
         Action("返回列表", { selected = null; picker = null }, enabled = !loading, icon = Lucide.ArrowLeft)
         Panel(padding = 0) {
@@ -345,21 +357,8 @@ internal fun AppsSettings(running: Boolean, phoneRevision: Int, call: (String, J
         export = if (!loading && pendingApk == null) ({ exportApk(id) }) else null,
         exportMessage = failure ?: message, exportFailed = failure != null) { opening = null } }
 
-    if (adding) MemoryDialog("创建应用", { if (!loading) adding = false }) {
-        Note("说清应用用途和主要操作，制作过程中可以继续补充需求。")
-        AssistantField("你想创建什么应用", prompt, 4000, loading, 5, "例如：做一个待办清单，支持添加、完成和删除，重新打开后保留记录。")
-        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            listOf(
-                "待办清单" to "创建一个待办清单，支持添加、完成、删除和筛选任务，重新打开后保留记录。",
-                "记账本" to "创建一个记账本，支持记录收入和支出、选择分类、查看本月汇总，重新打开后保留记录。",
-                "文本工具" to "创建一个文本整理工具，支持统计字数、去除空行和重复行，显示处理前后的结果。",
-            ).forEach { (label, text) -> Action(label, { prompt.setTextAndPlaceCursorAtEnd(text) }, enabled = !loading) }
-        }
-        MemoryChoice("交付方式", listOf("micro" to "先创建微应用", "apk" to "直接交付 APK"), createOutput, !loading) { createOutput = it }
-        Note(if (createOutput == "apk") "完成后生成 APK，返回此页即可保存并独立安装。" else "在 DSHX 中查看并使用，满意后随时打包 APK。")
-        if (!running) Note("启动 dsh 后可按需求创建；示例可以直接添加。")
-        failure?.let { AppNotice(it, error = true) }
-        Action(if (loading) "正在创建会话…" else if (createOutput == "apk") "开始创建 APK" else "开始创建应用", {
+    if (adding) MemoryDialog("创建应用", { if (!loading) adding = false }, footer = {
+        Action(if (loading) "正在创建…" else if (createOutput == "apk") "创建 APK" else "创建微应用", {
             work {
                 val text = prompt.text.toString().trim()
                 require(text.isNotEmpty() && text.length <= 4000) { "请填写 1 至 4000 字的功能需求。" }
@@ -377,33 +376,53 @@ internal fun AppsSettings(running: Boolean, phoneRevision: Int, call: (String, J
             }
         }, enabled = running && !loading && prompt.text.isNotBlank() && prompt.text.toString().trim().length <= 4000,
             modifier = Modifier.fillMaxWidth(), primary = true, icon = if (createOutput == "apk") Lucide.Package else Lucide.Plus)
-        Divider()
-        Section("从示例开始")
-        Action("添加便签示例", {
-            work {
-                runInterruptible(Dispatchers.IO) {
-                    val value = context.assets.open("skills/create-dshx-app/assets/quick-notes.json").bufferedReader().use { JSONObject(it.readText()) }
-                    val check = call("check", JSONObject().put("package", value))
-                    call("install", JSONObject().put("checkId", check.getString("checkId")).put("hash", check.getString("hash"))
-                        .put("operationId", UUID.randomUUID().toString()).put("expectedRevision", call("status", JSONObject()).getLong("revision")))
+    }) {
+        AssistantField("应用需求", prompt, 4000, loading, 5, "例如：记账本，记录收支、查看月度汇总", minLines = 3)
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            listOf(
+                "待办清单" to "创建一个待办清单，支持添加、完成、删除和筛选任务，重新打开后保留记录。",
+                "记账本" to "创建一个记账本，支持记录收入和支出、选择分类、查看本月汇总，重新打开后保留记录。",
+                "文本工具" to "创建一个文本整理工具，支持统计字数、去除空行和重复行，显示处理前后的结果。",
+            ).forEach { (label, text) -> Action(label, { prompt.setTextAndPlaceCursorAtEnd(text) }, enabled = !loading) }
+        }
+        Text("生成格式", fontSize = 13.sp, fontWeight = FontWeight.Medium, modifier = Modifier.padding(top = 8.dp))
+        Row(Modifier.fillMaxWidth().selectableGroup(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            AppOutput("微应用", "DSHX 内使用", Lucide.LayoutGrid, createOutput == "micro", !loading, Modifier.weight(1f)) { createOutput = "micro" }
+            AppOutput("APK", "独立安装", Lucide.Package, createOutput == "apk", !loading, Modifier.weight(1f)) { createOutput = "apk" }
+        }
+        if (!running) Note("启动 dsh 后即可创建")
+        failure?.let { AppNotice(it, error = true) }
+
+        Action("试用示例", { examples = !examples }, enabled = !loading,
+            modifier = Modifier.fillMaxWidth().semantics { stateDescription = if (examples) "已展开" else "已收起" },
+            icon = if (examples) Lucide.ChevronUp else Lucide.ChevronDown)
+        if (examples) Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Action("便签", {
+                work {
+                    runInterruptible(Dispatchers.IO) {
+                        val value = context.assets.open("skills/create-dshx-app/assets/quick-notes.json").bufferedReader().use { JSONObject(it.readText()) }
+                        val check = call("check", JSONObject().put("package", value))
+                        call("install", JSONObject().put("checkId", check.getString("checkId")).put("hash", check.getString("hash"))
+                            .put("operationId", UUID.randomUUID().toString()).put("expectedRevision", call("status", JSONObject()).getLong("revision")))
+                    }
+                    adding = false; refresh(); selected = "quick-notes"
+                    message = "便签已添加，启用后可打开使用。"
                 }
-                adding = false; refresh(); selected = "quick-notes"
-                message = "便签已添加，启用后可打开使用。"
-            }
-        }, enabled = !loading && rows.none { it.optString("id") == "quick-notes" }, modifier = Modifier.fillMaxWidth())
-        Action("添加广告跳过示例", {
-            work {
-                val result = runInterruptible(Dispatchers.IO) {
-                    val value = context.assets.open("skills/create-dshx-app/assets/skip-startup-ads.json").bufferedReader().use { JSONObject(it.readText()) }
-                    val check = call("check", JSONObject().put("package", value))
-                    call("install", JSONObject().put("checkId", check.getString("checkId")).put("hash", check.getString("hash"))
-                        .put("operationId", UUID.randomUUID().toString()).put("expectedRevision", call("status", JSONObject()).getLong("revision")))
+            }, enabled = !loading && rows.none { it.optString("id") == "quick-notes" }, modifier = Modifier.weight(1f))
+            Action("广告跳过", {
+                work {
+                    val result = runInterruptible(Dispatchers.IO) {
+                        val value = context.assets.open("skills/create-dshx-app/assets/skip-startup-ads.json").bufferedReader().use { JSONObject(it.readText()) }
+                        val check = call("check", JSONObject().put("package", value))
+                        call("install", JSONObject().put("checkId", check.getString("checkId")).put("hash", check.getString("hash"))
+                            .put("operationId", UUID.randomUUID().toString()).put("expectedRevision", call("status", JSONObject()).getLong("revision")))
+                    }
+                    require(result.optBoolean("known"))
+                    adding = false; refresh(); selected = "skip-startup-ads"
+                    message = "示例已添加，请查看能力并启用。"
                 }
-                require(result.optBoolean("known"))
-                adding = false; refresh(); selected = "skip-startup-ads"
-                message = "示例已添加，请查看能力并启用。"
-            }
-        }, enabled = !loading && rows.none { it.optString("id") == "skip-startup-ads" }, modifier = Modifier.fillMaxWidth())
+            }, enabled = !loading && rows.none { it.optString("id") == "skip-startup-ads" }, modifier = Modifier.weight(1f))
+        }
     }
     if (picker != null) MemoryDialog("选择适用应用", { picker = null }) {
         AssistantField("搜索应用", query, 200, false, 1)
@@ -421,6 +440,29 @@ internal fun AppsSettings(running: Boolean, phoneRevision: Int, call: (String, J
     if (deleting && app != null) MemoryDialog("删除微应用", { if (!loading) deleting = false }) {
         Note("停止并移除该功能，保留已安装版本和运行记录。")
         Action("删除", { mutate("remove", JSONObject().put("id", selected).put("deleteData", false)) }, enabled = !loading, danger = true)
+    }
+}
+
+@Composable
+private fun AppOutput(title: String, subtitle: String, icon: ImageVector, selected: Boolean, enabled: Boolean,
+    modifier: Modifier = Modifier, select: () -> Unit) {
+    val colors = MiuixTheme.colorScheme
+    val shape = RoundedCornerShape(8.dp)
+    var focused by remember { mutableStateOf(false) }
+    Column(modifier.clip(shape).background(if (selected) colors.secondary else colors.surfaceContainerHigh)
+        .onFocusChanged { focused = it.isFocused }
+        .border(if (focused && enabled) 2.dp else 1.dp, if (focused && enabled) colors.primary else colors.outline, shape)
+        .selectable(selected = selected, enabled = enabled, role = Role.RadioButton, onClick = select)
+        .heightIn(min = 84.dp).padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            val tint = if (enabled) colors.onSurface else colors.onSurfaceVariantSummary
+            Icon(icon, contentDescription = null, modifier = Modifier.size(18.dp), tint = tint)
+            Text(title, fontSize = 14.sp, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f), color = tint)
+            Icon(Lucide.Check, contentDescription = null, modifier = Modifier.size(16.dp),
+                tint = if (selected) tint else Color.Transparent)
+        }
+        Note(subtitle)
     }
 }
 
