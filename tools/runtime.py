@@ -6,7 +6,7 @@ import shutil
 PACKAGES = (
     "openssh", "curl", "jq", "sqlite", "python", "python-pip",
     "python-ensurepip-wheels", "rsync", "coreutils", "findutils",
-    "diffutils", "patch", "tar", "gzip", "zip", "unzip", "termux-exec",
+    "diffutils", "patch", "tar", "gzip", "zip", "unzip", "termux-exec", "aapt2",
 )
 
 
@@ -34,7 +34,7 @@ def install(usr: Path, bundle: Path):
         if source.name != "coreutils" and source.resolve() == (usr / "bin/coreutils").resolve():
             script(source.name, f'exec "$bin/coreutils" --coreutils-prog={source.name} "$@"')
     for name in ("curl", "jq", "sqlite3", "find", "xargs", "diff", "diff3", "cmp", "sdiff",
-                 "patch", "tar", "gzip", "zip", "unzip", "zipinfo"):
+                 "patch", "tar", "gzip", "zip", "unzip", "zipinfo", "aapt2", "openssl"):
         binary(name)
     script("gunzip", 'exec "$bin/gzip" -d "$@"')
     script("zcat", 'exec "$bin/gzip" -cd "$@"')

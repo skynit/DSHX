@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import zipfile
 import runtime
+import android
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "core"
@@ -150,6 +151,7 @@ def build(abi):
             source = usr / "share" / name
             if source.exists():
                 shutil.copytree(source, bundle / "share" / name, symlinks=False)
+        executables.update(android.install(bundle))
         # Preserve runtime JS, frontend assets, manifests and licenses. Office
         # conversion is not part of the phone app; no LibreOffice engine ships.
         def exclude(directory, names):

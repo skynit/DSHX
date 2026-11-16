@@ -906,6 +906,59 @@ test('Android runtime tools process JSON databases GNU commands archives and HTT
   } finally { tls.closeAllConnections(); await new Promise(resolve => tls.close(resolve)); }
 });
 
+test('Android runtime APK compiler builds native Java resources signs updates and preserves successful output on failure', { timeout: 120000 }, async () => {
+  const dir = await mkdtemp(join(directory, 'native apk '));
+  const project = join(dir, '含 空格工程');
+  const info = JSON.parse(await runtimeCommand('dshx-apk', ['doctor']));
+  assert.equal(info.compileSdk, 34);
+  assert.equal(info.runtime, 'Android ART');
+  await runtimeCommand('dshx-apk', ['init', project, '--package', 'local.dshx.compiler.test', '--name', '编译 & "签名"验证']);
+  await runtimeCommand('dshx-apk', ['init', project, '--package', 'local.dshx.compiler.other'], { status: 1 });
+  const first = JSON.parse(await runtimeCommand('dshx-apk', ['build', project]));
+  assert.equal(first.signatureVerified, true);
+  assert.equal(first.packageName, 'local.dshx.compiler.test');
+  assert.equal((await stat(first.path)).size, first.size);
+  const bytes = await readFile(first.path);
+  assert.equal(createHash('sha256').update(bytes).digest('hex'), first.sha256);
+  const entries = (await runtimeCommand('zipinfo', ['-1', first.path])).trim().split('\n');
+  assert.ok(entries.includes('classes.dex'));
+  assert.ok(entries.includes('resources.arsc'));
+  assert.ok(!entries.some(name => name.endsWith('.pk8') || name.endsWith('.pem') || name.endsWith('.java')));
+  const signer = join(core, 'share/android/apksigner.dex');
+  const verify = async file => runtimeCommand(info.vm, ['-cp', signer, 'com.android.apksigner.ApkSignerTool',
+    'verify', '--print-certs', '--min-sdk-version', '26', file]);
+  const original = await verify(first.path);
+  const library = join(dir, 'Greeting.java'), classes = join(dir, 'library classes');
+  await mkdir(classes);
+  await writeFile(library, 'package fixture; public class Greeting { public static String text() { return "本地 JAR"; } }');
+  await runtimeCommand(info.vm, ['-Xmx256m', '-cp', join(core, 'share/android/ecj.jar'),
+    'org.eclipse.jdt.internal.compiler.batch.Main', '-proc:none', '-1.8', '-bootclasspath',
+    join(core, 'share/android/android.jar'), '-d', classes, library]);
+  await mkdir(join(project, 'app/libs'));
+  await runtimeCommand('python3', ['-c',
+    'import pathlib,sys,zipfile; root=pathlib.Path(sys.argv[1]); z=zipfile.ZipFile(sys.argv[2],"w"); '
+      + '[z.write(p,p.relative_to(root)) for p in root.rglob("*.class")]; z.writestr("library.txt","JAR resource"); z.close()',
+    classes, join(project, 'app/libs/greeting.jar')]);
+  await mkdir(join(project, 'app/src/main/assets'));
+  await writeFile(join(project, 'app/src/main/assets/note.txt'), '离线资源');
+  const java = join(project, 'app/src/main/java/local/dshx/compiler/test/MainActivity.java');
+  await writeFile(java, (await readFile(java, 'utf8')).replace('text.setText(R.string.app_name);',
+    'java.util.function.Supplier<String> title = () -> fixture.Greeting.text(); text.setText(title.get());'));
+  const manifest = join(project, 'app/src/main/AndroidManifest.xml');
+  await writeFile(manifest, (await readFile(manifest, 'utf8')).replace('versionCode="1"', 'versionCode="2"'));
+  const next = JSON.parse(await runtimeCommand('dshx-apk', ['build', project, '--output', join(project, 'build', 'update.apk')]));
+  assert.equal(await verify(next.path), original);
+  assert.equal(await runtimeCommand('unzip', ['-p', next.path, 'assets/note.txt']), '离线资源');
+  assert.equal(await runtimeCommand('unzip', ['-p', next.path, 'library.txt']), 'JAR resource');
+  await writeFile(java, 'this is invalid Java');
+  await runtimeCommand('dshx-apk', ['build', project], { status: 1 });
+  assert.deepEqual(await readFile(first.path), bytes);
+  const kotlin = join(project, 'app/src/main/java/Unsupported.kt');
+  await writeFile(kotlin, 'class Unsupported');
+  await runtimeCommand('dshx-apk', ['build', project], { status: 1 });
+  assert.deepEqual(await readFile(first.path), bytes);
+});
+
 test('Android runtime Python loads standard extensions creates venv and installs an offline wheel', { timeout: 90000 }, async () => {
   const dir = await mkdtemp(join(directory, 'python tools '));
   const code = 'import ssl,sqlite3,ctypes,bz2,lzma,zlib,hashlib,dbm.gnu,multiprocessing; print("stdlib ready")';
@@ -8170,6 +8223,8 @@ test('Android micro apps register all tools through the official schema and pres
     assert.equal(appToolNames.has('app_export'), true);
     assert.equal(appToolNames.has('app_shell'), false);
     assert.equal(sections.length, 1);
+    assert.match(sections[0].text, /dshx-apk/);
+    assert.match(sections[0].text, /不支持 Kotlin、AAR、Gradle\/Maven/);
   } finally { cleanups.forEach(cleanup => cleanup?.()); }
 });
 

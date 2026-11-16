@@ -65,6 +65,18 @@ import kotlinx.coroutines.withTimeout
 class CoreTest {
     @get:Rule val folder = TemporaryFolder()
 
+    @Test fun enginePreservesAndroidBootPathsWithoutForwardingCredentialsOrInjection() {
+        val boot = "/apex/com.android.art/javalib/core-oj.jar:/system/framework/framework.jar"
+        val source = mapOf("ANDROID_ROOT" to "/system", "ANDROID_DATA" to "/data",
+            "BOOTCLASSPATH" to boot, "DEX2OATBOOTCLASSPATH" to boot,
+            "API_KEY" to "private", "NODE_OPTIONS" to "--require=/tmp/inject.js",
+            "JAVA_TOOL_OPTIONS" to "-javaagent:/tmp/inject.jar", "HTTP_PROXY" to "http://private",
+            "LD_PRELOAD" to "/tmp/inject.so")
+        assertEquals(mapOf("ANDROID_ROOT" to "/system", "ANDROID_DATA" to "/data",
+            "BOOTCLASSPATH" to boot, "DEX2OATBOOTCLASSPATH" to boot), Engine.androidEnvironment(source))
+        assertTrue(Engine.androidEnvironment(emptyMap()).isEmpty())
+    }
+
     private fun updateManifest(base: String, bytes: ByteArray = "apk".toByteArray()): JSONObject = JSONObject()
         .put("format", 1).put("packageName", "local.dshx.app").put("versionCode", 3).put("versionName", "0.1.0-dev.2")
         .put("commit", "a".repeat(40)).put("releaseNotesUrl", "${base}releases/3/release-note.txt")

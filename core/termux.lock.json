@@ -339,6 +339,36 @@
       "version": "8.23.0",
       "url": "https://packages.termux.dev/apt/termux-main/pool/main/c/curl/curl_8.23.0_aarch64.deb",
       "sha256": "e57a9975a828eb48790bec0da950795af165aa714f6a33d266c45a4e2898aa85"
+    },
+    "aapt2": {
+      "version": "16.0.0.4-4",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/a/aapt2/aapt2_16.0.0.4-4_aarch64.deb",
+      "sha256": "1b3e4d716670d78fed4a66e04a1ba92827a36fe3000e9bef98208392f3100050"
+    },
+    "abseil-cpp": {
+      "version": "20260817.0",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/a/abseil-cpp/abseil-cpp_20260817.0_aarch64.deb",
+      "sha256": "b698963bb7096494ad928ce89cd869a53e6adf0b05f5f407b40fda9c85c6e2b0"
+    },
+    "libprotobuf": {
+      "version": "2:36.2-1",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/libp/libprotobuf/libprotobuf_2:36.2-1_aarch64.deb",
+      "sha256": "daa3b9169e094644ba95c35d40a5cc283473144decc7dae8396c49cc51440815"
+    },
+    "fmt": {
+      "version": "1:12.2.0",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/f/fmt/fmt_1:12.2.0_aarch64.deb",
+      "sha256": "4a2cb43ab167b32daf0d7978f21c5391d17bce47dae6aa2a8b3a8f958e663ce7"
+    },
+    "libpng": {
+      "version": "1.6.59",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/libp/libpng/libpng_1.6.59_aarch64.deb",
+      "sha256": "32d61f0b1a60cf7283aa3a80e288737493df2c6b84c8c749606b77c94a10f2b2"
+    },
+    "libzopfli": {
+      "version": "1.0.3-5",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/libz/libzopfli/libzopfli_1.0.3-5_aarch64.deb",
+      "sha256": "95cd7cb2209fbafb25825f5fcd4f86f021512175608e038b1c3d8d3fa0a4fe40"
     }
   },
   "x86_64": {
@@ -681,6 +711,36 @@
       "version": "8.23.0",
       "url": "https://packages.termux.dev/apt/termux-main/pool/main/c/curl/curl_8.23.0_x86_64.deb",
       "sha256": "03a68c5393759f6802a2b256891c2bca93d633d4915cdcb50e6d643c12f84fff"
+    },
+    "aapt2": {
+      "version": "16.0.0.4-4",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/a/aapt2/aapt2_16.0.0.4-4_x86_64.deb",
+      "sha256": "427d90195bccd27de6094aacc3804a44086a890c8686867389b6a0252fa6a658"
+    },
+    "abseil-cpp": {
+      "version": "20260817.0",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/a/abseil-cpp/abseil-cpp_20260817.0_x86_64.deb",
+      "sha256": "cdd59794ae695e8dbade2d718bf781bc95b1ef01ee159e7617e90d9bca1b2da5"
+    },
+    "libprotobuf": {
+      "version": "2:36.2-1",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/libp/libprotobuf/libprotobuf_2:36.2-1_x86_64.deb",
+      "sha256": "d661707eeedbfa5ac16f37c36e79ffa17f8d9c7362ea7fba6a682fe86765f14e"
+    },
+    "fmt": {
+      "version": "1:12.2.0",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/f/fmt/fmt_1:12.2.0_x86_64.deb",
+      "sha256": "6cc8492e074a227029b74f9ad175ccb8d18f001a0bccb9a15d6d01ee96377a7f"
+    },
+    "libpng": {
+      "version": "1.6.59",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/libp/libpng/libpng_1.6.59_x86_64.deb",
+      "sha256": "b5bbc3c552255d072ac5e53ec7641128f373d09e404abd01a8285b1a4a7f324c"
+    },
+    "libzopfli": {
+      "version": "1.0.3-5",
+      "url": "https://packages.termux.dev/apt/termux-main/pool/main/libz/libzopfli/libzopfli_1.0.3-5_x86_64.deb",
+      "sha256": "d1fab66ab892e8bbf864014829bd6002ba0541c5bf58bb2137ca8d4cfab9dc01"
     }
   }
 }

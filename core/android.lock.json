@@ -1,0 +1,48 @@
+{
+  "format": 1,
+  "compileSdk": 34,
+  "tools": {
+    "apksigner.dex": {
+      "url": "https://github.com/farhaanaliii/kosei-toolchain/releases/download/v0.1.0/apksigner.dex",
+      "apiUrl": "https://api.github.com/repos/farhaanaliii/kosei-toolchain/releases/assets/563455945?download=1",
+      "sha256": "d631e2ec7f3ba3401956f193b6bdd2864af12ac65f959555c84f08eaed8abac8"
+    },
+    "d8.dex": {
+      "url": "https://github.com/farhaanaliii/kosei-toolchain/releases/download/v0.1.0/d8.dex",
+      "apiUrl": "https://api.github.com/repos/farhaanaliii/kosei-toolchain/releases/assets/563455947?download=1",
+      "sha256": "5273174294ce0cc2ff2ed5b05d7fecec1d462d3e283204eac5bb34fb139991b5"
+    },
+    "ecj.jar": {
+      "url": "https://github.com/farhaanaliii/kosei-toolchain/releases/download/v0.1.0/ecj.jar",
+      "apiUrl": "https://api.github.com/repos/farhaanaliii/kosei-toolchain/releases/assets/563455941?download=1",
+      "sha256": "451d6725788e54145892d05d3f357d310e26885472dbb7dda9a50abb520b7729"
+    },
+    "android.jar": {
+      "sdkPath": "platforms/android-34/android.jar",
+      "sha256": "6cea1df3efb77103ac3e2beb9bf4718964b0e0869ab16d39d29d5cbae1c147ad"
+    },
+    "package.xml": {
+      "sdkPath": "platforms/android-34/package.xml",
+      "sha256": "7ed2920aec1d0c3581c9c33117bbe72f508dcee9de4acf1f1599e981787448de"
+    },
+    "kosei-LICENSE.txt": {
+      "url": "https://raw.githubusercontent.com/farhaanaliii/kosei-toolchain/main/LICENSE",
+      "apiUrl": "https://raw.githubusercontent.com/farhaanaliii/kosei-toolchain/main/LICENSE",
+      "sha256": "cd770d2f289da35a318b85f1c460ee1ce3cb0ae8d5e8bfd1bf8136dfb605867a"
+    },
+    "EPL-2.0.txt": {
+      "url": "https://www.eclipse.org/org/documents/epl-2.0/EPL-2.0.txt",
+      "apiUrl": "https://www.eclipse.org/org/documents/epl-2.0/EPL-2.0.txt",
+      "sha256": "0becf16567beb77fa252b7664631dd177c8f9a1889e48995b45379c7130e5303"
+    },
+    "Apache-2.0.txt": {
+      "url": "https://www.apache.org/licenses/LICENSE-2.0.txt",
+      "apiUrl": "https://www.apache.org/licenses/LICENSE-2.0.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    "core-lambda-stubs.jar": {
+      "sdkPath": "build-tools/34.0.0/core-lambda-stubs.jar",
+      "sha256": "f0404cf634498aec268ad9a3967b5ae8f0005280de0504e264a2a65b8f19745e"
+    }
+  }
+}

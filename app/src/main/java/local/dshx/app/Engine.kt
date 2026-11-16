@@ -402,6 +402,7 @@ class Engine(private val context: Context, private val worker: Executor = Execut
                 builder.environment().apply {
                     // Do not forward desktop credentials, Node injection flags or proxy settings.
                     clear()
+                    putAll(androidEnvironment(System.getenv()))
                     put("HOME", home.path)
                     put("DSH_HOME", File(home, ".dsh").path)
                     put("DSHX_WORKSPACE", workspace.path)
@@ -535,6 +536,12 @@ class Engine(private val context: Context, private val worker: Executor = Execut
     private fun record(line: String) = logs.append(line)
 
     companion object {
+        /** ART 子进程复用系统启动类路径，不继承注入参数、代理或凭据。 */
+        internal fun androidEnvironment(source: Map<String, String>): Map<String, String> = source.filterKeys {
+            it in setOf("ANDROID_ROOT", "ANDROID_DATA", "ANDROID_ART_ROOT", "ANDROID_RUNTIME_ROOT",
+                "ANDROID_I18N_ROOT", "ANDROID_TZDATA_ROOT", "BOOTCLASSPATH", "DEX2OATBOOTCLASSPATH")
+        }
+
         /** 提前探测占用；真正 bind 仍有竞争窗口，EADDRINUSE 由服务完整收尾后回退。 */
         internal fun preferredPort(port: Int): Int {
             if (port !in 1..65535) return 0

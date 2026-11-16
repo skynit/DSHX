@@ -103,6 +103,6 @@ export async function apply(ctx) {
   policyHost.createApp = create;
   ctx.effect(() => async () => { if (policyHost.createApp === create) policyHost.createApp = undefined; await queue; await domain.close(); });
   ctx.systemPrompt.section({ name: 'android:apps', order: 106,
-    text: '用户在当前对话要求创建、修改应用或制作、打包 APK 时，先用 skill({name:"create-dshx-app"}) 加载完整流程；本轮已有该技能正文时直接沿用。在当前会话制作并交付，用户无需先打开创建页面或另建会话。DSHX 通过 app_* 工具管理应用，通过 app_export 和 present 交付 APK；具体步骤、权限、重试和验证要求以技能及其运行契约为准。',
+    text: '用户要求 Java 原生 Android 应用或编译 Java 工程时，终端预装 dshx-apk：先读 dshx-apk --help，可用 init 创建工程、build 编译资源和 Java 并签名验签；支持 Java 8、API 26–34、app/libs/*.jar，不支持 Kotlin、AAR、Gradle/Maven 或 C/C++。按 build 返回的真实 path 用 present 交付 APK；签名通过与安装、功能验证分别报告。网页微应用沿用 app_*：用户在当前对话要求创建、修改微应用或导出其 APK 时，先用 skill({name:"create-dshx-app"}) 加载完整流程；本轮已有该技能正文时直接沿用。在当前会话制作并交付，用户无需先打开创建页面或另建会话。DSHX 通过 app_* 工具管理微应用，通过 app_export 和 present 交付其 APK；具体步骤、权限、重试和验证要求以技能及其运行契约为准。',
   });
 }
