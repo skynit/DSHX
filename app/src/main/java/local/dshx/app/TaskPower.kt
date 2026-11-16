@@ -7,42 +7,57 @@ import android.media.AudioTrack
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
+import android.os.SystemClock
 import android.util.Log
 
-/** 由引擎前台服务在主线程管理，仅在至少一个会话执行任务时持有资源。 */
+/** 由引擎前台服务在主线程管理，任务执行时持续保活，空闲后保活三十分钟。 */
 internal class TaskPower(private val context: Context) {
     private val main = Handler(Looper.getMainLooper())
-    private var active = false
+    // null 表示已停止；空闲超时后保留 false，避免状态刷新重新触发保活。
+    private var active: Boolean? = null
+    private var idleUntil = 0L
     private var wake: PowerManager.WakeLock? = null
     private var audio: AudioTrack? = null
     private val renew = object : Runnable {
         override fun run() {
-            if (!active) return
-            hold()
-            main.postDelayed(this, 5 * 60_000L)
+            if (active == null) return
+            val timeout = if (active == true) WAKE_TIMEOUT else (idleUntil - SystemClock.elapsedRealtime()).coerceAtMost(WAKE_TIMEOUT)
+            if (timeout <= 0) { release(); return }
+            hold(timeout)
+            main.postDelayed(this, timeout.coerceAtMost(RENEW_INTERVAL))
         }
     }
 
     fun setActive(value: Boolean) {
         if (active == value) return
         active = value
+        idleUntil = if (value) 0L else SystemClock.elapsedRealtime() + IDLE_TIMEOUT
         main.removeCallbacks(renew)
-        if (active) renew.run() else {
-            audio?.let { runCatching { it.release() } }
-            audio = null
-            wake?.let { runCatching { if (it.isHeld) it.release() } }
-            wake = null
-        }
+        renew.run()
     }
 
-    private fun hold() {
+    fun stop() {
+        active = null
+        idleUntil = 0L
+        release()
+    }
+
+    private fun release() {
+        main.removeCallbacks(renew)
+        audio?.let { runCatching { it.release() } }
+        audio = null
+        wake?.let { runCatching { if (it.isHeld) it.release() } }
+        wake = null
+    }
+
+    private fun hold(timeout: Long) {
         try {
             val lock = wake ?: context.getSystemService(PowerManager::class.java)
                 .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "DSHX:task").apply {
                     setReferenceCounted(false)
                 }.also { wake = it }
-            // 续期覆盖长任务；若续期线程停止响应，锁仍会在十分钟后自动到期。
-            lock.acquire(10 * 60_000L)
+            // 续期覆盖长任务；锁最多十分钟到期，空闲时不超过剩余保活时间。
+            lock.acquire(timeout)
         } catch (error: Exception) { Log.w("DSHXTask", "任务唤醒锁申请失败", error) }
         if (audio?.playState == AudioTrack.PLAYSTATE_PLAYING) return
         audio?.let { runCatching { it.release() } }
@@ -67,5 +82,11 @@ internal class TaskPower(private val context: Context) {
             track?.let { runCatching { it.release() } }
             Log.w("DSHXTask", "任务静音循环启动失败，保留唤醒锁并在续期时重试", error)
         }
+    }
+
+    private companion object {
+        const val IDLE_TIMEOUT = 30 * 60_000L
+        const val WAKE_TIMEOUT = 10 * 60_000L
+        const val RENEW_INTERVAL = 5 * 60_000L
     }
 }

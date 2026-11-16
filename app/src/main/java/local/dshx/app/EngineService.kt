@@ -46,7 +46,7 @@ class EngineService : Service() {
     private val taskPower = TaskPower(this)
     private val engine get() = (application as DshApp).engine
     private val listener: (EngineState) -> Unit = { state ->
-        taskPower.setActive(running && state.taskRunning)
+        if (running) taskPower.setActive(state.taskRunning) else taskPower.stop()
         if (state.url != null && readySince == 0L) readySince = SystemClock.elapsedRealtime()
         restartId?.let { if (engine.restartStatus(it).optString("state") == "succeeded") restartId = null }
         getSystemService(NotificationManager::class.java).notify(1, notification(state.phase))
@@ -65,7 +65,7 @@ class EngineService : Service() {
         main.removeCallbacks(retry)
         if (intent?.action == "stop") {
             running = false
-            taskPower.setActive(false)
+            taskPower.stop()
             if (!engine.stop()) finish()
             return START_NOT_STICKY
         }
@@ -86,6 +86,7 @@ class EngineService : Service() {
         }
         running = true
         retryDelay = 1_000L
+        taskPower.setActive(engine.state.taskRunning)
         startEngine()
         // 系统回收前台服务后可能传入空 Intent，仍需重新启动引擎。
         return START_STICKY
@@ -93,7 +94,7 @@ class EngineService : Service() {
 
     override fun onDestroy() {
         running = false
-        taskPower.setActive(false)
+        taskPower.stop()
         main.removeCallbacks(retry)
         engine.remove(listener)
         engine.cancelRestart()
@@ -106,11 +107,12 @@ class EngineService : Service() {
     private fun startEngine() {
         if (!running || engine.active) return
         readySince = 0L
+        taskPower.setActive(false)
         engine.start(::finished)
     }
 
     private fun finished(restart: Boolean) {
-        taskPower.setActive(false)
+        taskPower.stop()
         val pending = restartId
         if (pending != null) {
             val operation = engine.restartStatus(pending)

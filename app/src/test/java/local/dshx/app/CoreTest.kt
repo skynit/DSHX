@@ -362,7 +362,7 @@ class CoreTest {
         assertEquals(2, jobs.size)
     }
 
-    @Test @Config(sdk = [26, 34]) fun taskPowerPlaysOneSecondOfSilenceOnlyWhileTasksRun() {
+    @Test @Config(sdk = [26, 34]) fun taskPowerPlaysOneSecondOfSilenceDuringTasksAndThirtyMinutesOfIdle() {
         val context = RuntimeEnvironment.getApplication()
         val written = mutableListOf<ByteArray>()
         val listener = org.robolectric.shadows.ShadowAudioTrack.OnAudioDataWrittenListener { _, bytes, _ -> written.add(bytes.copyOf()) }
@@ -383,15 +383,51 @@ class CoreTest {
             power.setActive(true)
             assertEquals(1, written.size)
             power.setActive(false)
+            assertTrue(wake.isHeld)
+            assertEquals(android.media.AudioTrack.PLAYSTATE_PLAYING, audio.playState)
+            val main = shadowOf(Looper.getMainLooper())
+            main.idleFor(29, TimeUnit.MINUTES)
+            power.setActive(false)
+            main.idleFor(59_999, TimeUnit.MILLISECONDS)
+            assertTrue(wake.isHeld)
+            main.idleFor(1, TimeUnit.MILLISECONDS)
             assertFalse(wake.isHeld)
             assertEquals(android.media.AudioTrack.STATE_UNINITIALIZED, audio.state)
-            shadowOf(Looper.getMainLooper()).idleFor(15, TimeUnit.MINUTES)
+            power.setActive(false)
+            main.idleFor(15, TimeUnit.MINUTES)
             assertEquals(1, written.size)
             assertFalse(wake.isHeld)
         } finally {
-            power.setActive(false)
+            power.stop()
             org.robolectric.shadows.ShadowAudioTrack.removeAudioDataListener(listener)
         }
+    }
+
+    @Test @Config(sdk = [26, 34]) fun taskPowerStartsIdleAndRestartsTheGracePeriodAfterNewTasks() {
+        val power = TaskPower(RuntimeEnvironment.getApplication())
+        val main = shadowOf(Looper.getMainLooper())
+        try {
+            power.setActive(false)
+            val wake = ReflectionHelpers.getField<PowerManager.WakeLock>(power, "wake")
+            assertTrue(wake.isHeld)
+            main.idleFor(29, TimeUnit.MINUTES)
+            power.setActive(true)
+            main.idleFor(32, TimeUnit.MINUTES)
+            assertTrue(wake.isHeld)
+            power.setActive(false)
+            main.idleFor(30, TimeUnit.MINUTES)
+            assertFalse(wake.isHeld)
+            assertNull(ReflectionHelpers.getField<android.media.AudioTrack?>(power, "audio"))
+
+            power.setActive(true)
+            val next = ReflectionHelpers.getField<PowerManager.WakeLock>(power, "wake")
+            assertTrue(next.isHeld)
+            power.setActive(false)
+            main.idleFor(29, TimeUnit.MINUTES)
+            assertTrue(next.isHeld)
+            main.idleFor(1, TimeUnit.MINUTES)
+            assertFalse(next.isHeld)
+        } finally { power.stop() }
     }
 
     @Test fun taskPowerRenewsLongTasksAndKeepsWakeLockWhenAudioFails() {
@@ -407,28 +443,30 @@ class CoreTest {
             assertTrue(wake.isHeld)
             val audio = ReflectionHelpers.getField<android.media.AudioTrack>(power, "audio")
             assertEquals(android.media.AudioTrack.PLAYSTATE_PLAYING, audio.playState)
-            power.setActive(false)
+            power.stop()
             assertFalse(wake.isHeld)
             assertEquals(android.media.AudioTrack.STATE_UNINITIALIZED, audio.state)
         } finally {
             org.robolectric.shadows.ShadowAudioTrack.enableIllegalStateOnPlay(false)
-            power.setActive(false)
+            power.stop()
         }
     }
 
-    @Test fun engineServiceReleasesTaskPowerOnStopAndDestroy() {
+    @Test fun engineServiceKeepsIdlePowerAndReleasesItOnStopAndDestroy() {
         val engine = (RuntimeEnvironment.getApplication() as DshApp).engine
         ReflectionHelpers.setField(engine, "worker", Executor {})
         val controller = Robolectric.buildService(EngineService::class.java).create()
         val service = controller.get()
         val listener = ReflectionHelpers.getField<(EngineState) -> Unit>(service, "listener")
         try {
-            service.onStartCommand(Intent(), 0, 1)
-            listener(EngineState(url = "http://127.0.0.1:1234"))
             val power = ReflectionHelpers.getField<TaskPower>(service, "taskPower")
             assertNull(ReflectionHelpers.getField<PowerManager.WakeLock?>(power, "wake"))
-            listener(EngineState(taskRunning = true))
+            service.onStartCommand(Intent(), 0, 1)
+            listener(EngineState(url = "http://127.0.0.1:1234"))
             val wake = ReflectionHelpers.getField<PowerManager.WakeLock>(power, "wake")
+            assertTrue(wake.isHeld)
+            listener(EngineState(taskRunning = true))
+            listener(EngineState(taskRunning = false))
             assertTrue(wake.isHeld)
             service.onStartCommand(Intent().setAction("stop"), 0, 2)
             assertFalse(wake.isHeld)
