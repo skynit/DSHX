@@ -96,7 +96,8 @@ class AndroidTunnelEndpointIdentity : TunnelEndpointIdentity {
 }
 
 /** DSHX 聊天身份独立于 CWNAS 信令路由。端点编号由公钥派生，签名绑定双方挑战及本次 SDP。 */
-internal class TunnelPeerHandshake(private val remoteId: String, private val session: String, private val initiator: Boolean) {
+internal class TunnelPeerHandshake(private val remoteId: String, private val session: String, private val initiator: Boolean,
+    private val conversation: String = session) {
     private val nonce = encode(ByteArray(32).also(SecureRandom()::nextBytes))
     private var remoteNonce: String? = null
     var offer: String? = null
@@ -136,7 +137,7 @@ internal class TunnelPeerHandshake(private val remoteId: String, private val ses
             "dshx-chat/1 proof", session, if (initiator) localId else remoteId, if (initiator) remoteId else localId,
             if (initiator) nonce else challenge, if (initiator) challenge else nonce,
             encode(hash(offer.toByteArray(Charsets.UTF_8))), encode(hash(answer.toByteArray(Charsets.UTF_8))), signerIsInitiator,
-        )).toString().toByteArray(Charsets.UTF_8)
+        )).apply { if (conversation != session) put(conversation) }.toString().toByteArray(Charsets.UTF_8)
     }
 
     companion object {
@@ -179,7 +180,7 @@ class TunnelPlatformClient(
             addQueryParameter("limit", limit.toString())
         }.build()
         execute(Request.Builder().url(url).get().build()).use { response ->
-            val page = TunnelDirectoryPage.fromJson(JSONObject(response.body?.string().orEmpty()))
+            val page = TunnelDirectoryPage.fromJson(JSONObject(readBody(response)))
             return page.copy(items = page.items.filter { it.publication == TunnelPublication.PUBLISHED })
         }
     }
@@ -199,7 +200,7 @@ class TunnelPlatformClient(
         val challengeRequest = Request.Builder().url(origin.newBuilder()
             .encodedPath("${TunnelChatProtocol.REGISTER_PATH}/challenge").build())
             .post(ByteArray(0).toRequestBody()).build()
-        val challenge = execute(challengeRequest).use { JSONObject(it.body?.string().orEmpty()).getString("challenge") }
+        val challenge = execute(challengeRequest).use { JSONObject(readBody(it)).getString("challenge") }
         require(challenge.matches(Regex("[A-Za-z0-9_-]{43}"))) { "平台注册挑战无效。" }
         val proof = identity.sign("dshx-platform-register/1\n$challenge\n$body".toByteArray(Charsets.UTF_8))
         val request = Request.Builder()
@@ -208,7 +209,9 @@ class TunnelPlatformClient(
             .header("X-DSHX-Signature", Base64.getUrlEncoder().withoutPadding().encodeToString(proof))
             .put(body.toRequestBody("application/json".toMediaTypeOrNull())).build()
         execute(request).use { response ->
-            return parseRegistration(response.body?.string().orEmpty(), clean)
+            return parseRegistration(readBody(response), clean).also {
+                require(it.endpoint.publication == clean.publication) { "平台未确认端点可见性设置。" }
+            }
         }
     }
 
@@ -230,23 +233,31 @@ class TunnelPlatformClient(
     }
 
     private fun execute(request: Request): Response {
-        val response = runCatching { http.newCall(request).execute() }.getOrElse {
-            throw TunnelPlatformException("platform_unavailable", "穿透平台暂时不可用。", retryable = true)
-        }
-        if (!response.isSuccessful) {
-            val body = response.body?.string().orEmpty()
+        val response = network { http.newCall(request).execute() }
+        if (!response.isSuccessful) response.use {
+            val body = readBody(response)
             val error = runCatching { JSONObject(body).optJSONObject("error") }.getOrNull()
             val code = error?.optString("code")?.takeIf { it.isNotBlank() } ?: "http_${response.code}"
-            response.close()
             throw TunnelPlatformException(code, error?.optString("message")?.takeIf { it.isNotBlank() }
                 ?: "穿透平台请求失败（HTTP ${response.code}）。", response.code == 429 || response.code >= 500)
         }
         return response
     }
 
+    private fun readBody(response: Response) = network { response.body?.string().orEmpty() }
+
+    private inline fun <T> network(call: () -> T): T = try { call() } catch (_: java.io.IOException) {
+        throw TunnelPlatformException("platform_unavailable", "穿透平台暂时不可用。", retryable = true)
+    }
+
     private fun parseRegistration(raw: String, settings: TunnelChatSettings): TunnelPlatformRegistration {
         val value = JSONObject(raw)
         val endpointValue = value.optJSONObject("endpoint") ?: value
+        if (settings.publication == TunnelPublication.HIDDEN) {
+            require(endpointValue.optString("endpointId") == settings.endpointId && endpointValue.optString("publication") == "hidden") {
+                "平台未确认撤下此端点。"
+            }
+        }
         require(endpointValue.optString("endpointId", settings.endpointId) == settings.endpointId) { "平台返回的端点身份不匹配。" }
         val endpoint = settings.descriptor(online = false).copy(
             displayName = endpointValue.optString("displayName", settings.displayName),
@@ -315,8 +326,10 @@ class TunnelSignalingClient(
         socket = http.newWebSocket(request, SocketListener(clean, listener))
     }
 
-    fun sendOffer(sessionId: String, targetEndpointId: String, sdp: String): Boolean = sendSignal("offer", sessionId, targetEndpointId,
-        JSONObject().put("description", JSONObject().put("type", "offer").put("sdp", sdp)))
+    fun sendOffer(sessionId: String, targetEndpointId: String, sdp: String, conversationId: String = sessionId): Boolean =
+        sendSignal("offer", sessionId, targetEndpointId,
+            JSONObject().put("description", JSONObject().put("type", "offer").put("sdp", sdp))
+                .apply { if (conversationId != sessionId) put("conversation_id", conversationId) })
 
     fun sendAnswer(sessionId: String, targetEndpointId: String, sdp: String): Boolean = sendSignal("answer", sessionId, targetEndpointId,
         JSONObject().put("description", JSONObject().put("type", "answer").put("sdp", sdp)))

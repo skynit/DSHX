@@ -51,8 +51,8 @@ function verifyProfile(raw, challenge, proof) {
   const id = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
   const signed = Buffer.concat([Buffer.from(`dshx-platform-register/1\n${challenge}\n`), raw]);
   if (id !== body.endpointId || !verify('sha256', signed, key, Buffer.from(proof, 'base64url'))) return null;
-  const { displayName, publicIntroduction, publication, acceptance, maxAiReplies } = body;
-  return { endpointId: id, displayName, publicIntroduction, publication, acceptance, maxAiReplies, capabilities: ['text'] };
+  const { displayName, publicIntroduction, publication, acceptance } = body;
+  return { endpointId: id, displayName, publicIntroduction, publication, acceptance, capabilities: ['text'] };
 }
 
 /** 只保存端点状态和信令路由；从不接收或中转聊天正文。 */
@@ -61,8 +61,17 @@ export function createTunnelPlatform({ iceServers = [] } = {}) {
   const challenges = new Map();
   const tokens = new Map();
   const sessions = new Map();
+  let registrationOrder = 0;
   const sockets = new WebSocketServer({ noServer: true, maxPayload: maxSignal, perMessageDeflate: false });
-  const describe = profile => ({ ...profile.info, online: profile.socket?.readyState === WebSocket.OPEN });
+  const describe = ({ info: { endpointId, displayName, publicIntroduction, publication, acceptance, capabilities }, socket }) => ({
+    endpointId, displayName, publicIntroduction, publication, acceptance, capabilities, online: socket?.readyState === WebSocket.OPEN,
+  });
+  const describeDirectory = profile => {
+    const { endpointId, displayName, publicIntroduction, publication, capabilities } = profile.info;
+    const { socket } = profile;
+    return { endpointId, displayName, publicIntroduction, publication, capabilities,
+      online: socket?.readyState === WebSocket.OPEN, accepting: profile.info.acceptance === 'accepting' };
+  };
 
   const service = createServer({ requestTimeout: 10_000, headersTimeout: 5000 }, (req, res) => {
     handleRequest(req, res).catch(() => {
@@ -75,21 +84,22 @@ export function createTunnelPlatform({ iceServers = [] } = {}) {
     if (req.method === 'POST' && url.pathname === `${register}/challenge`) {
       if (challenges.size >= 4096) return error(res, 429, 'busy');
       const challenge = nonce();
-      challenges.set(challenge, Date.now() + 30_000);
+      challenges.set(challenge, { expires: Date.now() + 30_000, order: ++registrationOrder });
       return reply(res, 200, { challenge });
     }
     if (req.method === 'PUT' && url.pathname === register) {
       const challenge = req.headers['x-dshx-challenge'];
       const proof = req.headers['x-dshx-signature'];
-      const expires = challenges.get(challenge);
-      if (!expires || expires <= Date.now() || !validText(proof, 112)) return error(res, 401, 'invalid_proof');
+      const pending = challenges.get(challenge);
+      if (!pending || pending.expires <= Date.now() || !validText(proof, 112)) return error(res, 401, 'invalid_proof');
       challenges.delete(challenge);
       const info = verifyProfile(await readBody(req), challenge, proof);
-      if (!info) return error(res, 401, 'invalid_proof');
+      if (!info || pending.expires <= Date.now()) return error(res, 401, 'invalid_proof');
       const old = profiles.get(info.endpointId);
+      if (old && old.order > pending.order) return error(res, 409, 'stale_registration');
       if (!old && profiles.size >= 4096) return error(res, 429, 'directory_full');
       if (old) invalidate(old);
-      const profile = { info, token: nonce(), expires: Date.now() + 60_000, updated: Date.now(), sessions: new Set() };
+      const profile = { info, order: pending.order, token: nonce(), expires: Date.now() + 60_000, updated: Date.now(), sessions: new Set() };
       profiles.set(info.endpointId, profile);
       tokens.set(profile.token, profile);
       // 客户端从 HTTPS 平台地址派生同源 WSS 地址，不信任反代传入的 Host。
@@ -105,7 +115,7 @@ export function createTunnelPlatform({ iceServers = [] } = {}) {
         return id > cursor && info.publication === 'published' &&
           [info.endpointId, info.displayName, info.publicIntroduction].some(text => text.toLowerCase().includes(query));
       });
-      const items = ids.slice(0, limit).map(id => describe(profiles.get(id)));
+      const items = ids.slice(0, limit).map(id => describeDirectory(profiles.get(id)));
       return reply(res, 200, { items, ...(ids.length > limit ? { nextCursor: items.at(-1).endpointId } : {}) });
     }
     if (req.method === 'DELETE' && url.pathname.startsWith(`${directory}/`)) {
@@ -175,6 +185,7 @@ export function createTunnelPlatform({ iceServers = [] } = {}) {
     const bound = sessions.get(id);
     if (type === 'offer') {
       if (!validText(payload.description?.sdp, 60 * 1024) || payload.description.type !== 'offer' || !payload.description.sdp) return reject('invalid_signal');
+      if (payload.conversation_id !== undefined && (typeof payload.conversation_id !== 'string' || !sessionId.test(payload.conversation_id))) return reject('invalid_signal');
       if (peer?.info.publication !== 'published' || peer.socket?.readyState !== WebSocket.OPEN) return reject('unavailable');
       // 暂停接收还要允许客户端识别并放行旧会话重连，所以接收策略由端点裁决。
       if (bound || profile.sessions.size >= 64 || peer.sessions.size >= 64) return reject('busy');
@@ -194,7 +205,8 @@ export function createTunnelPlatform({ iceServers = [] } = {}) {
       } else if (type === 'session_close') removeSession(id);
       else return reject('invalid_signal');
     }
-    const clean = type === 'offer' || type === 'answer' ? { description: { type, sdp: payload.description.sdp } } :
+    const clean = type === 'offer' || type === 'answer' ? { description: { type, sdp: payload.description.sdp },
+      ...(type === 'offer' && payload.conversation_id !== undefined ? { conversation_id: payload.conversation_id } : {}) } :
       type === 'candidate' ? { candidate: payload.candidate, sdp_mid: payload.sdp_mid, sdp_mline_index: payload.sdp_mline_index } : {};
     if (!send(peer.socket, { protocol, version: 1, type, message_id: message.message_id, session_id: id,
       source: endpoint(profile.info.endpointId), destination: endpoint(target), payload: clean })) {
@@ -251,7 +263,7 @@ export function createTunnelPlatform({ iceServers = [] } = {}) {
 
   const sweep = setInterval(() => {
     const now = Date.now();
-    for (const [challenge, expires] of challenges) if (expires <= now) challenges.delete(challenge);
+    for (const [challenge, pending] of challenges) if (pending.expires <= now) challenges.delete(challenge);
     for (const [token, profile] of tokens) if (!activeToken(profile)) tokens.delete(token);
     for (const [id, profile] of profiles) if (!profile.socket && now - profile.updated > 7 * 24 * 3600_000) profiles.delete(id);
   }, 10_000).unref();

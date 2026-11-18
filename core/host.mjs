@@ -263,7 +263,7 @@ export class PolicyHost {
   }
 
   cachedMode(session) {
-    if (typeof session === 'string' && session.startsWith('tunnel:')) return 'tunnel';
+    if (isTunnelSession(session)) return 'tunnel';
     if (!this.configured) return 'workspace-write';
     return !this.failure && this.connected ? this.sessions.get(session) ?? 'unavailable' : 'unavailable';
   }
@@ -313,6 +313,8 @@ export class PolicyHost {
 
   close() { this.fail(); }
 }
+
+export const isTunnelSession = session => typeof session === 'string' && session.startsWith('tunnel:');
 
 export const policyHost = new PolicyHost({
   port: process.env.DSHX_POLICY_PORT,

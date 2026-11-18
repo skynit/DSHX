@@ -194,6 +194,11 @@ private fun TunnelChatSettingsContent(runtime: TunnelChatRuntime, runtimeState: 
     Section("公共端点")
     Panel(padding = 0) {
         SettingsRow("端点状态", runtimeState.message) {}
+        if (runtimeState.pendingWithdrawal) {
+            Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+                Note("平台尚未确认撤下公开端点，客户端将自动重试。")
+            }
+        }
         Divider()
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             SettingsTitle("接收新聊天")
@@ -202,7 +207,7 @@ private fun TunnelChatSettingsContent(runtime: TunnelChatRuntime, runtimeState: 
             AssistantField("dsh 身份介绍", introduction, 2_000, false, 4, "告诉访客这个端点由谁接待、擅长什么")
             AssistantField("穿透平台", platform, 256, false, 1, TunnelChatProtocol.DEFAULT_PLATFORM_ORIGIN)
             SettingsTitle("发布状态")
-            SettingsOptions(publication.name.lowercase(), listOf("published" to "公开目录", "hidden" to "隐身，不可发现")) {
+            SettingsOptions(publication.name.lowercase(), listOf("published" to "公开目录", "hidden" to "隐身")) {
                 publication = if (it == "published") TunnelPublication.PUBLISHED else TunnelPublication.HIDDEN
             }
             SettingsTitle("新聊天接收")
@@ -216,7 +221,7 @@ private fun TunnelChatSettingsContent(runtime: TunnelChatRuntime, runtimeState: 
     Section("远端能力")
     Panel(padding = 0) {
         Column(Modifier.padding(16.dp)) {
-            Note("本地记忆、知识库、本地文件、Phone control 均未接入。")
+            Note("本地记忆、知识库、本地文件和手机操作暂未开放。")
         }
     }
     Section("应用")

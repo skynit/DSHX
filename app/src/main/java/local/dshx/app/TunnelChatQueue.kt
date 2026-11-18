@@ -6,6 +6,7 @@ import android.util.AtomicFile
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.FileNotFoundException
 import java.security.KeyStore
 import java.security.SecureRandom
 import java.util.Base64
@@ -94,10 +95,39 @@ data class TunnelQueuedMessage(
     }
 }
 
-/**
- * 文件队列只保存发送方尚未投递的消息。每次重试保留原 message_id/conversation_id，
- * 不通过创建新会话绕过端点限频。
- */
+data class TunnelConversation(
+    val id: String,
+    val platformOrigin: String,
+    val localEndpointId: String,
+    val remoteEndpointId: String,
+    val visitor: Boolean,
+    val verified: Boolean = false,
+    val mode: ConversationMode = ConversationMode.AI,
+    val aiRepliesSent: Int = 0,
+    val closed: Boolean = false,
+    val sequence: Long = 0,
+    val waitingNotified: Boolean = false,
+    val receivedMessageIds: List<String> = emptyList(),
+) {
+    fun toJson() = JSONObject().put("id", id).put("origin", platformOrigin).put("local", localEndpointId)
+        .put("remote", remoteEndpointId).put("visitor", visitor).put("verified", verified)
+        .put("mode", mode.name).put("replies", aiRepliesSent).put("closed", closed).put("seq", sequence)
+        .put("waitingNotified", waitingNotified).put("receivedMessageIds", JSONArray(receivedMessageIds))
+
+    fun canReply(limit: Int) = verified && !visitor && !closed && mode == ConversationMode.AI && aiRepliesSent < limit
+
+    companion object {
+        fun fromJson(row: JSONObject) = TunnelConversation(
+            row.getString("id"), row.getString("origin"), row.getString("local"), row.getString("remote"),
+            row.getBoolean("visitor"), row.getBoolean("verified"), ConversationMode.valueOf(row.getString("mode")),
+            row.getInt("replies"), row.getBoolean("closed"), row.getLong("seq"),
+            row.optBoolean("waitingNotified"),
+            row.optJSONArray("receivedMessageIds")?.let { array -> (0 until array.length()).map { array.getString(it) } }.orEmpty(),
+        )
+    }
+}
+
+/** 待发消息与接待状态共用一次加密写入，重试保留原消息和会话 ID。 */
 class TunnelChatQueueStore(
     private val file: File,
     private val cipher: TunnelChatQueueCipher,
@@ -105,32 +135,37 @@ class TunnelChatQueueStore(
 ) {
     private val lock = Any()
 
-    fun enqueue(message: ChatMessage, targetEndpointId: String, now: Long = System.currentTimeMillis()): Boolean = synchronized(lock) {
+    fun enqueue(message: ChatMessage, targetEndpointId: String, now: Long = System.currentTimeMillis(),
+        conversation: TunnelConversation? = null): Boolean = synchronized(lock) {
         val config = limits().validate()
-        val rows = readRows().filter { now - it.enqueuedAt <= config.queueMaxAgeMs }.toMutableList()
+        val data = readData()
+        val rows = data.rows.filter { now - it.enqueuedAt <= config.queueMaxAgeMs &&
+            !(conversation?.closed == true && it.belongsTo(conversation)) }.toMutableList()
         if (rows.any { it.message.messageId == message.messageId }) return@synchronized true
         val next = TunnelQueuedMessage(message, now, targetEndpointId, config.platformOrigin)
         val bytes = rows.sumOf { it.message.toJson().toString().toByteArray(Charsets.UTF_8).size.toLong() } +
             message.toJson().toString().toByteArray(Charsets.UTF_8).size
         if (rows.size >= config.queueMaxMessages || bytes > config.queueMaxBytes) return@synchronized false
         rows += next
-        writeRows(rows)
+        writeData(Data(rows, if (conversation == null) data.conversations else data.withConversation(conversation)))
         true
     }
 
     fun due(now: Long = System.currentTimeMillis()): List<TunnelQueuedMessage> = synchronized(lock) {
         val config = limits().validate()
-        val original = readRows()
+        val data = readData()
+        val original = data.rows
         val rows = original.filter { now - it.enqueuedAt <= config.queueMaxAgeMs }
-        if (rows.size != original.size) writeRows(rows)
+        if (rows.size != original.size) writeData(data.copy(rows = rows))
         rows.filter { it.nextAttemptAt <= now }.sortedBy { it.enqueuedAt }
     }
 
     fun markAttempt(messageId: String, now: Long = System.currentTimeMillis(), delayMs: Long = 1_000L) = synchronized(lock) {
-        val rows = readRows().map {
+        val data = readData()
+        val rows = data.rows.map {
             if (it.message.messageId == messageId) it.copy(attempts = it.attempts + 1, nextAttemptAt = now + delayMs.coerceAtLeast(0)) else it
         }
-        writeRows(rows)
+        writeData(data.copy(rows = rows))
     }
 
     fun retryDelayMs(attempts: Int): Long {
@@ -141,25 +176,52 @@ class TunnelChatQueueStore(
     fun acknowledge(ack: ChatAck, targetEndpointId: String) = synchronized(lock) {
         if (ack.status == ChatAck.Status.REJECTED) return@synchronized
         val config = limits()
-        val rows = readRows()
+        val data = readData()
+        val rows = data.rows
         val remaining = rows.filterNot { it.message.messageId == ack.messageId && it.message.conversationId == ack.conversationId &&
             it.targetEndpointId == targetEndpointId && it.platformOrigin == config.platformOrigin && it.message.senderEndpointId == config.endpointId }
-        if (remaining.size != rows.size) writeRows(remaining)
+        if (remaining.size != rows.size) writeData(data.copy(rows = remaining))
     }
 
-    fun snapshot(): List<TunnelQueuedMessage> = synchronized(lock) { readRows() }
+    fun snapshot(): List<TunnelQueuedMessage> = synchronized(lock) { readData().rows }
+    fun conversations(): List<TunnelConversation> = synchronized(lock) { readData().conversations }
 
-    private fun readRows(): List<TunnelQueuedMessage> {
-        if (!file.isFile) return emptyList()
-        if (file.length() == 0L) return emptyList()
-        val plain = cipher.decrypt(Base64.getDecoder().decode(AtomicFile(file).readFully()))
-        val rows = JSONArray(String(plain, Charsets.UTF_8))
-        return (0 until rows.length()).map { TunnelQueuedMessage.fromJson(rows.getJSONObject(it)) }
+    fun save(conversation: TunnelConversation) = synchronized(lock) {
+        val data = readData()
+        val rows = if (conversation.closed) data.rows.filterNot { it.belongsTo(conversation) && !it.message.isEnd() } else data.rows
+        writeData(Data(rows, data.withConversation(conversation)))
     }
 
-    private fun writeRows(rows: List<TunnelQueuedMessage>) {
+    private fun TunnelQueuedMessage.belongsTo(conversation: TunnelConversation) =
+        message.conversationId == conversation.id && message.senderEndpointId == conversation.localEndpointId &&
+            platformOrigin == conversation.platformOrigin && targetEndpointId == conversation.remoteEndpointId
+
+    private data class Data(val rows: List<TunnelQueuedMessage>, val conversations: List<TunnelConversation>) {
+        fun withConversation(next: TunnelConversation) = conversations.filterNot {
+            it.id == next.id && it.platformOrigin == next.platformOrigin && it.localEndpointId == next.localEndpointId
+        } + next
+    }
+
+    private fun readData(): Data {
+        if (!file.isFile || file.length() == 0L) return Data(emptyList(), emptyList())
+        val encoded = try { AtomicFile(file).readFully() } catch (error: FileNotFoundException) {
+            if (file.exists()) throw error
+            return Data(emptyList(), emptyList())
+        }
+        val json = String(cipher.decrypt(Base64.getDecoder().decode(encoded)), Charsets.UTF_8)
+        val value = if (json.startsWith('[')) JSONObject().put("rows", JSONArray(json)) else JSONObject(json)
+        val rows = value.getJSONArray("rows")
+        val conversations = value.optJSONArray("conversations") ?: JSONArray()
+        return Data((0 until rows.length()).map { TunnelQueuedMessage.fromJson(rows.getJSONObject(it)) },
+            (0 until conversations.length()).map { TunnelConversation.fromJson(conversations.getJSONObject(it)) })
+    }
+
+    private fun writeData(data: Data) {
         file.parentFile?.mkdirs()
-        val value = JSONArray().apply { rows.forEach { put(it.toJson()) } }.toString().toByteArray(Charsets.UTF_8)
+        val value = JSONObject()
+            .put("rows", JSONArray(data.rows.map { it.toJson() }))
+            .put("conversations", JSONArray(data.conversations.map { it.toJson() }))
+            .toString().toByteArray(Charsets.UTF_8)
         val encoded = Base64.getEncoder().encode(cipher.encrypt(value))
         val atomic = AtomicFile(file)
         val output = atomic.startWrite()

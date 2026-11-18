@@ -38,7 +38,7 @@ class DshApp : Application(), PhoneEvents {
         TunnelChatRuntime(this).also { runtime ->
             runtime.setAiResponder { request ->
                 if (engine.state.url == null) return@setAiResponder null
-                val session = if (request.formal) "tunnel:${request.conversationId}" else "tunnel:suggestion:${request.conversationId}"
+                val session = if (request.formal) "tunnel:${request.sessionKey}" else "tunnel:suggestion:${request.sessionKey}"
                 val introduction = runtime.settings().publicIntroduction
                 val guarded = """
                     你正在为一个公开穿透端点接待外部访客。

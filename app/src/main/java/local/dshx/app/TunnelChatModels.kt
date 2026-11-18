@@ -57,7 +57,7 @@ enum class ConversationMode { AI, HUMAN_HANDOVER }
 
 /** 交给端点 AI 的请求；文本来自外部端点，只能作为不可信用户输入。 */
 data class TunnelChatAiRequest(
-    val conversationId: String,
+    val sessionKey: String,
     val remoteEndpointId: String,
     val text: String,
     val formal: Boolean,
@@ -190,6 +190,8 @@ data class TunnelEndpointDescriptor(
                     array.getString(index).also { require(it.matches(Regex("[a-z][a-z0-9_]{0,63}"))) { "端点能力标识无效。" } }
                 }
             } ?: emptyList()
+            val acceptance = value.optString("acceptance").takeIf { it.isNotBlank() }
+                ?: if (value.optBoolean("accepting", false)) "accepting" else "paused"
             return TunnelEndpointDescriptor(
                 endpointId = value.getString("endpointId"),
                 displayName = value.optString("displayName"),
@@ -199,7 +201,7 @@ data class TunnelEndpointDescriptor(
                     "hidden" -> TunnelPublication.HIDDEN
                     else -> throw IllegalArgumentException("目录发布状态无效。")
                 },
-                acceptance = when (value.optString("acceptance")) {
+                acceptance = when (acceptance) {
                     "accepting" -> TunnelAcceptance.ACCEPTING
                     "paused" -> TunnelAcceptance.PAUSED
                     else -> throw IllegalArgumentException("目录接收状态无效。")
@@ -232,10 +234,14 @@ data class TunnelChatConversationSnapshot(
     val remoteEndpointId: String,
     val outgoing: Boolean,
     val connected: Boolean,
+    val connecting: Boolean,
+    val closed: Boolean,
     val mode: ConversationMode,
     val aiRepliesSent: Int,
     val messages: List<ChatMessage>,
 )
+
+internal fun ChatMessage.isEnd() = kind == ChatMessageKind.CONVERSATION_EVENT && payload.optString("event") == "ended"
 
 data class ChatAttachment(
     val attachmentId: String,
@@ -390,12 +396,18 @@ data class ChatAck(
 }
 
 /** 为所有新会话提供全局限频和并发上限；已有会话的消息不走此闸门。 */
-class TunnelConversationAdmission(private val settings: () -> TunnelChatSettings) {
+class TunnelConversationAdmission(
+    private val settings: () -> TunnelChatSettings,
+    loadLastAcceptedAt: () -> Long? = { null },
+    private val saveLastAcceptedAt: (Long) -> Unit = {},
+) {
+    constructor(settings: () -> TunnelChatSettings) : this(settings, { null }, {})
+
     private val active = LinkedHashMap<String, Long>()
-    private var lastAcceptedAt: Long? = null
+    private var lastAcceptedAt: Long? = loadLastAcceptedAt()
 
     @Synchronized
-    fun open(conversationId: String, now: Long = android.os.SystemClock.elapsedRealtime(), reconnect: Boolean = false): AdmissionResult {
+    fun open(conversationId: String, now: Long = System.currentTimeMillis(), reconnect: Boolean = false): AdmissionResult {
         require(conversationId.isNotBlank()) { "会话编号不能为空。" }
         val config = settings().validate()
         if (active.containsKey(conversationId)) return AdmissionResult.Accepted(existing = true)
@@ -408,10 +420,14 @@ class TunnelConversationAdmission(private val settings: () -> TunnelChatSettings
             return AdmissionResult.Accepted(existing = true)
         }
         val previous = lastAcceptedAt
-        if (previous != null && now - previous < config.newConversationIntervalMs) {
-            return AdmissionResult.RateLimited(config.newConversationIntervalMs - (now - previous))
+        if (previous != null) {
+            val elapsed = now - previous
+            if (elapsed < config.newConversationIntervalMs) {
+                return AdmissionResult.RateLimited((config.newConversationIntervalMs - elapsed).coerceAtLeast(1L))
+            }
         }
         if (active.size >= config.maxActiveConversations) return AdmissionResult.Rejected("conversation_capacity")
+        saveLastAcceptedAt(now)
         lastAcceptedAt = now
         active[conversationId] = now
         return AdmissionResult.Accepted(existing = false)
@@ -426,7 +442,6 @@ class TunnelConversationAdmission(private val settings: () -> TunnelChatSettings
     @Synchronized
     fun clear() {
         active.clear()
-        lastAcceptedAt = null
     }
 
     sealed class AdmissionResult {
@@ -495,9 +510,18 @@ class TunnelChatSettingsStore(context: Context) {
     }
 
     @Synchronized
-    fun save(settings: TunnelChatSettings): TunnelChatSettings {
+    fun save(settings: TunnelChatSettings, publishedOrigins: Set<String> = publishedOrigins()): TunnelChatSettings {
         val clean = settings.validate()
-        check(preferences.edit().putString("settings", clean.toJson().toString()).commit()) { "穿透聊天设置保存失败。" }
+        check(preferences.edit().putString("settings", clean.toJson().toString())
+            .putStringSet("publishedOrigins", publishedOrigins).commit()) { "穿透聊天设置保存失败。" }
         return clean
+    }
+
+    fun publishedOrigins(): Set<String> = preferences.getStringSet("publishedOrigins", null)?.toSet() ?: emptySet()
+
+    fun lastAcceptedAt(): Long? = if (preferences.contains("lastAcceptedAt")) preferences.getLong("lastAcceptedAt", 0L) else null
+
+    fun saveLastAcceptedAt(value: Long) {
+        check(preferences.edit().putLong("lastAcceptedAt", value).commit()) { "穿透聊天限频状态保存失败。" }
     }
 }

@@ -115,6 +115,9 @@ test('tunnel platform discovers endpoints and relays only bound session signals'
   const { items } = await found.json();
   assert.deepEqual(items.map(item => [item.endpointId, item.online]), [[b.profile.endpointId, true]]);
   assert.equal(items[0].publicKey, undefined);
+  assert.equal(items[0].maxAiReplies, undefined);
+  assert.equal(items[0].acceptance, undefined);
+  assert.equal(items[0].accepting, true);
   const to = target(b);
   send(source, 'offer', { description: { type: 'offer', sdp: 'offer sdp' }, ignored: 'not forwarded' }, to);
   const offer = await receive(destination);
@@ -130,6 +133,15 @@ test('tunnel platform discovers endpoints and relays only bound session signals'
   assert.equal((await receive(source)).type, 'session_close');
   send(source, 'candidate', { candidate: 'candidate:1', sdp_mline_index: 0 }, to);
   assert.equal((await receive(source)).error.code, 'unknown_session');
+});
+
+test('tunnel platform rejects an older registration after a newer update', { timeout: 8000 }, async t => {
+  const platform = await fixture(t);
+  const peer = identity('可更新端点');
+  const stale = await platform.registration(peer, { displayName: '旧资料' });
+  const current = await platform.registration(peer, { displayName: '新资料' });
+  assert.equal((await platform.request(register, current)).status, 200);
+  assert.equal((await platform.request(register, stale)).status, 409);
 });
 
 test('tunnel platform removes hidden endpoints from discovery and rejects known-ID offers', { timeout: 8000 }, async t => {

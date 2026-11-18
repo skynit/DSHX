@@ -4354,6 +4354,38 @@ test('tunnel chat creates the named visitor session and blocks tools', async () 
   }
 });
 
+test('voice keeps independent sessions active for local and tunnel replies', async () => {
+  const { voiceSession } = await import(pathToFileURL(join(core, 'voice.mjs')));
+  const handlers = new Map();
+  const sessions = new Map(['local-session', 'tunnel:remote'].map(id => [id, { id }]));
+  const agents = new Map([...sessions].map(([id, session]) => [id, {
+    session, status: 'idle', inbox: { nextTurn: [], nextStep: [], hasPending: false, remove() {} }, cancel() {},
+  }]));
+  const voice = voiceSession({
+    on(name, handler) { handlers.set(name, handler); return () => handlers.delete(name); },
+    sessionPersistence: { stat: async () => ({ header: {} }) },
+    sessionController: { commands: {
+      resolveAgent: async sessionId => agents.get(sessionId),
+      prompt: async (request, source) => {
+        const agent = agents.get(request.sessionId);
+        handlers.get('agent/inbox/claimed')({ agent, message: { source, content: request.content }, turn: 1 });
+        handlers.get('agent/request')({ agent, turn: 1, signal: new AbortController().signal }, () => {});
+        handlers.get('session/event')(agent.session, { type: 'assistant/message', data: { turn: 1,
+          message: { content: [{ type: 'text', text: request.sessionId }] } } });
+        handlers.get('session/event')(agent.session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+      },
+    } },
+  });
+  try {
+    const [local, tunnel] = await Promise.all([
+      voice.call('prompt', { session: 'local-session', interaction: 'local', text: '你好' }),
+      voice.call('prompt', { session: 'tunnel:remote', interaction: 'tunnel', text: '你好' }),
+    ]);
+    assert.equal(local.text, 'local-session');
+    assert.equal(tunnel.text, 'tunnel:remote');
+  } finally { voice.close(); }
+});
+
 test('voice incremental output filters real stream frames by agent turn attempt and text channel', async () => {
   const f = await voiceStreamFixture(), events = [];
   try {

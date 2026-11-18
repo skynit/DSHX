@@ -138,7 +138,8 @@ export function localAdapter(Base, host = policyHost) {
 
 /** 语音与文字共用正式会话，简单任务只临时选择模型。 */
 export function voiceSession(ctx, host = policyHost) {
-  let active;
+  const active = new Map();
+  const activeForAgent = agent => active.get(agent.session?.id) ?? [...active.values()].find(run => run.agent === agent);
   const tasks = new Map();
   const waiting = new Set();
   function restore(run) {
@@ -170,7 +171,7 @@ export function voiceSession(ctx, host = policyHost) {
     }
   }
   function stop(run, error) {
-    if (active !== run || run.cancelled) return;
+    if (active.get(run.session) !== run || run.cancelled) return;
     run.cancelled = true;
     removePending(run);
     restore(run);
@@ -178,7 +179,7 @@ export function voiceSession(ctx, host = policyHost) {
     if (run.entered && !run.finished) run.agent.cancel({ kind: 'user' }, { keepInbox: true });
   }
   function publish(run, text) {
-    if (!text || !run.onEvent || run.cancelled || active !== run) return;
+    if (!text || !run.onEvent || run.cancelled || active.get(run.session) !== run) return;
     text = [...text].slice(0, 16000 - run.streamedLength).join('');
     if (!text) return;
     run.streamedText += text;
@@ -193,13 +194,16 @@ export function voiceSession(ctx, host = policyHost) {
       pending.cancelled = true;
       pending.wake.resolve();
     }
-    const run = active;
-    if (!run || interaction && interaction !== run.interaction) return;
-    stop(run, new Error('语音对话已取消。'));
-    return run.done.promise;
+    const runs = [...active.values()].filter(candidate => !interaction || candidate.interaction === interaction);
+    if (runs.length === 0) return;
+    const pending = runs.map(run => {
+      stop(run, new Error('语音对话已取消。'));
+      return run.done.promise;
+    });
+    return pending.length === 1 ? pending[0] : Promise.all(pending);
   };
   const claimed = ctx.on('agent/inbox/claimed', ({ agent, message, turn }) => {
-    const run = active;
+    const run = activeForAgent(agent);
     if (!run || run.agent !== agent || message.source?.kind !== 'user') return claimTask({ agent, message, turn });
     if (message.source.rpcId === run.request) {
       run.entered = true; run.turn = turn;
@@ -223,7 +227,8 @@ export function voiceSession(ctx, host = policyHost) {
     }
   });
   function claimTask({ agent, message, turn }) {
-    if (active?.agent === agent && message.source?.rpcId === active.request) return;
+    const current = activeForAgent(agent);
+    if (current?.agent === agent && message.source?.rpcId === current.request) return;
     const previous = tasks.get(agent);
     if (previous) {
       release(previous);
@@ -263,12 +268,12 @@ export function voiceSession(ctx, host = policyHost) {
     }
   }
   const request = ctx.on('agent/request', ({ agent, turn, signal }, next) => {
-    const run = active;
+    const run = activeForAgent(agent);
     if (run?.agent === agent && run.entered && run.turn === turn) run.signal = signal;
     return next();
   });
   const stream = ctx.on('agent/assistant-stream', ({ agent, frame }) => {
-    const run = active;
+    const run = activeForAgent(agent);
     if (!run || run.agent !== agent || !run.entered || run.cancelled || run.finished || run.signal?.aborted) return;
     if (frame.type === 'start') {
       run.attempt = frame.turn === run.turn ? { id: frame.attemptId, index: -1, text: '', length: 0 } : undefined;
@@ -290,8 +295,8 @@ export function voiceSession(ctx, host = policyHost) {
   });
   const event = ctx.on('session/event', (session, entry) => {
     taskEvent(session, entry);
-    const run = active;
-    if (!run || run.session !== session.id) return;
+    const run = active.get(session.id);
+    if (!run) return;
     if (entry.type === 'model/selection' && run.selection && !run.recording) run.changed = true;
     if (entry.type === 'user/message' && entry.data.source?.kind === 'user') {
       if (entry.data.source?.rpcId === run.request) {
@@ -333,7 +338,8 @@ export function voiceSession(ctx, host = policyHost) {
   // Scoped instructions can enter after inbox claim. Recheck at the adapter
   // boundary, and retry that same logged user message once on its original model.
   const retry = ctx.on('agent/request-error', ({ agent, provider, failure, signal }, next) => {
-    const run = active?.agent === agent ? active : tasks.get(agent);
+    const current = activeForAgent(agent);
+    const run = current?.agent === agent ? current : tasks.get(agent);
     if (failure.code === 'LOCAL_MEMORY_CONTEXT' && provider === route.provider && run?.agent === agent) {
       run.contextFailure = failure;
       return next();
@@ -349,7 +355,7 @@ export function voiceSession(ctx, host = policyHost) {
     // needs a request override outside that snapshot, scoped to this run only.
     run.retry = agent.ctx.on('agent/request', async (_payload, next) => {
       const config = await next();
-      if (run.cancelled || run.changed || (active !== run && tasks.get(agent) !== run)) return config;
+      if (run.cancelled || run.changed || (active.get(run.session) !== run && tasks.get(agent) !== run)) return config;
       const { reasoningEffort: _effort, ...rest } = config;
       return { ...rest, ...run.previous };
     }, { prepend: true });
@@ -359,15 +365,16 @@ export function voiceSession(ctx, host = policyHost) {
     async call(action, data, onEvent) {
       if (action === 'cancel') { await cancel(data.interaction); return { cancelled: true }; }
       if (action !== 'prompt') throw new Error('不支持的语音会话操作。');
-      if (active?.cancelled) {
+      const current = active.get(data.session);
+      if (current?.cancelled) {
         const pending = { interaction: data.interaction, cancelled: false, wake: Promise.withResolvers() };
         waiting.add(pending);
         try {
-          while (active?.cancelled && !pending.cancelled) await Promise.race([active.done.promise, pending.wake.promise]);
+          while (active.get(data.session)?.cancelled && !pending.cancelled) await Promise.race([active.get(data.session)?.done.promise, pending.wake.promise]);
           if (pending.cancelled) throw new Error('语音对话已取消。');
         } finally { waiting.delete(pending); }
       }
-      if (active) throw new Error('上一轮语音对话尚未结束。');
+      if (active.has(data.session)) throw new Error('上一轮语音对话尚未结束。');
       if (onEvent !== undefined && typeof onEvent !== 'function') throw new Error('语音事件回调无效。');
       if (typeof data.interaction !== 'string' || !/^[a-zA-Z0-9-]{1,80}$/.test(data.interaction)) throw new Error('语音轮次无效。');
       if (typeof data.text !== 'string' || !data.text.trim() || Buffer.byteLength(data.text) > 16000) throw new Error('语音文字为空或过长。');
@@ -380,12 +387,13 @@ export function voiceSession(ctx, host = policyHost) {
         route: target, local: split && target.provider === route.provider, online: split && target.provider !== route.provider,
         entered: false, cancelled: false, text: '', answerStreamed: '', onEvent, streamedText: '', streamedLength: 0,
         done: Promise.withResolvers() };
-      active = run;
       const timer = setTimeout(() => cancel(run.interaction), 170000);
       try {
         if (!run.session) run.session = (await ctx.sessionController.create({})).sessionId;
         if (run.cancelled) throw new Error('语音对话已取消。');
         if (typeof run.session !== 'string' || !/^[A-Za-z0-9._:-]{1,128}$/.test(run.session)) throw new Error('语音会话编号无效。');
+        if (active.has(run.session)) throw new Error('上一轮语音对话尚未结束。');
+        active.set(run.session, run);
         await run.onEvent?.({ session: run.session, text: '' });
         if (run.cancelled) throw new Error('语音对话已取消。');
         // 访客会话标识由 Android 宿主分配，首次消息到来时才创建对应会话。
@@ -411,7 +419,7 @@ export function voiceSession(ctx, host = policyHost) {
           // 取消回执等待本次清理和运行器停稳，避免下一轮抢入仍在收尾的 agent。
           if (run.cancelled && run.entered && !run.finished) await run.agent.whenIdle?.();
         } finally {
-          if (active === run) active = undefined;
+          if (active.get(run.session) === run) active.delete(run.session);
           run.done.resolve();
         }
       }

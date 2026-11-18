@@ -104,6 +104,18 @@ class CoreTest {
         assertEquals(TunnelConversationAdmission.AdmissionResult.Rejected("endpoint_not_accepting"), admission.open("conversation-3", now = 10_000L))
     }
 
+    @Test fun tunnelChatAdmissionKeepsTheNewConversationLimitAcrossRuntimeRestart() {
+        val settings = TunnelChatSettings(newConversationIntervalMs = 5_000L)
+        var saved: Long? = null
+        val first = TunnelConversationAdmission({ settings }, { saved }, { saved = it })
+        assertEquals(TunnelConversationAdmission.AdmissionResult.Accepted(false), first.open("conversation-1", now = 10_000L))
+        first.clear()
+
+        val restarted = TunnelConversationAdmission({ settings }, { saved }, { saved = it })
+        assertEquals(TunnelConversationAdmission.AdmissionResult.RateLimited(4_000L), restarted.open("conversation-2", now = 11_000L))
+        assertEquals(TunnelConversationAdmission.AdmissionResult.Accepted(false), restarted.open("conversation-2", now = 15_000L))
+    }
+
     @Test fun tunnelChatConversationSwitchesToHumanHandoverAndRespectsReplyLimit() {
         val state = TunnelConversationState { 2 }
 
@@ -268,6 +280,22 @@ class CoreTest {
         assertEquals(1, second.snapshot().size)
         second.acknowledge(ack, "endpoint-receiver")
         assertTrue(second.snapshot().isEmpty())
+    }
+
+    @Test fun tunnelChatQueuePersistsVerifiedConversationControlState() {
+        val file = folder.newFile("conversation-state.json")
+        val cipher = FixedTunnelChatQueueCipher(ByteArray(32) { it.toByte() })
+        val settings = TunnelChatSettings(endpointId = "endpoint-host")
+        val first = TunnelChatQueueStore(file, cipher) { settings }
+        val expected = TunnelConversation(
+            id = "conversation-1", platformOrigin = settings.platformOrigin, localEndpointId = settings.endpointId,
+            remoteEndpointId = "endpoint-visitor", visitor = false, verified = true,
+            mode = ConversationMode.HUMAN_HANDOVER, aiRepliesSent = 10, sequence = 4,
+        )
+
+        first.save(expected)
+
+        assertEquals(listOf(expected), TunnelChatQueueStore(file, cipher) { settings }.conversations())
     }
 
     @Test fun tunnelPlatformClientUsesPublicDirectoryAndRegistrationContract() {

@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
-import { policyHost } from './host.mjs';
+import { isTunnelSession, policyHost } from './host.mjs';
 import { openMemory, memoryFailure, searchMemory, accessible, normalize, sameScope } from './memory-store.mjs';
 import { extract, selectEvents, memoryRequest, memoryInput, memorySources, memoryBoundary } from './memory-extract.mjs';
 import { readBudget } from './read-budget.mjs';
@@ -30,7 +30,7 @@ export const memoryToolAvailable = tool => isMemoryTool(tool) && Boolean(owner?.
 export const memoryView = workspace => owner?.view(workspace) ?? { enabled: false, revision: 0, entries: [] };
 const inputEvent = event => event.type === 'user/message' && memoryInput(event.data);
 const messageText = message => message.content.filter(part => part.type === 'text').map(part => part.text).join('\n');
-const rootSession = session => !session.id.startsWith('tunnel:') && !session.header.parentSession && session.header.origin !== 'subagent' && !(session.header.delegationDepth > 0);
+const rootSession = session => !isTunnelSession(session.id) && !session.header.parentSession && session.header.origin !== 'subagent' && !(session.header.delegationDepth > 0);
 const routeFor = session => session.requestHeader?.()?.config;
 const scopeFor = (ctx, session) => ctx.workingDirectory?.get(session) ?? session.header.cwd;
 const sourceRows = source => [...(source.kind === 'auto' ? [{ session: source.session, events: source.events }] : []), ...(source.refs ?? [])];
@@ -252,7 +252,7 @@ export function memorySession(ctx, options = {}) {
     await ready;
     signal?.throwIfAborted();
     const decision = await next();
-    if (decision.kind !== 'enter' || agent.session.id.startsWith('tunnel:')) return decision;
+    if (decision.kind !== 'enter' || isTunnelSession(agent.session.id)) return decision;
     signal?.throwIfAborted();
     const latest = decision.messages.findLast(memoryInput);
     if (!latest) return decision;

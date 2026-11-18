@@ -1,6 +1,7 @@
 package local.dshx.app
 
 import android.content.Context
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.util.UUID
@@ -18,6 +19,7 @@ data class TunnelChatRuntimeState(
     val status: Status = Status.DISABLED,
     val message: String = "穿透聊天未开启。",
     val endpoint: TunnelEndpointDescriptor? = null,
+    val pendingWithdrawal: Boolean = false,
     val activeConversations: Int = 0,
     val conversations: List<TunnelChatConversationSnapshot> = emptyList(),
 )
@@ -34,15 +36,16 @@ class TunnelChatRuntime(
     private val signaling = TunnelSignalingClient()
     private val sessionBindings = ConcurrentHashMap<String, SessionBinding>()
     private val authenticatedSessions = ConcurrentHashMap.newKeySet<String>()
-    private val conversationStates = ConcurrentHashMap<String, TunnelConversationState>()
-    private val conversationMetadata = ConcurrentHashMap<String, ConversationMetadata>()
     private val conversationMessages = ConcurrentHashMap<String, CopyOnWriteArrayList<ChatMessage>>()
-    private val sequence = ConcurrentHashMap<String, Long>()
     private val deduplicator = TunnelMessageDeduplicator()
-    private val admission = TunnelConversationAdmission { currentSettings }
+    private val admission = TunnelConversationAdmission(
+        settings = { currentSettings },
+        loadLastAcceptedAt = settingsStore::lastAcceptedAt,
+        saveLastAcceptedAt = settingsStore::saveLastAcceptedAt,
+    )
     private val aiWorker = ThreadPoolExecutor(1, 1, 0L, TimeUnit.SECONDS, ArrayBlockingQueue(16), { task ->
         Thread(task, "dshx-tunnel-ai").apply { isDaemon = true }
-    }, ThreadPoolExecutor.DiscardPolicy())
+    }, ThreadPoolExecutor.AbortPolicy())
     private val retryScheduler = Executors.newSingleThreadScheduledExecutor { task -> Thread(task, "dshx-tunnel-retry").apply { isDaemon = true } }
     @Volatile private var registration: TunnelPlatformRegistration? = null
     private val identity by lazy { AndroidTunnelEndpointIdentity() }
@@ -52,6 +55,7 @@ class TunnelChatRuntime(
     @Volatile private var nextRegistrationAttempt = Long.MAX_VALUE
     @Volatile private var acceptingSignals = false
     @Volatile private var currentSettings = settingsStore.read()
+    private var publishedOrigins = settingsStore.publishedOrigins()
     @Volatile var state: TunnelChatRuntimeState = initialState(currentSettings)
         private set
     @Volatile private var messageListener: ((ChatMessage, String) -> Unit)? = null
@@ -63,14 +67,23 @@ class TunnelChatRuntime(
             AndroidTunnelChatQueueCipher(),
         ) { currentSettings }
     }
+    private val records by lazy { queue.conversations().associateBy { key(it.id, it.platformOrigin, it.localEndpointId) }.toMutableMap() }
 
     init {
+        if (withdrawals().isNotEmpty()) {
+            state = state.copy(pendingWithdrawal = true)
+            submit { syncWithdrawals() }
+        }
         retryScheduler.scheduleAtFixedRate({
-            onWorker {
+            submit {
+                syncWithdrawals()
+                synchronized(this) {
+                    if (closed) return@synchronized
                 runCatching {
                     if (engineReady && System.currentTimeMillis() >= nextRegistrationAttempt) start()
                     if (state.status == Status.ONLINE) retryQueued()
                 }.onFailure { publishState("本地待发消息读取或重试失败。") }
+                }
             }
         }, 5L, 5L, TimeUnit.SECONDS)
     }
@@ -88,14 +101,45 @@ class TunnelChatRuntime(
     @Synchronized fun saveSettings(settings: TunnelChatSettings): TunnelChatSettings {
         val clean = settings.validate()
         val previous = currentSettings
-        currentSettings = settingsStore.save(clean.copy(endpointId = previous.endpointId))
+        val origins = if (previous.enabled && previous.publication == TunnelPublication.PUBLISHED) {
+            publishedOrigins + previous.platformOrigin
+        } else publishedOrigins
+        currentSettings = settingsStore.save(clean.copy(endpointId = previous.endpointId), origins)
+        publishedOrigins = origins
+        if (previous.platformOrigin != clean.platformOrigin) conversationMessages.clear()
         if (!clean.enabled) stop()
-        else if (previous != clean && engineReady) {
+        else if (previous != currentSettings && engineReady) {
             if (previous.platformOrigin != clean.platformOrigin || clean.publication == TunnelPublication.HIDDEN) stop()
             else disconnectSignaling("正在应用端点设置…", retry = false)
+            if (withdrawals().isNotEmpty()) submit { syncWithdrawals() }
             start()
         } else if (!engineReady) update(initialState(clean))
+        if ((!clean.enabled || !engineReady) && withdrawals().isNotEmpty()) submit { syncWithdrawals() }
         return currentSettings
+    }
+
+    private fun withdrawals() = publishedOrigins.filterNot {
+        currentSettings.enabled && currentSettings.publication == TunnelPublication.PUBLISHED && it == currentSettings.platformOrigin
+    }
+
+    // 与公开注册使用同一个工作线程。先登记可能公开的地址，再发请求；响应丢失也不能漏掉撤下任务。
+    private fun syncWithdrawals() {
+        val origins = synchronized(this) { if (closed) return; withdrawals() }
+        for (origin in origins) {
+            val settings = synchronized(this) {
+                if (closed || origin !in withdrawals()) return@synchronized null
+                currentSettings.copy(platformOrigin = origin, endpointId = identity.endpointId, publication = TunnelPublication.HIDDEN)
+            } ?: continue
+            runCatching { TunnelPlatformClient(origin).updateEndpoint(settings, identity) }.onSuccess {
+                synchronized(this) {
+                    if (closed) return
+                    val remaining = publishedOrigins - origin
+                    settingsStore.save(currentSettings, remaining)
+                    publishedOrigins = remaining
+                    update(state)
+                }
+            }
+        }
     }
 
     @Synchronized fun setEngineReady(ready: Boolean) {
@@ -118,7 +162,13 @@ class TunnelChatRuntime(
             val registered = runCatching {
                 val clean = synchronized(this) {
                     if (!isCurrent(run)) return@submit
-                    settingsWithIdentity()
+                    settingsWithIdentity().also { settings ->
+                        if (settings.publication == TunnelPublication.PUBLISHED) {
+                            val origins = publishedOrigins + settings.platformOrigin
+                            settingsStore.save(settings, origins)
+                            publishedOrigins = origins
+                        }
+                    }
                 }
                 val platform = TunnelPlatformClient(clean.platformOrigin)
                 platform.registerEndpoint(clean, identity)
@@ -144,7 +194,7 @@ class TunnelChatRuntime(
     private fun settingsWithIdentity(): TunnelChatSettings {
         val endpointId = identity.endpointId
         if (currentSettings.endpointId != endpointId) {
-            currentSettings = settingsStore.save(currentSettings.copy(endpointId = endpointId))
+            currentSettings = settingsStore.save(currentSettings.copy(endpointId = endpointId), publishedOrigins)
         }
         return currentSettings
     }
@@ -173,83 +223,94 @@ class TunnelChatRuntime(
         else prepareConversation(endpoint.endpointId)
     }
 
-    @Synchronized fun openConversation(remoteEndpointId: String, conversationId: String = UUID.randomUUID().toString(), relayOnly: Boolean = false): String {
-        require(remoteEndpointId.isNotBlank() && remoteEndpointId != currentSettings.endpointId) { "目标端点无效。" }
+    private fun openConversation(remoteEndpointId: String): String = prepareConversation(remoteEndpointId).also { connect(record(it)!!) }
+
+    private fun connect(conversation: TunnelConversation) {
         require(state.status == Status.ONLINE) { "端点尚未在线，暂不能发起聊天。" }
-        val metadata = conversationMetadata[conversationId]
-        require(metadata == null || metadata.outgoing && metadata.remoteEndpointId == remoteEndpointId &&
-            metadata.platformOrigin == currentSettings.platformOrigin) { "聊天会话目标不匹配。" }
-        sessionBindings.values.firstOrNull { it.conversationId == conversationId }?.let { return conversationId }
+        require(conversation.visitor || conversation.verified) { "访客身份尚未验证。" }
+        if (binding(conversation.id) != null) return
         val current = registration ?: throw IllegalStateException("端点尚未向平台注册。")
-        require(conversationId.matches(Regex("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}"))) {
-            "穿透会话编号必须是 UUID。"
-        }
-        val sessionId = conversationId
-        sessionBindings[sessionId] = SessionBinding(sessionId, conversationId, remoteEndpointId, outgoing = true)
-        conversationStates.putIfAbsent(conversationId, TunnelConversationState { currentSettings.maxAiReplies })
-        conversationMetadata.putIfAbsent(conversationId, ConversationMetadata(remoteEndpointId, outgoing = true, platformOrigin = currentSettings.platformOrigin))
-        conversationMessages.putIfAbsent(conversationId, CopyOnWriteArrayList())
-        sequence.putIfAbsent(conversationId, 0L)
+        val sessionId = if (conversation.verified) UUID.randomUUID().toString() else conversation.id
+        val attempt = SessionBinding(sessionId, conversation, initiator = true)
+        sessionBindings[sessionId] = attempt
         try {
-            transportOrThrow().createOutgoing(sessionId, remoteEndpointId, current.iceServers, relayOnly)
-            expireNegotiation(sessionBindings.getValue(sessionId))
+            transportOrThrow().createOutgoing(sessionId, conversation.remoteEndpointId, current.iceServers)
+            expireNegotiation(attempt)
         } catch (error: Throwable) {
             disconnectSession(sessionId)
             throw error
         }
         publishState(state.message)
-        return conversationId
     }
 
-    fun reconnectConversation(conversationId: String, relayOnly: Boolean = false): String {
-        val metadata = conversationMetadata[conversationId] ?: throw IllegalArgumentException("未知聊天会话。")
-        return openConversation(metadata.remoteEndpointId, conversationId, relayOnly)
+    @Synchronized fun reconnectConversation(conversationId: String) {
+        connect(requireOpen(conversationId))
     }
 
     private fun prepareConversation(remoteEndpointId: String): String {
         settingsWithIdentity()
         require(validId(remoteEndpointId) && remoteEndpointId != currentSettings.endpointId) { "目标端点无效。" }
         val id = UUID.randomUUID().toString()
-        conversationMetadata[id] = ConversationMetadata(remoteEndpointId, outgoing = true, platformOrigin = currentSettings.platformOrigin)
-        conversationStates[id] = TunnelConversationState { currentSettings.maxAiReplies }
+        save(newConversation(id, remoteEndpointId, visitor = true))
         publishState(state.message)
         return id
     }
 
     @Synchronized fun sendText(conversationId: String, text: String): ChatMessage {
-        val binding = sessionBindings.values.firstOrNull { it.conversationId == conversationId }
-        require(currentSettings.enabled && conversationMetadata[conversationId]?.outgoing == true) { "访客会话尚未建立。" }
-        val message = textMessage(conversationId, text, ChatSenderRole.VISITOR, ChatMessageKind.TEXT)
-        enqueue(message)
+        val conversation = requireOpen(conversationId)
+        require(conversation.visitor) { "访客会话尚未建立。" }
+        val message = textMessage(conversation, text, ChatSenderRole.VISITOR, ChatMessageKind.TEXT)
+        enqueue(message, conversation)
         appendMessage(message, currentSettings.endpointId)
-        binding?.let { flushQueued(it.conversationId) } ?: publishState("消息已加入本地待发队列。")
+        flushQueued(conversationId)
         return message
     }
 
-    @Synchronized private fun sendAiFormalText(conversationId: String, text: String): ChatMessage? {
-        val binding = sessionBindings.values.firstOrNull { it.conversationId == conversationId } ?: return null
-        val conversation = conversationStates[conversationId] ?: return null
-        val message = textMessage(conversationId, text, ChatSenderRole.AI, ChatMessageKind.AI_FORMAL)
-        if (!conversation.recordAiFormalReply { enqueue(message) }) return null
+    private fun sendAiFormalText(conversation: TunnelConversation, text: String) {
+        val message = textMessage(conversation, text, ChatSenderRole.AI, ChatMessageKind.AI_FORMAL)
+        val next = conversation.copy(aiRepliesSent = conversation.aiRepliesSent + 1)
+        enqueue(message, next)
         appendMessage(message, currentSettings.endpointId)
-        flushQueued(binding.conversationId)
-        notifyWaitingHuman(binding, conversation)
-        return message
+        flushQueued(conversation.id)
+        notifyWaitingHuman(next)
     }
 
     @Synchronized fun sendHumanFormalText(conversationId: String, text: String): ChatMessage {
-        val binding = sessionBindings.values.firstOrNull { it.conversationId == conversationId }
-        require(binding != null && binding.sessionId in authenticatedSessions && !binding.outgoing) { "访客尚未连接。" }
-        val message = textMessage(conversationId, text, ChatSenderRole.ENDPOINT_USER, ChatMessageKind.HUMAN_FORMAL)
-        enqueue(message)
-        conversationStates[conversationId]?.recordFormalMessage(ChatMessageKind.HUMAN_FORMAL, ChatSenderRole.ENDPOINT_USER)
+        val conversation = requireOpen(conversationId)
+        require(conversation.verified && !conversation.visitor) { "访客身份尚未验证。" }
+        val message = textMessage(conversation, text, ChatSenderRole.ENDPOINT_USER, ChatMessageKind.HUMAN_FORMAL)
+        enqueue(message, conversation.copy(mode = ConversationMode.HUMAN_HANDOVER))
         appendMessage(message, currentSettings.endpointId)
-        flushQueued(binding.conversationId)
+        flushQueued(conversationId)
         return message
     }
 
     @Synchronized fun resumeAi(conversationId: String) {
-        conversationStates[conversationId]?.resumeAi()
+        val conversation = requireOpen(conversationId)
+        require(conversation.verified && !conversation.visitor) { "不能修改对方的接待模式。" }
+        save(conversation.copy(mode = ConversationMode.AI, waitingNotified = false))
+        publishState(state.message)
+    }
+
+    @Synchronized fun endConversation(conversationId: String) {
+        val conversation = requireOpen(conversationId)
+        val ended = conversation.copy(closed = true)
+        if (conversation.verified) {
+            val role = if (conversation.visitor) ChatSenderRole.VISITOR else ChatSenderRole.ENDPOINT_USER
+            val message = textMessage(conversation, "会话已结束。", role, ChatMessageKind.CONVERSATION_EVENT)
+            message.payload.put("event", "ended")
+            if (!enqueue(message, ended, allowFull = true)) {
+                save(ended)
+                binding(conversationId)?.let { disconnectSession(it.sessionId, notify = true) }
+                publishState("会话已在本地结束；待发队列已满，未能通知对方。")
+                return
+            }
+            flushQueued(conversationId)
+            binding(conversationId)?.let { expireClosing(it) }
+        } else {
+            save(ended)
+            binding(conversationId)?.let { disconnectSession(it.sessionId, notify = true) }
+        }
         publishState(state.message)
     }
 
@@ -261,23 +322,39 @@ class TunnelChatRuntime(
         retryScheduler.shutdownNow()
     }
 
-    private fun enqueue(message: ChatMessage) {
-        val target = conversationMetadata[message.conversationId] ?: error("会话未建立。")
-        check(target.platformOrigin == currentSettings.platformOrigin) { "会话属于之前使用的穿透平台。" }
+    private fun enqueue(message: ChatMessage, conversation: TunnelConversation, allowFull: Boolean = false): Boolean {
         require(message.toJson().toString().toByteArray(Charsets.UTF_8).size <= TunnelChatProtocol.MAX_MESSAGE_BYTES) { "聊天消息过大。" }
-        check(queue.enqueue(message, target.remoteEndpointId)) { "本地待发消息队列已满。" }
+        val next = conversation.copy(sequence = message.seq)
+        if (!queue.enqueue(message, next.remoteEndpointId, conversation = next)) {
+            check(allowFull) { "本地待发消息队列已满。" }
+            return false
+        }
+        records[key(next.id)] = next
+        return true
     }
 
-    private fun nextSequence(conversationId: String): Long = synchronized(sequence) {
-        val next = (sequence[conversationId] ?: 0L) + 1L
-        sequence[conversationId] = next
-        next
+    private fun key(id: String, origin: String = currentSettings.platformOrigin, local: String = currentSettings.endpointId) =
+        Triple(origin, local, id)
+
+    private fun record(id: String) = records[key(id)]
+
+    private fun save(conversation: TunnelConversation) {
+        queue.save(conversation)
+        records[key(conversation.id)] = conversation
     }
 
-    private fun textMessage(conversationId: String, text: String, role: ChatSenderRole, kind: ChatMessageKind): ChatMessage = ChatMessage(
+    private fun newConversation(id: String, remote: String, visitor: Boolean) =
+        TunnelConversation(id, currentSettings.platformOrigin, currentSettings.endpointId, remote, visitor)
+
+    private fun binding(id: String) = sessionBindings.values.firstOrNull { it.conversationId == id }
+
+    private fun requireOpen(id: String): TunnelConversation = record(id)
+        ?.takeIf { currentSettings.enabled && !it.closed } ?: error("聊天会话不可用或已结束。")
+
+    private fun textMessage(conversation: TunnelConversation, text: String, role: ChatSenderRole, kind: ChatMessageKind): ChatMessage = ChatMessage(
         messageId = UUID.randomUUID().toString(),
-        conversationId = conversationId,
-        seq = nextSequence(conversationId),
+        conversationId = conversation.id,
+        seq = conversation.sequence + 1,
         senderRole = role,
         senderEndpointId = currentSettings.endpointId,
         kind = kind,
@@ -286,7 +363,7 @@ class TunnelChatRuntime(
     )
 
     @Synchronized private fun flushQueued(conversationId: String) {
-        val binding = sessionBindings.values.firstOrNull { it.conversationId == conversationId } ?: return
+        val binding = binding(conversationId) ?: return
         if (!authenticatedSessions.contains(binding.sessionId)) return
         queue.due().filter { it.message.conversationId == conversationId && matchesEndpoint(it, binding.remoteEndpointId) }.forEach { row ->
             val sent = authenticatedSessions.contains(binding.sessionId) && transport?.sendJson(binding.sessionId, TunnelChatProtocol.message(row.message)) == true
@@ -301,15 +378,22 @@ class TunnelChatRuntime(
 
     private fun retryQueued() {
         queue.due().groupBy { it.message.conversationId }.forEach { (conversationId, rows) ->
-            val binding = sessionBindings[conversationId]
+            val row = rows.firstOrNull { matchesEndpoint(it, it.targetEndpointId) } ?: return@forEach
+            val conversation = record(conversationId) ?: run {
+                // 旧版待发访客文本没有会话记录。无法恢复旧版接待状态，不为旧版 AI 正式回复重建状态。
+                if (row.message.senderRole != ChatSenderRole.VISITOR || row.message.kind != ChatMessageKind.TEXT) return@forEach
+                newConversation(conversationId, row.targetEndpointId, visitor = true)
+                    .copy(sequence = rows.filter { matchesEndpoint(it, row.targetEndpointId) }.maxOf { it.message.seq }).also { save(it) }
+            }
+            if (conversation.remoteEndpointId != row.targetEndpointId || conversation.closed && !row.message.isEnd()) return@forEach
+            val binding = binding(conversationId)
             if (binding != null) {
                 flushQueued(conversationId)
             } else {
-                val row = rows.first()
-                if (row.message.senderRole != ChatSenderRole.VISITOR || !matchesEndpoint(row, row.targetEndpointId)) return@forEach
-                rows.forEach { queue.markAttempt(it.message.messageId, delayMs = queue.retryDelayMs(it.attempts)) }
-                sequence.merge(conversationId, rows.maxOf { it.message.seq }, ::maxOf)
-                runCatching { openConversation(row.targetEndpointId, conversationId) }
+                rows.filter { matchesEndpoint(it, conversation.remoteEndpointId) }.forEach {
+                    queue.markAttempt(it.message.messageId, delayMs = queue.retryDelayMs(it.attempts))
+                }
+                runCatching { connect(conversation) }
             }
         }
     }
@@ -319,7 +403,11 @@ class TunnelChatRuntime(
         when (event) {
             is TunnelSignalingEvent.Registered -> {
                 if (event.iceServers.isNotEmpty()) registration = registration?.copy(iceServers = event.iceServers)
-                val message = if (currentSettings.publication == TunnelPublication.HIDDEN) "已在线，端点处于隐身模式。" else "公共端点已在线。"
+                val message = when {
+                    withdrawals().isNotEmpty() -> "正在确认撤下旧平台上的公开端点…"
+                    currentSettings.publication == TunnelPublication.HIDDEN -> "已在线，端点处于隐身模式。"
+                    else -> "公共端点已在线。"
+                }
                 update(TunnelChatRuntimeState(Status.ONLINE, message, currentSettings.descriptor(online = true)))
             }
             is TunnelSignalingEvent.Message -> handleSignalingMessage(event)
@@ -358,28 +446,36 @@ class TunnelChatRuntime(
         when (event.type) {
             "offer" -> {
                 val offer = event.payload.optString("sdp")
-                val conversationId = sessionId
-                if (offer.isBlank() || !validId(sessionId) || !validId(conversationId)) return
-                val previous = conversationMetadata[conversationId]
-                if (previous != null && (previous.remoteEndpointId != source || previous.outgoing || previous.platformOrigin != currentSettings.platformOrigin)) return
-                if (sessionBindings.values.any { it.conversationId == conversationId }) {
+                val conversationId = event.payload.optString("conversation_id", sessionId)
+                val reconnect = conversationId != sessionId
+                val previous = record(conversationId)
+                if (offer.isBlank() || !validId(sessionId) || !validId(conversationId) ||
+                    reconnect && previous?.verified != true || previous?.verified == true && !reconnect || previous != null &&
+                    (previous.remoteEndpointId != source || !reconnect && (previous.visitor || previous.closed))) {
                     signaling.closeSession(sessionId, source)
                     return
                 }
-                when (admission.open(conversationId, reconnect = previous?.verified == true)) {
+                val existing = binding(conversationId)
+                if (existing != null) {
+                    // 双方同时重连时，编号较小的一方保留自己发出的 offer。
+                    if (!existing.initiator || existing.sessionId in authenticatedSessions || currentSettings.endpointId < source) {
+                        if (existing.sessionId != sessionId) signaling.closeSession(sessionId, source)
+                        return
+                    }
+                    disconnectSession(existing.sessionId, notify = true)
+                }
+                when (admission.open(conversationId, reconnect = reconnect)) {
                     is TunnelConversationAdmission.AdmissionResult.Accepted -> {
-                        sessionBindings[sessionId] = SessionBinding(sessionId, conversationId, source, outgoing = false)
-                        sessionBindings.getValue(sessionId).handshake.offer = offer
-                        conversationStates.putIfAbsent(conversationId, TunnelConversationState { currentSettings.maxAiReplies })
-                        conversationMetadata.putIfAbsent(conversationId, ConversationMetadata(source, outgoing = false, platformOrigin = currentSettings.platformOrigin))
-                        conversationMessages.putIfAbsent(conversationId, CopyOnWriteArrayList())
-                        sequence.putIfAbsent(conversationId, 0L)
+                        val conversation = previous ?: newConversation(conversationId, source, visitor = false)
+                        val attempt = SessionBinding(sessionId, conversation, initiator = false)
+                        attempt.handshake.offer = offer
+                        sessionBindings[sessionId] = attempt
                         val iceServers = event.payload.optJSONArray("ice_servers")?.let { array ->
                             runCatching { (0 until array.length()).map { index -> TunnelIceServer.fromJson(array.getJSONObject(index)) } }.getOrNull()
                         } ?: registration?.iceServers.orEmpty()
                         runCatching {
                             transportOrThrow().acceptIncoming(sessionId, source, offer, iceServers)
-                            expireNegotiation(sessionBindings.getValue(sessionId))
+                            expireNegotiation(attempt)
                         }.onFailure { disconnectSession(sessionId, notify = true) }
                         publishState(state.message)
                     }
@@ -387,7 +483,7 @@ class TunnelChatRuntime(
                     is TunnelConversationAdmission.AdmissionResult.Rejected -> signaling.closeSession(sessionId, source)
                 }
             }
-            "answer" -> if (sessionBindings[sessionId]?.let { it.remoteEndpointId == source && it.outgoing } == true) {
+            "answer" -> if (sessionBindings[sessionId]?.let { it.remoteEndpointId == source && it.initiator } == true) {
                 event.payload.optString("sdp").takeIf { it.isNotBlank() }?.let {
                     val binding = sessionBindings[sessionId] ?: return
                     if (binding.handshake.answer != null) return
@@ -409,7 +505,7 @@ class TunnelChatRuntime(
         when (event) {
             is WebRtcChatEvent.LocalOffer -> {
                 binding.handshake.offer = event.sdp
-                if (!signaling.sendOffer(event.sessionId, event.remoteEndpointId, event.sdp)) disconnectSession(event.sessionId)
+                if (!signaling.sendOffer(event.sessionId, event.remoteEndpointId, event.sdp, binding.conversationId)) disconnectSession(event.sessionId)
             }
             is WebRtcChatEvent.LocalAnswer -> {
                 binding.handshake.answer = event.sdp
@@ -442,9 +538,11 @@ class TunnelChatRuntime(
                 val proof = binding.handshake.prove(frame, identity)
                 if (proof != null && transport?.sendJson(binding.sessionId, proof) == true) return
             } else if (type == "proof" && binding.handshake.verify(frame, identity)) {
+                val conversation = record(binding.conversationId) ?: binding.conversation
+                if (!conversation.verified) save(conversation.copy(verified = true))
                 authenticatedSessions += binding.sessionId
-                conversationMetadata[binding.conversationId]?.verified = true
                 flushQueued(binding.conversationId)
+                if (conversation.closed) expireClosing(binding)
                 publishState(state.message)
                 return
             }
@@ -452,25 +550,55 @@ class TunnelChatRuntime(
             publishState("远端端点身份验证失败。")
             return
         }
+        val conversation = record(binding.conversationId) ?: return
         if (type == "ack") {
             runCatching { ChatAck.fromJson(frame) }.getOrNull()?.takeIf { it.conversationId == binding.conversationId }
                 ?.takeIf { it.status == ChatAck.Status.RECEIVED || it.status == ChatAck.Status.DUPLICATE }
-                ?.let { queue.acknowledge(it, binding.remoteEndpointId) }
+                ?.let {
+                    queue.acknowledge(it, binding.remoteEndpointId)
+                    if (conversation.closed && queue.snapshot().none { row -> row.message.conversationId == conversation.id &&
+                            matchesEndpoint(row, binding.remoteEndpointId) && row.message.isEnd() }) {
+                        disconnectSession(binding.sessionId, notify = true)
+                    }
+                }
             return
         }
         val message = runCatching { ChatMessage.fromJson(frame) }.getOrNull() ?: return
         if (message.conversationId != binding.conversationId || message.senderEndpointId != binding.remoteEndpointId) return
-        val permitted = if (binding.outgoing) {
+        if (message.isEnd()) {
+            val role = if (conversation.visitor) ChatSenderRole.ENDPOINT_USER else ChatSenderRole.VISITOR
+            if (message.senderRole != role) return
+            if (!conversation.closed) {
+                save(conversation.copy(closed = true, receivedMessageIds = rememberMessage(conversation, message.messageId)))
+                appendMessage(message, binding.remoteEndpointId)
+            }
+            signalingAck(binding, ChatAck(message.messageId, message.conversationId, ChatAck.Status.RECEIVED))
+            expireClosing(binding)
+            return
+        }
+        if (conversation.closed) return
+        val permitted = if (conversation.visitor) {
             (message.senderRole == ChatSenderRole.AI && message.kind in setOf(ChatMessageKind.AI_FORMAL, ChatMessageKind.CONVERSATION_EVENT)) ||
                 (message.senderRole == ChatSenderRole.ENDPOINT_USER && message.kind == ChatMessageKind.HUMAN_FORMAL)
         } else message.senderRole == ChatSenderRole.VISITOR && message.kind == ChatMessageKind.TEXT
         if (!permitted) return
+        if (message.messageId in conversation.receivedMessageIds) {
+            signalingAck(binding, ChatAck(message.messageId, message.conversationId, ChatAck.Status.DUPLICATE))
+            return
+        }
         val accepted = deduplicator.accept("${binding.remoteEndpointId}/${binding.conversationId}/${message.messageId}")
-        signalingAck(binding, ChatAck(message.messageId, message.conversationId, if (accepted) ChatAck.Status.RECEIVED else ChatAck.Status.DUPLICATE))
-        if (!accepted) return
+        if (!accepted) {
+            signalingAck(binding, ChatAck(message.messageId, message.conversationId, ChatAck.Status.DUPLICATE))
+            return
+        }
+        val nextConversation = conversation.copy(
+            mode = if (conversation.visitor && message.kind == ChatMessageKind.HUMAN_FORMAL) ConversationMode.HUMAN_HANDOVER else conversation.mode,
+            receivedMessageIds = rememberMessage(conversation, message.messageId),
+        )
+        save(nextConversation)
+        signalingAck(binding, ChatAck(message.messageId, message.conversationId, ChatAck.Status.RECEIVED))
         appendMessage(message, binding.remoteEndpointId)
-        if (binding.outgoing) conversationStates[message.conversationId]?.recordFormalMessage(message.kind, message.senderRole)
-        if (message.senderRole == ChatSenderRole.VISITOR && !binding.outgoing) scheduleAi(binding, message)
+        if (message.senderRole == ChatSenderRole.VISITOR && !conversation.visitor) scheduleAi(nextConversation, message)
     }
 
     private fun signalingAck(binding: SessionBinding, ack: ChatAck) {
@@ -478,7 +606,14 @@ class TunnelChatRuntime(
     }
 
     private fun update(next: TunnelChatRuntimeState) {
-        state = next.copy(activeConversations = sessionBindings.size, conversations = snapshots())
+        val pending = withdrawals().isNotEmpty()
+        val endpoint = next.endpoint?.let {
+            if (pending && currentSettings.publication == TunnelPublication.HIDDEN) {
+                it.copy(publication = TunnelPublication.PUBLISHED, online = false)
+            } else it
+        }
+        state = next.copy(activeConversations = sessionBindings.size, conversations = snapshots(),
+            endpoint = endpoint, pendingWithdrawal = pending)
         listeners.forEach { it(state) }
     }
 
@@ -494,69 +629,79 @@ class TunnelChatRuntime(
         publishState(state.message)
     }
 
-    private fun scheduleAi(binding: SessionBinding, message: ChatMessage) {
+    private fun rememberMessage(conversation: TunnelConversation, messageId: String): List<String> =
+        (conversation.receivedMessageIds + messageId).takeLast(10_000)
+
+    private fun TunnelConversation.canReply() = canReply(currentSettings.maxAiReplies)
+
+    private fun scheduleAi(conversation: TunnelConversation, message: ChatMessage) {
         val text = message.payload.optString("text").takeIf { it.isNotBlank() } ?: return
-        val state = conversationStates[message.conversationId] ?: return
-        val formal = state.canGenerateAiFormalReply()
-        if (!formal && state.mode == ConversationMode.AI) {
-            notifyWaitingHuman(binding, state)
-            return
-        }
         val responder = aiResponder ?: return
-        val suggestion = !formal && state.mode == ConversationMode.HUMAN_HANDOVER
-        if (!formal && !suggestion) return
-        aiWorker.execute {
-            if (!engineReady || sessionBindings[binding.sessionId] !== binding) return@execute
-            val request = TunnelChatAiRequest(message.conversationId, binding.remoteEndpointId, text.take(4_000), formal)
-            val reply = runCatching { responder(request) }.getOrNull()?.trim().orEmpty()
-            if (reply.isBlank()) return@execute
-            onWorker {
-                if (!engineReady || sessionBindings[binding.sessionId] !== binding) return@onWorker
-                runCatching {
-                    if (formal && sendAiFormalText(message.conversationId, reply.take(4_000)) != null) return@runCatching
-                    if (state.mode == ConversationMode.HUMAN_HANDOVER) {
-                        val internal = textMessage(message.conversationId, reply.take(4_000), ChatSenderRole.AI, ChatMessageKind.AI_SUGGESTION)
-                        appendMessage(internal, currentSettings.endpointId)
+        val scope = key(conversation.id)
+        val sessionKey = UUID.nameUUIDFromBytes(JSONArray(listOf(conversation.platformOrigin, conversation.localEndpointId,
+            conversation.remoteEndpointId, conversation.id)).toString().toByteArray(Charsets.UTF_8)).toString()
+        try {
+            aiWorker.execute {
+                val reception = synchronized(this) {
+                    if (!engineReady || !currentSettings.enabled || key(conversation.id) != scope) return@execute
+                    val live = record(conversation.id)?.takeUnless { it.closed } ?: return@execute
+                    if (!live.canReply() && live.mode == ConversationMode.AI) {
+                        onWorker { record(conversation.id)?.takeIf { key(it.id) == scope }?.let(::notifyWaitingHuman) }
+                        return@execute
                     }
-                }.onFailure { publishState("AI 回复未能加入待发队列。") }
+                    live.mode
+                }
+                val formal = reception == ConversationMode.AI
+                val request = TunnelChatAiRequest(sessionKey, conversation.remoteEndpointId, text.take(4_000), formal)
+                val reply = runCatching { responder(request) }.getOrNull()?.trim().orEmpty()
+                onWorker {
+                    if (!engineReady || !currentSettings.enabled || key(conversation.id) != scope) return@onWorker
+                    val live = record(conversation.id)?.takeUnless { it.closed } ?: return@onWorker
+                    if (reply.isBlank()) {
+                        publishState(if (formal) "AI 回复失败，端点用户仍可回复。" else "未能生成 AI 内部建议。")
+                        return@onWorker
+                    }
+                    runCatching {
+                        if (formal && live.canReply()) sendAiFormalText(live, reply.take(4_000))
+                        else if (live.mode == ConversationMode.HUMAN_HANDOVER) {
+                            val internal = textMessage(live, reply.take(4_000), ChatSenderRole.AI, ChatMessageKind.AI_SUGGESTION)
+                            appendMessage(internal, currentSettings.endpointId)
+                        }
+                    }.onFailure { publishState("AI 回复未能加入待发队列。") }
+                }
             }
+        } catch (_: RejectedExecutionException) {
+            publishState("AI 接待繁忙，端点用户仍可回复。")
         }
     }
 
-    private fun notifyWaitingHuman(binding: SessionBinding, conversation: TunnelConversationState) {
-        if (!conversation.markWaitingHumanIfNeeded()) return
-        val event = conversationEvent(binding.conversationId, "waiting_human", "AI 正式回复已达上限，等待人工回复。")
-        enqueue(event)
-        appendMessage(event, currentSettings.endpointId)
-        flushQueued(binding.conversationId)
+    private fun notifyWaitingHuman(conversation: TunnelConversation) {
+        if (conversation.closed || conversation.mode != ConversationMode.AI || conversation.canReply() || conversation.waitingNotified) return
+        val message = textMessage(conversation, "AI 正式回复已达上限，等待人工回复。", ChatSenderRole.AI, ChatMessageKind.CONVERSATION_EVENT)
+        message.payload.put("event", "waiting_human")
+        if (enqueue(message, conversation.copy(waitingNotified = true), allowFull = true)) {
+            appendMessage(message, currentSettings.endpointId)
+            flushQueued(conversation.id)
+        }
     }
 
-    private fun conversationEvent(conversationId: String, name: String, text: String): ChatMessage = ChatMessage(
-        messageId = UUID.randomUUID().toString(),
-        conversationId = conversationId,
-        seq = nextSequence(conversationId),
-        senderRole = ChatSenderRole.AI,
-        senderEndpointId = currentSettings.endpointId,
-        kind = ChatMessageKind.CONVERSATION_EVENT,
-        createdAt = System.currentTimeMillis(),
-        payload = JSONObject().put("event", name).put("text", text),
-    )
-
-    private fun snapshots(): List<TunnelChatConversationSnapshot> = conversationStates.keys
-        .union(conversationMessages.keys)
-        .mapNotNull { conversationId ->
-            val meta = conversationMetadata[conversationId] ?: return@mapNotNull null
-            val binding = sessionBindings.values.firstOrNull { it.conversationId == conversationId }
+    private fun snapshots(): List<TunnelChatConversationSnapshot> = (if (!currentSettings.enabled) emptyList() else records.values
+        .filter { it.platformOrigin == currentSettings.platformOrigin && it.localEndpointId == currentSettings.endpointId })
+        .map { conversation ->
+            val binding = binding(conversation.id)
+            val connected = binding != null && binding.sessionId in authenticatedSessions
             TunnelChatConversationSnapshot(
-                conversationId = conversationId,
-                remoteEndpointId = meta.remoteEndpointId,
-                outgoing = meta.outgoing,
-                connected = binding != null && binding.sessionId in authenticatedSessions,
-                mode = conversationStates[conversationId]?.mode ?: ConversationMode.AI,
-                aiRepliesSent = conversationStates[conversationId]?.aiRepliesSent ?: 0,
-                messages = conversationMessages[conversationId]?.toList().orEmpty(),
+                conversationId = conversation.id,
+                remoteEndpointId = conversation.remoteEndpointId,
+                outgoing = conversation.visitor,
+                connected = !conversation.closed && connected,
+                connecting = !conversation.closed && binding != null && !connected,
+                closed = conversation.closed,
+                mode = conversation.mode,
+                aiRepliesSent = conversation.aiRepliesSent,
+                messages = conversationMessages[conversation.id]?.toList().orEmpty(),
             )
-        }.filter { conversationMetadata[it.conversationId]?.platformOrigin == currentSettings.platformOrigin }.sortedBy { it.conversationId }
+        }.sortedBy { it.conversationId }
 
     private fun disconnectSession(sessionId: String, notify: Boolean = false) {
         val binding = sessionBindings.remove(sessionId) ?: return
@@ -574,6 +719,14 @@ class TunnelChatRuntime(
                 publishState("聊天连接超时，待发消息将重试。")
             }
         } }, 25, TimeUnit.SECONDS)
+    }
+
+    private fun expireClosing(binding: SessionBinding) {
+        if (binding.closing) return
+        binding.closing = true
+        retryScheduler.schedule({ onWorker {
+            if (sessionBindings[binding.sessionId] === binding) disconnectSession(binding.sessionId, notify = true)
+        } }, 10, TimeUnit.SECONDS)
     }
 
     private fun sendHello(binding: SessionBinding): Boolean {
@@ -605,12 +758,12 @@ class TunnelChatRuntime(
 
     private fun validId(value: String): Boolean = value.matches(Regex("[A-Za-z0-9][A-Za-z0-9._:-]{0,127}"))
 
-    private class SessionBinding(val sessionId: String, val conversationId: String, val remoteEndpointId: String, val outgoing: Boolean) {
-        val handshake = TunnelPeerHandshake(remoteEndpointId, sessionId, outgoing)
+    private class SessionBinding(val sessionId: String, val conversation: TunnelConversation, val initiator: Boolean) {
+        val conversationId get() = conversation.id
+        val remoteEndpointId get() = conversation.remoteEndpointId
+        val handshake = TunnelPeerHandshake(remoteEndpointId, sessionId, initiator, conversationId)
         var helloSent = false
-    }
-    private class ConversationMetadata(val remoteEndpointId: String, val outgoing: Boolean, val platformOrigin: String) {
-        @Volatile var verified = false
+        var closing = false
     }
 
     private fun WebRtcChatEvent.sessionId(): String = when (this) {
