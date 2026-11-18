@@ -388,6 +388,11 @@ export function voiceSession(ctx, host = policyHost) {
         if (typeof run.session !== 'string' || !/^[A-Za-z0-9._:-]{1,128}$/.test(run.session)) throw new Error('语音会话编号无效。');
         await run.onEvent?.({ session: run.session, text: '' });
         if (run.cancelled) throw new Error('语音对话已取消。');
+        // 访客会话标识由 Android 宿主分配，首次消息到来时才创建对应会话。
+        if (run.session.startsWith('tunnel:') && !(await ctx.sessionPersistence.stat(run.session))) {
+          await ctx.sessionController.create({ sessionId: run.session });
+        }
+        if (run.cancelled) throw new Error('语音对话已取消。');
         const agent = await ctx.sessionController.commands.resolveAgent(run.session);
         run.agent = agent;
         if (run.cancelled) throw new Error('语音对话已取消。');

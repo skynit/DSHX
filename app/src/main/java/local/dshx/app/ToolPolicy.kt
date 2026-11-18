@@ -1,6 +1,6 @@
 package local.dshx.app
 
-/** Live session registry owned by the Android host. All registered sessions use Full. */
+/** Android 宿主维护的实时会话权限表；穿透 AI 会话默认使用独立的受限模式。 */
 class ToolPolicy(private val changed: () -> Unit = {}) {
     data class Session(val id: String, val title: String, val root: String, val mode: String, val parent: String?)
     data class State(val instance: String? = null, val connected: Boolean = false, val sessions: List<Session> = emptyList(), val revision: Long = 0)
@@ -36,7 +36,8 @@ class ToolPolicy(private val changed: () -> Unit = {}) {
         require(id in owners || owners.size < 256) { "本次运行会话数量已达上限，请结束工作区后重试" }
         val label = title.replace(Regex("[\\p{Cc}\\p{Cf}]"), " ").trim().take(100).ifBlank { "未命名会话" }
         owners[id] = binding
-        val session = Session(id, label, root, FULL, parent)
+        val mode = if (id.startsWith("tunnel:") || owner?.mode == TUNNEL) TUNNEL else FULL
+        val session = Session(id, label, root, mode, parent)
         if (old != session) publish(state.copy(sessions = state.sessions.filterNot { it.id == id } + session))
         return session.mode
     }
@@ -64,6 +65,7 @@ class ToolPolicy(private val changed: () -> Unit = {}) {
 
     companion object {
         const val FULL = "full"
+        const val TUNNEL = "tunnel"
         private fun validId(id: String) = id.matches(Regex("[A-Za-z0-9._:-]{1,128}"))
     }
 }

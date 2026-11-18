@@ -58,6 +58,7 @@ internal fun SettingsContent(
     backupPicking: Boolean, onBackup: (Boolean) -> Unit,
     onPage: (AppPage) -> Unit, onLibrary: () -> Unit,
     onHostingSession: (String) -> Unit,
+    tunnelChat: TunnelChatRuntime, tunnelChatState: TunnelChatRuntimeState,
     onApps: (String, JSONObject) -> JSONObject,
     onCreateApp: (JSONObject) -> JSONObject,
 ) {
@@ -74,6 +75,8 @@ internal fun SettingsContent(
                 LinkRow("任务分工", "${if (voice.local) "已开启" else "未开启"} · 简单任务与截图识别", { onPage(AppPage.Tasks) })
                 Divider()
                 LinkRow("手机操作与权限", "屏幕操作、悬浮提示与通知", { onPage(AppPage.Permissions) })
+                Divider()
+                LinkRow("穿透聊天", tunnelChatState.message, { onPage(AppPage.TunnelChat) })
                 Divider()
                 LinkRow("实验体", "触发日志与培养设置", { onPage(AppPage.Hosting) })
                 Divider()
@@ -101,6 +104,7 @@ internal fun SettingsContent(
         AppPage.VoiceOptions -> VoiceSettings(voice, state, action)
         AppPage.Tasks -> SmallModelSettings(voice, state, action)
         AppPage.Permissions -> PhoneSettings(phone, phoneRevision, permission)
+        AppPage.TunnelChat -> TunnelChatSettingsContent(tunnelChat, tunnelChatState)
         AppPage.Apps -> AppsSettings(engine.url != null, phoneRevision, onApps, onCreateApp, onHostingSession, permission,
             back = { onPage(AppPage.Settings) })
         AppPage.Backup -> BackupSettings(engine, backupPicking, onStop, onBackup)
@@ -140,6 +144,90 @@ private fun UpdateSettings() {
                 Text(state.notes, fontSize = 14.sp, lineHeight = 23.sp)
             } else Note(if (state.notesError != null) "更新说明暂时无法加载，请重新检查更新。" else "重新检查更新可查看更新说明。")
         }
+    }
+}
+
+@Composable
+private fun TunnelChatSettingsContent(runtime: TunnelChatRuntime, runtimeState: TunnelChatRuntimeState) {
+    val initial = remember(runtime.settings().endpointId) { runtime.settings() }
+    val displayName = rememberTextFieldState(initial.displayName)
+    val introduction = rememberTextFieldState(initial.publicIntroduction)
+    val platform = rememberTextFieldState(initial.platformOrigin)
+    val interval = rememberTextFieldState((initial.newConversationIntervalMs / 1_000L).toString())
+    val maxReplies = rememberTextFieldState(initial.maxAiReplies.toString())
+    var saved by remember { mutableStateOf(initial) }
+    var enabled by remember { mutableStateOf(initial.enabled) }
+    var publication by remember { mutableStateOf(initial.publication) }
+    var acceptance by remember { mutableStateOf(initial.acceptance) }
+    var message by rememberSaveable { mutableStateOf<String?>(null) }
+    var error by rememberSaveable { mutableStateOf<String?>(null) }
+
+    fun save() {
+        val seconds = interval.text.toString().trim().toLongOrNull()
+        val replies = maxReplies.text.toString().trim().toIntOrNull()
+        if (seconds == null || replies == null) {
+            error = "限频和 AI 回复上限必须填写整数。"
+            message = null
+            return
+        }
+        val next = saved.copy(
+            enabled = enabled,
+            platformOrigin = platform.text.toString(),
+            displayName = displayName.text.toString(),
+            publicIntroduction = introduction.text.toString(),
+            publication = publication,
+            acceptance = acceptance,
+            newConversationIntervalMs = seconds * 1_000L,
+            maxAiReplies = replies,
+        )
+        runCatching { runtime.saveSettings(next) }.onSuccess {
+            saved = it
+            message = "穿透聊天设置已保存。"
+            error = null
+        }.onFailure {
+            error = it.message ?: "设置保存失败，请检查后重试。"
+            message = null
+        }
+    }
+
+    Note("端点公开后，已登记到同一穿透平台的 DSHX 客户端都可以发现并尝试连接。平台只负责目录、认证和信令，不保存聊天正文。")
+    Section("公共端点")
+    Panel(padding = 0) {
+        SettingsRow("端点状态", runtimeState.message) {}
+        Divider()
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            SettingsTitle("接收新聊天")
+            SettingsOptions(if (enabled) "on" else "off", listOf("on" to "开启", "off" to "关闭")) { enabled = it == "on" }
+            AssistantField("公开名称", displayName, 80, false, 1, "留空时使用端点编号")
+            AssistantField("dsh 身份介绍", introduction, 2_000, false, 4, "告诉访客这个端点由谁接待、擅长什么")
+            AssistantField("穿透平台", platform, 256, false, 1, TunnelChatProtocol.DEFAULT_PLATFORM_ORIGIN)
+            SettingsTitle("发布状态")
+            SettingsOptions(publication.name.lowercase(), listOf("published" to "公开目录", "hidden" to "隐身，不可发现")) {
+                publication = if (it == "published") TunnelPublication.PUBLISHED else TunnelPublication.HIDDEN
+            }
+            SettingsTitle("新聊天接收")
+            SettingsOptions(acceptance.name.lowercase(), listOf("accepting" to "接受", "paused" to "暂停")) {
+                acceptance = if (it == "accepting") TunnelAcceptance.ACCEPTING else TunnelAcceptance.PAUSED
+            }
+            AssistantField("新聊天最小间隔（秒）", interval, 6, false, 1, "默认 5 秒；已有聊天不受影响")
+            AssistantField("每个会话最多 AI 正式回复", maxReplies, 4, false, 1, "默认 10 条；人工正式发言后 AI 自动回复暂停")
+        }
+    }
+    Section("远端能力")
+    Panel(padding = 0) {
+        Column(Modifier.padding(16.dp)) {
+            Note("本地记忆、知识库、本地文件、Phone control 均未接入。")
+        }
+    }
+    Section("应用")
+    Panel {
+        Text("端点编号：${saved.endpointId}", fontSize = 13.sp)
+        Spacer(Modifier.height(12.dp))
+        Action("保存并应用", ::save, primary = true, icon = Lucide.Save)
+        SettingsFeedback(message, error)
+    }
+    androidx.compose.runtime.key(saved.platformOrigin) {
+        TunnelChatDirectoryAndConversations(runtime, runtimeState, saved.platformOrigin)
     }
 }
 

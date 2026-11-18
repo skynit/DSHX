@@ -51,6 +51,8 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
 import android.content.ContextWrapper
 import android.content.res.AssetManager
 import kotlinx.coroutines.Dispatchers
@@ -64,6 +66,268 @@ import kotlinx.coroutines.withTimeout
 @Config(sdk = [34])
 class CoreTest {
     @get:Rule val folder = TemporaryFolder()
+
+    @Test fun tunnelChatSettingsUsePublicEndpointAndTenAiRepliesByDefault() {
+        val settings = TunnelChatSettings().validate()
+
+        assertFalse(settings.enabled)
+        assertEquals(TunnelChatProtocol.DEFAULT_PLATFORM_ORIGIN, settings.platformOrigin)
+        assertEquals(TunnelPublication.PUBLISHED, settings.publication)
+        assertEquals(TunnelAcceptance.ACCEPTING, settings.acceptance)
+        assertEquals(5_000L, settings.newConversationIntervalMs)
+        assertEquals(8, settings.maxActiveConversations)
+        assertEquals(10, settings.maxAiReplies)
+        assertFalse(settings.remoteMemoryEnabled)
+        assertFalse(settings.remoteKnowledgeEnabled)
+        assertFalse(settings.remoteFilesEnabled)
+        assertFalse(settings.phoneControlEnabled)
+    }
+
+    @Test fun tunnelChatAdmissionLimitsOnlyNewConversationsAndHonorsHiddenPauseAndCapacity() {
+        var settings = TunnelChatSettings(newConversationIntervalMs = 5_000L, maxActiveConversations = 1)
+        val admission = TunnelConversationAdmission { settings }
+
+        assertEquals(TunnelConversationAdmission.AdmissionResult.Accepted(false), admission.open("conversation-1", now = 0L))
+        assertEquals(TunnelConversationAdmission.AdmissionResult.Accepted(true), admission.open("conversation-1", now = 1_000L))
+        assertEquals(TunnelConversationAdmission.AdmissionResult.RateLimited(4_000L), admission.open("conversation-2", now = 1_000L))
+        admission.close("conversation-1")
+        assertEquals(TunnelConversationAdmission.AdmissionResult.RateLimited(4_000L), admission.open("conversation-2", now = 1_000L))
+        assertEquals(TunnelConversationAdmission.AdmissionResult.Accepted(false), admission.open("conversation-2", now = 5_000L))
+
+        settings = settings.copy(acceptance = TunnelAcceptance.PAUSED)
+        admission.close("conversation-2")
+        assertEquals(TunnelConversationAdmission.AdmissionResult.Accepted(true), admission.open("conversation-2", now = 5_001L, reconnect = true))
+        assertEquals(TunnelConversationAdmission.AdmissionResult.Rejected("endpoint_not_accepting"), admission.open("conversation-3", now = 5_001L))
+
+        settings = settings.copy(publication = TunnelPublication.HIDDEN)
+        admission.close("conversation-2")
+        assertEquals(TunnelConversationAdmission.AdmissionResult.Rejected("endpoint_not_accepting"), admission.open("conversation-3", now = 10_000L))
+    }
+
+    @Test fun tunnelChatConversationSwitchesToHumanHandoverAndRespectsReplyLimit() {
+        val state = TunnelConversationState { 2 }
+
+        assertThrows(IllegalStateException::class.java) { state.recordAiFormalReply { error("queue full") } }
+        assertEquals(0, state.aiRepliesSent)
+        assertTrue(state.recordAiFormalReply {})
+        assertTrue(state.recordAiFormalReply {})
+        assertFalse(state.recordAiFormalReply {})
+        state.recordFormalMessage(ChatMessageKind.HUMAN_FORMAL, ChatSenderRole.ENDPOINT_USER)
+        assertEquals(ConversationMode.HUMAN_HANDOVER, state.mode)
+        assertFalse(state.recordAiFormalReply {})
+        state.resumeAi()
+        assertFalse(state.recordAiFormalReply {})
+    }
+
+    @Test fun tunnelChatMarksTheReplyLimitAsWaitingForHumanOnlyOnce() {
+        val state = TunnelConversationState { 1 }
+
+        assertTrue(state.recordAiFormalReply {})
+        assertTrue(state.markWaitingHumanIfNeeded())
+        assertFalse(state.markWaitingHumanIfNeeded())
+        state.recordFormalMessage(ChatMessageKind.HUMAN_FORMAL, ChatSenderRole.ENDPOINT_USER)
+        assertFalse(state.markWaitingHumanIfNeeded())
+    }
+
+    @Test fun tunnelEngineSessionsUseRestrictedToolMode() {
+        val policy = ToolPolicy()
+        policy.begin("first")
+        policy.connected("first")
+
+        assertEquals(ToolPolicy.TUNNEL, policy.register("first", "tunnel:conversation", "穿透聊天", null))
+        assertEquals(ToolPolicy.TUNNEL, policy.mode("first", "tunnel:conversation"))
+        assertEquals(ToolPolicy.TUNNEL, policy.register("first", "child", "子会话", "tunnel:conversation"))
+        assertEquals(ToolPolicy.FULL, policy.register("first", "local-session", "本地会话", null))
+    }
+
+    @Test fun tunnelChatMessagesRoundTripAndRejectDisallowedAttachments() {
+        val message = ChatMessage(
+            messageId = "message-1",
+            conversationId = "conversation-1",
+            seq = 3,
+            senderRole = ChatSenderRole.VISITOR,
+            senderEndpointId = "endpoint-visitor",
+            kind = ChatMessageKind.FILE,
+            createdAt = 1_700_000_000_000L,
+            payload = JSONObject().put("attachment", ChatAttachment(
+                attachmentId = "attachment-1",
+                name = "notes.md",
+                mimeType = "text/markdown",
+                size = 12,
+                sha256 = "a".repeat(64),
+            ).toJson()),
+        )
+
+        val decoded = ChatMessage.fromJson(message.toJson())
+        assertEquals(message.messageId, decoded.messageId)
+        assertEquals(message.conversationId, decoded.conversationId)
+        assertEquals(message.kind, decoded.kind)
+        assertEquals("notes.md", decoded.payload.getJSONObject("attachment").getString("name"))
+        assertThrows(IllegalArgumentException::class.java) {
+            ChatAttachment("attachment-2", "archive.zip", "application/zip", 1, "b".repeat(64)).validate()
+        }
+    }
+
+    @Test fun tunnelChatUsesCwnasSignalingAndRequiresValidAckIdentity() {
+        assertEquals("cwnas-webrtc-signaling", TunnelChatProtocol.SIGNALING)
+        val ack = ChatAck("message-1", "conversation-1", ChatAck.Status.RECEIVED, nextExpectedSeq = 4)
+        assertEquals(ack, ChatAck.fromJson(ack.toJson()))
+        assertThrows(IllegalArgumentException::class.java) {
+            ChatAck("message/1", "conversation-1", ChatAck.Status.RECEIVED)
+        }
+    }
+
+    @Test fun tunnelChatProofMatchesOnlyTheExpectedPeerAndNegotiation() {
+        fun identity(): TunnelEndpointIdentity {
+            val pair = java.security.KeyPairGenerator.getInstance("EC").apply { initialize(256) }.generateKeyPair()
+            return object : TunnelEndpointIdentity {
+                override val publicKey = pair.public.encoded
+                override val endpointId = TunnelPeerHandshake.endpointId(publicKey)
+                override fun sign(value: ByteArray): ByteArray = java.security.Signature.getInstance("SHA256withECDSA").run {
+                    initSign(pair.private); update(value); sign()
+                }
+            }
+        }
+        val alice = identity()
+        val bob = identity()
+        fun handshake(remote: TunnelEndpointIdentity, outgoing: Boolean, sdp: String = "answer") =
+            TunnelPeerHandshake(remote.endpointId, "conversation", outgoing).apply { offer = "offer"; answer = sdp }
+        val sender = handshake(bob, true)
+        val receiver = handshake(alice, false)
+        val outbound = checkNotNull(sender.prove(receiver.hello(), alice))
+        val inbound = checkNotNull(receiver.prove(sender.hello(), bob))
+        assertTrue(sender.verify(inbound, alice))
+        assertTrue(receiver.verify(outbound, bob))
+        receiver.answer = "changed-sdp"
+        assertFalse(receiver.verify(outbound, bob))
+        receiver.answer = "answer"
+        assertFalse(receiver.verify(outbound, identity()))
+        val nextConnection = handshake(alice, false)
+        nextConnection.prove(sender.hello(), bob)
+        assertFalse(nextConnection.verify(outbound, bob))
+    }
+
+    @Test fun tunnelSignalingRegisterSendsNoEndpointEnvelopeAndChecksRouteReceipt() {
+        val register = AtomicReference<JSONObject>()
+        val registered = CountDownLatch(1)
+        val identity = object : TunnelEndpointIdentity {
+            override val endpointId = "test-route"
+            override val publicKey = byteArrayOf(1)
+            override fun sign(value: ByteArray) = value
+        }
+        MockWebServer().use { server ->
+            server.enqueue(MockResponse().withWebSocketUpgrade(object : okhttp3.WebSocketListener() {
+                override fun onMessage(webSocket: okhttp3.WebSocket, text: String) {
+                    val request = JSONObject(text)
+                    register.set(request)
+                    webSocket.send(JSONObject().put("protocol", TunnelChatProtocol.SIGNALING).put("version", 1)
+                        .put("type", "register_ok").put("reply_to", request.getString("message_id"))
+                        .put("source", JSONObject().put("kind", "platform").put("id", "platform"))
+                        .put("destination", JSONObject().put("kind", "endpoint").put("id", identity.endpointId))
+                        .put("payload", JSONObject().put("registered_route_ids", org.json.JSONArray(listOf(identity.endpointId)))
+                            .put("connection_id", "connection")).toString())
+                }
+                override fun onClosing(webSocket: okhttp3.WebSocket, code: Int, reason: String) { webSocket.close(1000, null) }
+            }))
+            TunnelSignalingClient().use { client ->
+                client.connect(server.url(TunnelChatProtocol.SIGNALING_PATH).toString(), TunnelChatSettings(endpointId = identity.endpointId), identity, "directory-ticket") {
+                    if (it is TunnelSignalingEvent.Registered) registered.countDown()
+                }
+                assertTrue(registered.await(5, TimeUnit.SECONDS))
+                val sent = register.get()
+                assertEquals("register", sent.getString("type"))
+                assertFalse(sent.has("source"))
+                assertFalse(sent.has("destination"))
+                assertEquals(identity.endpointId, sent.getJSONObject("payload").getJSONArray("routes").getJSONObject(0).getString("id"))
+                assertEquals("Bearer directory-ticket", server.takeRequest(5, TimeUnit.SECONDS)?.getHeader("Authorization"))
+            }
+        }
+    }
+
+    @Test fun tunnelChatQueueKeepsOriginalIdsAcrossRestartAndRetriesEncryptedAtRest() {
+        val file = folder.newFile("outbox.json")
+        val cipher = FixedTunnelChatQueueCipher(ByteArray(32) { it.toByte() })
+        val settings = TunnelChatSettings(queueMaxAgeMs = 60_000L, endpointId = "endpoint-visitor")
+        val message = ChatMessage.text("conversation-1", 1, ChatSenderRole.VISITOR, "endpoint-visitor", "hello", now = 1_000L)
+        val first = TunnelChatQueueStore(file, cipher) { settings }
+
+        assertTrue(first.enqueue(message, "endpoint-receiver", now = 1_000L))
+        assertTrue(file.readText().isNotEmpty())
+        assertFalse(file.readText().contains("hello"))
+
+        val second = TunnelChatQueueStore(file, cipher) { settings }
+        assertEquals(listOf(message.messageId), second.due(now = 1_000L).map { it.message.messageId })
+        assertEquals("endpoint-receiver", second.snapshot().single().targetEndpointId)
+        assertEquals(settings.platformOrigin, second.snapshot().single().platformOrigin)
+        second.markAttempt(message.messageId, now = 1_000L, delayMs = 500L)
+        assertTrue(second.due(now = 1_200L).isEmpty())
+        assertEquals(listOf(message.messageId), second.due(now = 1_500L).map { it.message.messageId })
+        val ack = ChatAck(message.messageId, message.conversationId, ChatAck.Status.RECEIVED)
+        second.acknowledge(ack.copy(conversationId = "wrong-conversation"), "endpoint-receiver")
+        second.acknowledge(ack, "wrong-endpoint")
+        assertEquals(1, second.snapshot().size)
+        second.acknowledge(ack, "endpoint-receiver")
+        assertTrue(second.snapshot().isEmpty())
+    }
+
+    @Test fun tunnelPlatformClientUsesPublicDirectoryAndRegistrationContract() {
+        val server = MockWebServer()
+        val challenge = "A".repeat(43)
+        server.start()
+        try {
+            server.enqueue(MockResponse().setResponseCode(200).setBody(JSONObject()
+                .put("items", org.json.JSONArray().put(JSONObject()
+                    .put("endpointId", "endpoint-remote")
+                    .put("displayName", "公开端点")
+                    .put("publicIntroduction", "远端 dsh")
+                    .put("publication", "published")
+                    .put("acceptance", "accepting")
+                    .put("online", true)
+                    .put("maxAiReplies", 10)
+                    .put("capabilities", org.json.JSONArray().put("text"))))
+                .put("nextCursor", "next").toString()))
+            server.enqueue(MockResponse().setResponseCode(200).setBody(JSONObject().put("challenge", challenge).toString()))
+            server.enqueue(MockResponse().setResponseCode(200).setBody(JSONObject()
+                .put("signalingUrl", server.url("/api/v1/signaling").toString().replace("http://", "ws://"))
+                .put("registrationToken", "registration-token")
+                .put("connectionId", "connection-1")
+                .put("endpoint", JSONObject()
+                    .put("endpointId", "endpoint-local")
+                    .put("displayName", "本地端点")
+                    .put("publicIntroduction", "本地 dsh")
+                    .put("publication", "published")
+                    .put("acceptance", "accepting")
+                    .put("capabilities", org.json.JSONArray().put("text"))).toString()))
+
+            val client = TunnelPlatformClient(server.url("/").toString())
+            val page = client.listPublicEndpoints()
+            assertEquals("endpoint-remote", page.items.single().endpointId)
+            assertEquals("next", page.nextCursor)
+            assertEquals("/api/v1/dshx/chat/endpoints?limit=50", server.takeRequest().path)
+
+            val identity = object : TunnelEndpointIdentity {
+                override val endpointId = "endpoint-local"
+                override val publicKey = byteArrayOf(1, 2, 3)
+                override fun sign(value: ByteArray) = value
+            }
+            val registration = client.registerEndpoint(TunnelChatSettings(endpointId = identity.endpointId), identity)
+            assertEquals("endpoint-local", registration.endpoint.endpointId)
+            assertEquals("registration-token", registration.registrationToken)
+            val challengeRequest = server.takeRequest()
+            assertEquals("POST", challengeRequest.method)
+            assertEquals("/api/v1/dshx/chat/endpoints/register/challenge", challengeRequest.path)
+            val request = server.takeRequest()
+            assertEquals("PUT", request.method)
+            assertEquals("/api/v1/dshx/chat/endpoints/register", request.path)
+            val body = request.body.readUtf8()
+            assertEquals("endpoint-local", JSONObject(body).getString("endpointId"))
+            assertEquals(challenge, request.getHeader("X-DSHX-Challenge"))
+            val signed = java.util.Base64.getUrlDecoder().decode(request.getHeader("X-DSHX-Signature"))
+            assertEquals("dshx-platform-register/1\n$challenge\n$body", signed.toString(Charsets.UTF_8))
+        } finally {
+            server.shutdown()
+        }
+    }
 
     @Test fun enginePreservesAndroidBootPathsWithoutForwardingCredentialsOrInjection() {
         val boot = "/apex/com.android.art/javalib/core-oj.jar:/system/framework/framework.jar"

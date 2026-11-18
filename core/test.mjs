@@ -4295,22 +4295,28 @@ test('voice host cleans up real voice runs on synchronous asynchronous send fail
   }
 });
 
-async function voiceStreamFixture() {
+async function voiceStreamFixture({ sessionId = 'stream-session' } = {}) {
   const { voiceSession } = await import(pathToFileURL(join(core, 'voice.mjs')));
   const handlers = new Map(), admitted = Promise.withResolvers();
-  const signal = new AbortController(), session = { id: 'stream-session' };
+  const signal = new AbortController(), session = { id: sessionId };
   const original = { provider: 'original', model: 'one' }, selection = { current: original };
   let cancellations = 0;
+  let created = false;
   const agent = { status: 'idle', session, inbox: { nextTurn: [], nextStep: [], hasPending: false,
     remove(id) { this.nextTurn = this.nextTurn.filter(message => message.id !== id); } },
     cancel() { cancellations++; signal.abort(); } };
   const emit = (name, ...args) => handlers.get(name)?.(...args);
   const voice = voiceSession({
     on(name, handler) { handlers.set(name, handler); return () => handlers.delete(name); },
+    sessionPersistence: { stat: async () => created ? { header: session } : undefined },
     sessionController: {
+      async create({ sessionId }) { assert.equal(sessionId, session.id); created = true; return { sessionId }; },
       agents: { selectionFor: () => selection, selectForNextRequest(_agent, value) { selection.current = value; } },
       commands: {
-        resolveAgent: async () => agent,
+        resolveAgent: async () => {
+          if (session.id.startsWith('tunnel:')) assert.ok(created);
+          return agent;
+        },
         prompt: async (request, source) => {
           emit('agent/inbox/claimed', { agent, message: { role: 'user', content: request.content, source }, turn: 7 });
           emit('agent/request', { agent, turn: 7, signal: signal.signal }, () => {});
@@ -4330,6 +4336,23 @@ async function voiceStreamFixture() {
     cancellations: () => cancellations,
     prompt: (onEvent, interaction = 'stream') => voice.call('prompt', { session: session.id, interaction, text: '你好', local: true }, onEvent) };
 }
+
+test('tunnel chat creates the named visitor session and blocks tools', async () => {
+  const { toolAvailable, runTool } = await import(pathToFileURL(join(core, 'policy.mjs')));
+  const f = await voiceStreamFixture({ sessionId: 'tunnel:visitor' });
+  try {
+    const response = f.prompt(undefined, 'tunnel-test');
+    await Promise.race([f.admitted.promise, response]);
+    for (const name of ['read', 'bash', 'phone_observe', 'memory_search', 'knowledge_search', 'app_create', 'engine_logs']) {
+      assert.equal(toolAvailable(name, f.agent), false);
+      await assert.rejects(runTool({ name, agent: f.agent }, () => assert.fail('visitor tool executed')));
+    }
+    f.end();
+    assert.equal((await response).text, '最终回答');
+  } finally {
+    f.voice.close();
+  }
+});
 
 test('voice incremental output filters real stream frames by agent turn attempt and text channel', async () => {
   const f = await voiceStreamFixture(), events = [];

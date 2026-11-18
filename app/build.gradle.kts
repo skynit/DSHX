@@ -69,6 +69,7 @@ dependencies {
     implementation("com.android.tools.build:apksig:8.5.2")
     implementation(files("libs/sherpa-onnx-1.13.2.aar"))
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("io.github.webrtc-sdk:android:150.7871.01")
     implementation("top.yukonga.miuix.kmp:miuix:0.8.8")
     implementation("com.composables:icons-lucide:1.1.0")
     implementation("androidx.activity:activity-compose:1.8.0")

@@ -185,7 +185,7 @@ export class PolicyHost {
     if (state?.instance !== this.config.instance || state.connected !== true ||
         !Number.isSafeInteger(state.revision) || state.revision < this.revision || !Array.isArray(state.sessions) || state.sessions.length > 64 ||
         new Set(state.sessions.map(row => row?.id)).size !== state.sessions.length ||
-        state.sessions.some(row => typeof row.id !== 'string' || !['read-only', 'workspace-write', 'full'].includes(row.mode))) {
+        state.sessions.some(row => typeof row.id !== 'string' || !['read-only', 'workspace-write', 'full', 'tunnel'].includes(row.mode))) {
       throw new Error('原生工具权限响应无效。');
     }
     if (state.revision >= this.revision) {
@@ -263,6 +263,7 @@ export class PolicyHost {
   }
 
   cachedMode(session) {
+    if (typeof session === 'string' && session.startsWith('tunnel:')) return 'tunnel';
     if (!this.configured) return 'workspace-write';
     return !this.failure && this.connected ? this.sessions.get(session) ?? 'unavailable' : 'unavailable';
   }

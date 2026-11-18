@@ -103,7 +103,7 @@ internal enum class AppPage(val title: String, val settings: Boolean = false) {
     Home("DSHX"), Chat("对话"), Settings("设置", true), Voice("语音聊天"), Logs("运行诊断"), Library("知识库"),
     Assistant("助手与资料", true), VoiceOptions("语音交互", true), Tasks("任务分工", true),
     Permissions("手机操作与权限", true), Hosting("实验体", true), HostingOptions("培养设置", true),
-    Apps("微应用", true), Backup("备份与恢复", true), Update("应用更新", true);
+    Apps("微应用", true), TunnelChat("穿透聊天", true), Backup("备份与恢复", true), Update("应用更新", true);
 
     val previous: AppPage get() = when {
         this == HostingOptions -> Hosting
@@ -161,6 +161,7 @@ fun DshScreen(
     onTheme: (String) -> Unit, onStart: () -> Unit, onStop: () -> Unit,
     diagnostics: () -> String, pageError: String?, onReload: () -> Unit,
     assistantStore: AssistantStore,
+    tunnelChat: TunnelChatRuntime, tunnelChatState: TunnelChatRuntimeState,
     memoryStore: MemoryStore, onMemory: (String, org.json.JSONObject) -> org.json.JSONObject,
     onHosting: (String, org.json.JSONObject) -> org.json.JSONObject,
     onOpenSession: (String) -> Unit,
@@ -425,6 +426,7 @@ fun DshScreen(
                                     backupPicking, onBackup, onPage = { backGesture.reset(); settingsPage = it },
                                     onLibrary = { library = true },
                                     onHostingSession = { onOpenSession(it); selectTab(1) },
+                                    tunnelChat = tunnelChat, tunnelChatState = tunnelChatState,
                                     onApps = onApps, onCreateApp = onCreateApp,
                                 )
                             }

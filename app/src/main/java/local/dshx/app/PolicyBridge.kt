@@ -200,6 +200,7 @@ class PolicyBridge(
                     if (method == "engine") {
                         require(frame.toByteArray(Charsets.UTF_8).size <= 4096) { "引擎请求过大。" }
                         val mode = policy.mode(instance, session)
+                        require(mode != ToolPolicy.TUNNEL) { "穿透会话不允许引擎管理。" }
                         val action = request.getString("action")
                         require(action in setOf("status", "logs", "restart", "info"))
                         require(action != "restart" || mode == ToolPolicy.FULL) { "重启引擎需要 Full 权限。" }
@@ -254,7 +255,7 @@ class PolicyBridge(
                         continue
                     }
                     if (method == "phone") {
-                        policy.mode(instance, session)
+                        require(policy.mode(instance, session) == ToolPolicy.FULL)
                         val owner = policy.state.sessions.first { it.id == session }
                         val handler = requireNotNull(phone) { "手机功能桥未配置" }
                         val action = request.getString("action")

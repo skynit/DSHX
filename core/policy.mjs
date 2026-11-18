@@ -20,6 +20,7 @@ export function fileMode() { return access.getStore()?.androidMode; }
 
 export async function runTool(exec, callback) {
   let scope = access.getStore();
+  if (policyHost.cachedMode(exec.agent?.session?.id) === 'tunnel') throw denied();
   if (exec.name === 'skill' || managementTools.has(exec.name)) {
     const mode = await policyHost.mode(exec.agent?.session?.id);
     if (mode === 'unavailable' || managementTools.has(exec.name) && (mode !== 'full' || !mainAgent(exec.agent))) {
@@ -72,6 +73,8 @@ export async function modelPath(path, cwd = workspace, signal) {
 
 export function toolAvailable(name, agent) {
   const mode = policyHost.cachedMode(agent?.session?.id);
+  // 穿透聊天基础版只提供模型文本接待，不把宿主工具暴露给外部访客。
+  if (mode === 'tunnel') return false;
   const engine = engineToolNames.has(name) && (name !== 'engine_restart' || mode === 'full' && mainAgent(agent));
   const management = managementTools.has(name) && mode === 'full' && mainAgent(agent);
   return Boolean(workspace) && (fileTools.has(name) || name === 'skill' || engine || management || memoryToolAvailable(name) || knowledgeToolAvailable(name, agent) || (commandTools.has(name) || phoneToolNames.has(name) || appToolNames.has(name)) && mode === 'full') && mode !== 'unavailable' &&

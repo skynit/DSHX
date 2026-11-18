@@ -46,6 +46,7 @@ class MainActivity : ComponentActivity() {
     private var accessibilityHandled = false
     private val engine get() = (application as DshApp).engine
     private val voice get() = (application as DshApp).voice
+    private val tunnelChat get() = (application as DshApp).tunnelChat
     private val update get() = (application as DshApp).update
     private val updateInstaller = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         update.installed(result.resultCode)
@@ -224,6 +225,7 @@ class MainActivity : ComponentActivity() {
         val bundle = BundleInfo(info.getString("dsh"), info.getString("node"), info.getString("abi"), info.getLong("unpackedSize"))
         setContent {
             var state by remember { mutableStateOf(engine.state) }
+            var tunnelChatState by remember { mutableStateOf(tunnelChat.state) }
             var theme by remember { mutableStateOf(preferences.getString("theme", "system") ?: "system") }
             var voiceState by remember { mutableStateOf(voice.state) }
             DisposableEffect(voice) {
@@ -245,6 +247,13 @@ class MainActivity : ComponentActivity() {
                 engine.observe(listener)
                 onDispose { engine.remove(listener) }
             }
+            DisposableEffect(tunnelChat) {
+                val listener: (TunnelChatRuntimeState) -> Unit = { next ->
+                    runOnUiThread { tunnelChatState = next }
+                }
+                tunnelChat.observe(listener)
+                onDispose { tunnelChat.remove(listener) }
+            }
             DshScreen(
                 state = state, bundle = bundle, webVersion = WebView.getCurrentWebViewPackage()?.versionName,
                 theme = theme,
@@ -256,6 +265,7 @@ class MainActivity : ComponentActivity() {
                 engineInfo = engine::engineInfo, engineStatus = { engine.engineStatus() },
                 onReload = { pageError = null; browser?.reload() },
                 assistantStore = assistantStore,
+                tunnelChat = tunnelChat, tunnelChatState = tunnelChatState,
                 memoryStore = memoryStore, onMemory = engine::memory,
                 onHosting = engine::hosting,
                 onApps = engine::apps, onCreateApp = engine::createApp,
