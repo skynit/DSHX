@@ -1,4 +1,5 @@
-import { createHash, createPublicKey, randomBytes, randomUUID, verify } from 'node:crypto';
+import { createHash, createHmac, createPublicKey, randomBytes, randomUUID, verify } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { fileURLToPath } from 'node:url';
 import { WebSocket, WebSocketServer } from 'ws';
@@ -56,13 +57,28 @@ function verifyProfile(raw, challenge, proof) {
 }
 
 /** 只保存端点状态和信令路由；从不接收或中转聊天正文。 */
-export function createTunnelPlatform({ iceServers = [] } = {}) {
+export function createTunnelPlatform({ iceServers = [], turn } = {}) {
+  if (turn) {
+    const { urls, secret, ttlSeconds = 3600 } = turn;
+    if (!Array.isArray(urls) || !urls.length || urls.some(url => typeof url !== 'string' || !/^turns?:[^\s]+$/.test(url)) ||
+        typeof secret !== 'string' || secret.length < 32 || !Number.isInteger(ttlSeconds) || ttlSeconds < 60 || ttlSeconds > 86400) {
+      throw new Error('TURN 配置需要有效地址、至少 32 字符的共享密钥和 60–86400 秒的凭据有效期。');
+    }
+    turn = { urls, secret, ttlSeconds };
+  }
   const profiles = new Map();
   const challenges = new Map();
   const tokens = new Map();
   const sessions = new Map();
   let registrationOrder = 0;
   const sockets = new WebSocketServer({ noServer: true, maxPayload: maxSignal, perMessageDeflate: false });
+  const issueIceServers = profile => {
+    if (!turn) return iceServers;
+    profile.turnExpiresAtSeconds = Math.floor(Date.now() / 1000) + turn.ttlSeconds;
+    const username = `${profile.turnExpiresAtSeconds}:${profile.info.endpointId}`;
+    const credential = createHmac('sha1', turn.secret).update(username).digest('base64');
+    return [...iceServers, { urls: turn.urls, username, credential }];
+  };
   const describe = ({ info: { endpointId, displayName, publicIntroduction, publication, acceptance, capabilities }, socket }) => ({
     endpointId, displayName, publicIntroduction, publication, acceptance, capabilities, online: socket?.readyState === WebSocket.OPEN,
   });
@@ -103,7 +119,7 @@ export function createTunnelPlatform({ iceServers = [] } = {}) {
       profiles.set(info.endpointId, profile);
       tokens.set(profile.token, profile);
       // 客户端从 HTTPS 平台地址派生同源 WSS 地址，不信任反代传入的 Host。
-      return reply(res, 200, { endpoint: describe(profile), registrationToken: profile.token, iceServers });
+      return reply(res, 200, { endpoint: describe(profile), registrationToken: profile.token, iceServers: issueIceServers(profile) });
     }
     if (req.method === 'GET' && url.pathname === directory) {
       const query = (url.searchParams.get('query') ?? '').slice(0, 80).toLowerCase();
@@ -229,6 +245,11 @@ export function createTunnelPlatform({ iceServers = [] } = {}) {
 
   function acceptSocket(profile, ws) {
     const timer = setTimeout(() => ws.terminate(), 5000);
+    const connectionId = randomUUID();
+    let registerMessage;
+    const sendRegistration = () => send(ws, platformFrame(profile, 'register_ok', registerMessage, { payload: {
+      connection_id: connectionId, registered_route_ids: [profile.info.endpointId], ice_servers: issueIceServers(profile),
+    } }));
     let alive = true;
     let count = 0;
     const pulse = setInterval(() => {
@@ -236,6 +257,8 @@ export function createTunnelPlatform({ iceServers = [] } = {}) {
       alive = false;
       ws.ping();
       count = 0;
+      // 已有数据通道不重建；续发配置只供后续的新连接或重连使用。
+      if (turn && profile.socket === ws && profile.turnExpiresAtSeconds <= Math.floor(Date.now() / 1000) + turn.ttlSeconds / 2) sendRegistration();
     }, 10_000);
     ws.on('pong', () => { alive = true; });
     ws.on('error', () => ws.terminate());
@@ -255,8 +278,8 @@ export function createTunnelPlatform({ iceServers = [] } = {}) {
         if (frame.type !== 'register' || !Array.isArray(routes) || routes.length !== 1 || routes[0]?.id !== profile.info.endpointId) return ws.terminate();
         clearTimeout(timer);
         profile.socket = ws;
-        send(ws, platformFrame(profile, 'register_ok', frame, { payload: { connection_id: randomUUID(),
-          registered_route_ids: [profile.info.endpointId], ice_servers: iceServers } }));
+        registerMessage = frame;
+        sendRegistration();
       } catch { ws.terminate(); }
     });
   }
@@ -274,6 +297,11 @@ export function createTunnelPlatform({ iceServers = [] } = {}) {
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const iceServers = JSON.parse(process.env.DSHX_TUNNEL_ICE_SERVERS ?? '[]');
   if (!Array.isArray(iceServers)) throw new Error('DSHX_TUNNEL_ICE_SERVERS 必须是 JSON 数组。');
+  const turnUrls = process.env.DSHX_TUNNEL_TURN_URLS;
+  const secretFile = process.env.DSHX_TUNNEL_TURN_SECRET_FILE;
+  if (Boolean(turnUrls) !== Boolean(secretFile)) throw new Error('TURN 地址和共享密钥文件必须一起配置。');
+  const turn = turnUrls ? { urls: JSON.parse(turnUrls), secret: readFileSync(secretFile, 'utf8').trim(),
+    ttlSeconds: Number(process.env.DSHX_TUNNEL_TURN_TTL_SECONDS ?? 3600) } : undefined;
   const port = Number(process.env.DSHX_TUNNEL_PORT ?? 9082);
-  createTunnelPlatform({ iceServers }).listen(port, '127.0.0.1', () => console.log(`DSHX 穿透平台监听 127.0.0.1:${port}`));
+  createTunnelPlatform({ iceServers, turn }).listen(port, '127.0.0.1', () => console.log(`DSHX 穿透平台监听 127.0.0.1:${port}`));
 }

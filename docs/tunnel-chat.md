@@ -26,9 +26,49 @@
 node core/tunnel-platform.mjs
 ```
 
-默认只监听 `127.0.0.1:9082`，可用 `DSHX_TUNNEL_PORT` 改端口。用提供有效证书的 HTTPS 反向代理转发 `/api/v1/dshx/chat/` 和 `/api/v1/signaling`；后一条需允许 WebSocket 升级并转发 `Authorization`。两台 DSHX 客户端在「设置 → 穿透聊天」填写同一 HTTPS 地址，开启穿透聊天并启动引擎。服务不带 TURN 服务器；`DSHX_TUNNEL_ICE_SERVERS` 可设置为 WebRTC ICE（网络路径发现）服务器的 JSON 数组，例如 `[{"urls":["stun:stun.example.org:3478"]}]`。TURN 的 `username`、`credential` 会发给每个注册端点，不应填入不宜公开分发的长期凭据。
+默认只监听 `127.0.0.1:9082`，可用 `DSHX_TUNNEL_PORT` 改端口。用提供有效证书的 HTTPS 反向代理转发 `/api/v1/dshx/chat/` 和 `/api/v1/signaling`；后一条需允许 WebSocket 升级并转发 `Authorization`。两台 DSHX 客户端在「设置 → 穿透聊天」填写同一 HTTPS 地址，开启穿透聊天并启动引擎。平台进程本身不转发正文；独立 coturn 服务提供 TURN 中继，部署步骤见下节。`DSHX_TUNNEL_ICE_SERVERS` 可设置为 WebRTC ICE（网络路径发现）服务器的 JSON 数组，例如 `[{"urls":["stun:stun.example.org:3478"]}]`，继续用于 STUN 或兼容既有配置。不要在该变量中配置长期 TURN 密码，应使用平台签发的临时凭据。
 
-当前为单进程平台，端点目录保存在内存，重启后由客户端重新注册。断开的公开端点最多保留 7 天，便于对方选择离线投递；目录读取无需账号，发起连接必须持有注册凭证。限频与并发由接收方客户端执行。部署到公网前仍需加上反代层限流和运维监控；本服务无账号层、持久目录、举报或动态 TURN 凭证发放。
+当前为单进程平台，端点目录保存在内存，重启后由客户端重新注册。断开的公开端点最多保留 7 天，便于对方选择离线投递；目录读取无需账号，发起连接必须持有注册凭证。限频与并发由接收方客户端执行。部署到公网前仍需加上反代层限流和运维监控；本服务无账号层、持久目录或举报功能；已支持基于端点签名注册的临时 TURN 凭据发放。
+
+## 独立 TURN 中继
+
+TURN 是客户端直连失败时使用的网络转发服务。平台负责发放临时访问凭据，coturn 负责转发 WebRTC 加密数据，Android 客户端继续优先尝试直连。参考 coturn 官方的 [TURN REST API 和服务器配置说明](https://github.com/coturn/coturn/blob/master/README.turnserver)，采用兼容 WebRTC 的时间戳用户名和 HMAC-SHA1 临时密码，不向客户端发送服务器共享密钥。
+
+平台环境变量：
+
+| 变量 | 含义 |
+|---|---|
+| `DSHX_TUNNEL_TURN_URLS` | TURN 地址 JSON 数组，例如 `["turn:47.119.120.17:3478?transport=udp","turn:47.119.120.17:3478?transport=tcp"]` |
+| `DSHX_TUNNEL_TURN_SECRET_FILE` | 共享密钥文件路径，内容至少 32 字符，与 coturn 的 `static-auth-secret` 相同 |
+| `DSHX_TUNNEL_TURN_TTL_SECONDS` | 临时凭据有效期，默认 3600 秒，可设 60–86400 秒 |
+
+地址与密钥文件必须同时配置，否则启动失败；未配置时保留原有 STUN 配置。成功验签注册后，平台在原有 `iceServers` 字段附加 TURN 地址和临时凭据。用户名为 `<过期 Unix 秒数>:<endpointId>`，密码为 `Base64(HMAC-SHA1(共享密钥, 用户名))`。WebSocket 注册回执的 `ice_servers` 也包含当前凭据。在线期间，每 10 秒检查一次，剩余有效期不超过一半时，沿原连接重发 `register_ok`，保留 `connection_id`、路由和原注册消息的 `reply_to`。现有客户端会更新后续连接使用的配置；已建立的数据通道不因续期重建。信令掉线后按既有流程重新注册并领取新凭据。凭据不进入公共端点目录；注销端点不会提前撤销已经签发的 TURN 凭据，其可用于新分配的时间由有效期限制。
+
+服务器部署模板位于 `tools/tunnel/`：
+
+1. 安装系统发行版提供的 `coturn`；若没有其他 coturn 实例，可屏蔽包自带的 `coturn.service`，仅运行独立 `dshx-turn.service`。
+2. 创建 `/etc/dshx-turn/`，目录权限设为 `root:turnserver 0750`，用 `openssl rand -hex 32` 生成共享密钥，保存到 `auth-secret`，权限 `root:root 0600`。不要提交真实配置或密钥。
+3. 复制 `turnserver.conf.example` 为 `/etc/dshx-turn/turnserver.conf`，替换公网 IP、网卡 IP、域名和 `static-auth-secret`，权限 `root:turnserver 0640`。云服务器网卡为私网地址时，通过 `external-ip=公网地址/网卡地址` 告知客户端正确中继地址；中继 UDP 端口须保持同端口映射。
+4. 把 `dshx-turn.service` 安装到 `/etc/systemd/system/`；把 `dshx-tunnel-turn.conf.example` 安装为 `/etc/systemd/system/dshx-tunnel.service.d/turn.conf`。平台服务用 systemd `LoadCredential` 安全读取原始共享密钥，适用于现有 `DynamicUser` 服务。
+5. 更新平台程序后执行 `systemctl daemon-reload`、`systemctl enable --now dshx-turn`、`systemctl restart dshx-tunnel`。
+6. 在云安全组和主机防火墙放行 `3478/TCP`、`3478/UDP`、`49160–49259/UDP`。`3478` 是客户端入口；后一个范围承载中继数据，缺失时即使凭据正确也不能建立中继聊天。
+
+模板限制每用户 16 个分配、全局 200 个分配、每分配每方向 1 MiB/s 和全局 20 MiB/s；实际容量也受中继端口范围与服务器带宽限制。禁止中继访问内网、回环、组播和云元数据地址，关闭管理端口与 RFC 6062 TCP 对端分配。`no-tcp-relay` 仍允许客户端通过 TCP 连接 TURN，再使用 UDP 中继端口通信。当前模板提供 `turn:` UDP/TCP 入口，未提供 `turns:` TLS 入口；WebRTC 业务数据仍由双方数据通道加密。官方平台默认地址保持不变，使用测试服务时客户端仍填写 `https://dshx-tunnel.filesharing.asia:8443`。
+
+验证时必须检查实际选中的 ICE 路径为 `relay`，并在 DataChannel 上双向发送文本；服务 active、取得候选或仅完成信令均不能代替此验证。测试程序通过也不代表两台 Android 客户端、AI 接待和人工接管已通过真机验收。
+
+### 测试平台验收（2026-11-19）
+
+服务器 `47.119.120.17` 已运行独立 `dshx-turn.service`，系统包为 coturn `4.5.2-3.1~ubuntu22.04.1`。公网安全组放行后，测试结果如下：
+
+| 验证范围 | 结果 |
+|---|---|
+| 平台定向测试 | 本机 Node 26 与服务器 Node 24 环境均为 7/7 通过，涵盖原信令行为、端点独立临时凭据、密钥不泄露、续期及无效配置 |
+| 公网 HTTPS/WSS | 签名注册、在线目录、协商信令、隐身拒绝连接和测试端点注销通过 |
+| TURN UDP 入口 | 两个独立测试端点强制中继，双向文本通过，实际选中 `relay/relay` |
+| TURN TCP 入口 | 只保留 `transport=tcp` 配置，双向文本通过，实际选中 `relay/relay`；两端之间的中继候选仍为 UDP，符合模板配置 |
+
+上述数据通道测试在本机启动两个独立进程，用套接字 `SO_BINDTODEVICE` 固定到 `wlan0`，通过公网 IP `47.119.120.17` 访问 TURN；双方均使用公网中继候选，没有使用 Tailscale 或私网候选直连。临时端点在测试后注销。此结果证明公网平台与中继之间的集成，不代表两个不同接入网络上的 Android 客户端、端点身份握手、AI 接待或人工接管已经通过真机测试。未进行全仓测试或发布 APK。
 
 本文定义 DSHX 客户端之间的穿透聊天能力。目标是让一个 DSHX 客户端发布一个可发现的端点，其他 DSHX 客户端可以尝试连接；连接成功后由端点上的 AI 自动接待，端点用户可以随时人工接管。术语沿用根目录 [`GLOSSARY.md`](../GLOSSARY.md)。
 

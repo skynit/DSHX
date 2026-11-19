@@ -1,0 +1,7 @@
+# 安装到 /etc/systemd/system/dshx-tunnel.service.d/turn.conf。
+[Service]
+LoadCredential=turn-secret:/etc/dshx-turn/auth-secret
+Environment=DSHX_TUNNEL_TURN_SECRET_FILE=%t/credentials/%n/turn-secret
+Environment='DSHX_TUNNEL_TURN_URLS=["turn:47.119.120.17:3478?transport=udp","turn:47.119.120.17:3478?transport=tcp"]'
+Environment=DSHX_TUNNEL_TURN_TTL_SECONDS=3600
+# 继续保留平台已有 DSHX_TUNNEL_ICE_SERVERS 中的 STUN 配置。

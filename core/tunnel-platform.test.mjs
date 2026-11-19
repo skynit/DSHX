@@ -23,9 +23,9 @@ function identity(displayName) {
   } };
 }
 
-async function fixture(t) {
+async function fixture(t, options = {}) {
   const iceServers = [{ urls: ['stun:test.invalid:3478'] }];
-  const server = createTunnelPlatform({ iceServers }).listen(0, '127.0.0.1');
+  const server = createTunnelPlatform({ iceServers, ...options }).listen(0, '127.0.0.1');
   await once(server, 'listening');
   const base = `http://127.0.0.1:${server.address().port}`;
   const clients = [];
@@ -56,14 +56,14 @@ async function fixture(t) {
     clients.push(channel);
     return channel;
   };
-  const connect = async (peer, token) => {
+  const connect = async (peer, token, checkServers = servers => assert.deepEqual(servers, iceServers)) => {
     const channel = socket(token);
     await once(channel, 'open');
     const frame = send(channel, 'register', { routes: [{ id: peer.profile.endpointId }] });
     const ack = await receive(channel);
     assert.equal(ack.type, 'register_ok');
     assert.equal(ack.reply_to, frame.message_id);
-    assert.deepEqual(ack.payload.ice_servers, iceServers);
+    checkServers(ack.payload.ice_servers);
     return channel;
   };
   return { request, registration, publish, socket, connect };
@@ -161,4 +161,70 @@ test('tunnel platform removes hidden endpoints from discovery and rejects known-
   assert.equal((await receive(source)).error.code, 'unavailable');
   assert.equal((await platform.request(`${directory}/${b.profile.endpointId}`, { method: 'DELETE', headers: { Authorization: `Bearer ${aRow.registrationToken}` } })).status, 401);
   assert.equal((await platform.request(`${directory}/${b.profile.endpointId}`, { method: 'DELETE', headers: { Authorization: `Bearer ${hidden.registrationToken}` } })).status, 204);
+});
+
+test('tunnel platform issues endpoint-specific temporary TURN credentials without exposing the secret', { timeout: 8000 }, async t => {
+  const secret = 'test-only-shared-secret-with-32-characters';
+  const urls = ['turn:turn.test.invalid:3478?transport=udp', 'turn:turn.test.invalid:3478?transport=tcp'];
+  const platform = await fixture(t, { turn: { urls, secret, ttlSeconds: 120 } });
+  const a = identity('中继端点 A'), b = identity('中继端点 B');
+  const started = Math.floor(Date.now() / 1000);
+  const row = await platform.publish(a);
+  const checkServers = servers => {
+    assert.deepEqual(servers[0], { urls: ['stun:test.invalid:3478'] });
+    assert.equal(servers.length, 2);
+    const server = servers[1];
+    const [expires, endpointId] = server.username.split(':');
+    assert.equal(endpointId, a.profile.endpointId);
+    assert.ok(Number(expires) >= started + 120 && Number(expires) <= Math.floor(Date.now() / 1000) + 120);
+    assert.deepEqual(server.urls, urls);
+    return server;
+  };
+  const server = checkServers(row.iceServers);
+  // Node 的 WebCrypto 使用独立接口验证 coturn REST 凭据格式。
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-1' }, false, ['verify']);
+  assert.ok(await crypto.subtle.verify('HMAC', key, Buffer.from(server.credential, 'base64'), Buffer.from(server.username)));
+  assert.ok(!JSON.stringify(row).includes(secret));
+  const other = await platform.publish(b);
+  assert.notEqual(other.iceServers[1].username, server.username);
+  assert.notEqual(other.iceServers[1].credential, server.credential);
+  await platform.connect(a, row.registrationToken, checkServers);
+  const listing = await (await platform.request(directory)).text();
+  assert.ok(!listing.includes(server.credential) && !listing.includes(secret));
+  assert.equal((await platform.request(`${directory}/ice-servers`)).status, 404);
+});
+
+test('tunnel platform renews TURN credentials on the existing signaling connection', { timeout: 15000 }, async t => {
+  let now = 1795000000000;
+  t.mock.method(Date, 'now', () => now);
+  const platform = await fixture(t, { turn: {
+    urls: ['turn:turn.test.invalid:3478?transport=tcp'], secret: 'test-only-shared-secret-with-32-characters', ttlSeconds: 60,
+  } });
+  const peer = identity('持续在线端点');
+  const row = await platform.publish(peer);
+  const socket = platform.socket(row.registrationToken);
+  await once(socket, 'open');
+  const registration = send(socket, 'register', { routes: [{ id: peer.profile.endpointId }] });
+  const initial = await receive(socket);
+  const first = initial.payload.ice_servers[1];
+  now += 31_000;
+  const [raw] = await once(socket, 'message', { signal: AbortSignal.timeout(12_000) });
+  const refresh = JSON.parse(raw);
+  assert.equal(refresh.type, 'register_ok');
+  assert.equal(refresh.reply_to, registration.message_id);
+  assert.equal(refresh.payload.connection_id, initial.payload.connection_id);
+  assert.deepEqual(refresh.payload.registered_route_ids, [peer.profile.endpointId]);
+  const fresh = refresh.payload.ice_servers[1];
+  assert.equal(fresh.username, `${Math.floor(now / 1000) + 60}:${peer.profile.endpointId}`);
+  assert.notEqual(fresh.credential, first.credential);
+  // 刷新没有注销或重新注册端点，原信令仍可路由。
+  send(socket, 'offer', { description: { type: 'offer', sdp: 'offer' } }, target(identity('离线目标')));
+  assert.equal((await receive(socket)).error.code, 'unavailable');
+});
+
+test('tunnel platform rejects incomplete or unbounded TURN configuration', () => {
+  const valid = { urls: ['turn:turn.test.invalid:3478'], secret: 'test-only-shared-secret-with-32-characters' };
+  for (const change of [{ urls: [] }, { urls: ['https://invalid'] }, { secret: 'short' }, { ttlSeconds: 0 }, { ttlSeconds: 86401 }, { ttlSeconds: 1.5 }]) {
+    assert.throws(() => createTunnelPlatform({ turn: { ...valid, ...change } }), /TURN 配置/);
+  }
 });

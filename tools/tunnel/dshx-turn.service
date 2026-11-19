@@ -1,0 +1,27 @@
+[Unit]
+Description=DSHX WebRTC TURN relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=turnserver
+Group=turnserver
+ExecStartPre=/usr/bin/test -r /etc/dshx-turn/turnserver.conf
+ExecStart=/usr/bin/turnserver -c /etc/dshx-turn/turnserver.conf
+Restart=on-failure
+RestartSec=3
+RuntimeDirectory=dshx-turn
+StateDirectory=dshx-turn
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LimitNOFILE=65536
+MemoryMax=256M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target
