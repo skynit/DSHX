@@ -4354,6 +4354,41 @@ test('tunnel chat creates the named visitor session and blocks tools', async () 
   }
 });
 
+test('tunnel chat creates a visitor session through the loaded voice plugin', { timeout: 5000 }, async t => {
+  const { Context } = await load('@deepseek-ai/cordis');
+  const { policyHost } = await import(pathToFileURL(join(core, 'host.mjs')));
+  const voice = await import(pathToFileURL(join(core, 'voice.mjs')));
+  const ctx = new Context();
+  t.after(() => ctx.fiber.dispose());
+  const session = { id: 'tunnel:visitor' };
+  const agent = { session, status: 'idle', inbox: { hasPending: false, nextTurn: [], nextStep: [] } };
+  const created = [];
+  await ctx.plugin(services => {
+    services.provide('sessionPersistence', { async stat() { return undefined; } });
+    services.provide('agents', {});
+    services.provide('llm', { registerAdapter: () => () => {} });
+    services.provide('sessionController', {
+      async create({ sessionId }) { created.push(sessionId); return { sessionId }; },
+      commands: {
+        async resolveAgent(sessionId) {
+          assert.deepEqual(created, [sessionId]);
+          return agent;
+        },
+        async prompt(request, source) {
+          services.emit('agent/inbox/claimed', { agent, message: { source }, turn: 1 });
+          services.emit('session/event', session, { type: 'assistant/message', data: { turn: 1,
+            message: { content: [{ type: 'text', text: '测试回复' }] } } });
+          services.emit('session/event', session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+        },
+      },
+    });
+  });
+  await ctx.plugin(voice);
+  assert.deepEqual(await policyHost.voice('prompt', {
+    session: session.id, interaction: 'tunnel-test', text: '你好',
+  }), { session: session.id, text: '测试回复', local: false });
+});
+
 test('voice keeps independent sessions active for local and tunnel replies', async () => {
   const { voiceSession } = await import(pathToFileURL(join(core, 'voice.mjs')));
   const handlers = new Map();

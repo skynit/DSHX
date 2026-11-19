@@ -6,7 +6,7 @@ import { pathToFileURL } from 'node:url';
 import { localRouter } from './local-route.mjs';
 
 export const name = 'dshx-android-voice';
-export const inject = ['sessionController', 'agents', 'llm'];
+export const inject = ['sessionController', 'sessionPersistence', 'agents', 'llm'];
 const route = { provider: 'dshx-local', model: 'qwen3-0.6b' };
 
 function localTask(text) {
