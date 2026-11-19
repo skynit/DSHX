@@ -271,9 +271,9 @@ class CoreTest {
         assertEquals(listOf(message.messageId), second.due(now = 1_000L).map { it.message.messageId })
         assertEquals("endpoint-receiver", second.snapshot().single().targetEndpointId)
         assertEquals(settings.platformOrigin, second.snapshot().single().platformOrigin)
-        second.markAttempt(message.messageId, now = 1_000L, delayMs = 500L)
+        second.markAttempts(second.due(now = 1_000L), now = 1_000L)
         assertTrue(second.due(now = 1_200L).isEmpty())
-        assertEquals(listOf(message.messageId), second.due(now = 1_500L).map { it.message.messageId })
+        assertEquals(listOf(message.messageId), second.due(now = 6_000L).map { it.message.messageId })
         val ack = ChatAck(message.messageId, message.conversationId, ChatAck.Status.RECEIVED)
         second.acknowledge(ack.copy(conversationId = "wrong-conversation"), "endpoint-receiver")
         second.acknowledge(ack, "wrong-endpoint")
@@ -296,6 +296,191 @@ class CoreTest {
         first.save(expected)
 
         assertEquals(listOf(expected), TunnelChatQueueStore(file, cipher) { settings }.conversations())
+    }
+
+    @Test fun tunnelChatOfferRecoversWhenThePeersDisagreeAboutFirstVerification() {
+        val settings = TunnelChatSettings(endpointId = "host")
+        val receiver = TunnelConversation("chat", settings.platformOrigin, "host", "visitor", visitor = false)
+        val caller = TunnelConversation("chat", settings.platformOrigin, "visitor", "host", visitor = true)
+
+        assertTrue(TunnelConversation.acceptsOffer(receiver.copy(verified = true), "visitor", freshLink = false))
+        assertTrue(TunnelConversation.acceptsOffer(receiver, "visitor", freshLink = true))
+        assertTrue(TunnelConversation.acceptsOffer(caller, "host", freshLink = true))
+        assertFalse(TunnelConversation.acceptsOffer(caller, "stranger", freshLink = true))
+        assertFalse(TunnelConversation.acceptsOffer(null, "visitor", freshLink = true))
+        assertTrue(TunnelConversation.acceptsOffer(null, "visitor", freshLink = false))
+        assertFalse(TunnelConversation.acceptsOffer(caller, "host", freshLink = false))
+        assertFalse(TunnelConversation.acceptsOffer(receiver.copy(closed = true), "visitor", freshLink = false))
+        assertTrue(TunnelConversation.acceptsOffer(receiver.copy(verified = true, closed = true), "visitor", freshLink = true))
+        assertTrue(caller.needsInitialOffer(recovering = false))
+        assertFalse(caller.copy(verified = true).needsInitialOffer(recovering = false))
+        assertTrue(caller.copy(verified = true).needsInitialOffer(recovering = true))
+        assertFalse(caller.copy(verified = true, closed = true).needsInitialOffer(recovering = true))
+    }
+
+    @Test fun tunnelChatOnlyConfirmsDurableReceiptsAndFinishesReceptionWithTheQueuedReply() {
+        val file = folder.newFile("durable-inbox.json")
+        val cipher = CountingTunnelCipher()
+        val settings = TunnelChatSettings(endpointId = "host")
+        val chat = TunnelConversation("chat", settings.platformOrigin, "host", "visitor", visitor = false, verified = true)
+        val inbound = ChatMessage.text(chat.id, 1, ChatSenderRole.VISITOR, "visitor", "hello")
+        val store = TunnelChatQueueStore(file, cipher) { settings }
+        store.save(chat)
+
+        cipher.failWrites = true
+        assertThrows(java.io.IOException::class.java) { store.receive(chat, inbound) }
+        assertTrue(store.conversations().single().inbox.isEmpty())
+        cipher.failWrites = false
+        val backup = folder.root.resolve("previous-inbox.json")
+        Files.move(file.toPath(), backup.toPath())
+        assertTrue(file.mkdir())
+        assertThrows(java.io.IOException::class.java) { store.receive(chat, inbound) }
+        assertTrue(store.conversations().single().inbox.isEmpty())
+        Files.delete(file.toPath())
+        Files.move(backup.toPath(), file.toPath())
+        assertEquals(ChatAck.Status.RECEIVED, store.receive(chat, inbound))
+
+        val restarted = TunnelChatQueueStore(file, cipher) { settings }
+        val restored = restarted.conversations().single()
+        assertEquals("hello", restored.inbox.single().message!!.payload.getString("text"))
+        assertTrue(restored.inbox.single().pending)
+        assertEquals(ChatAck.Status.DUPLICATE, restarted.receive(restored, inbound))
+
+        val reply = ChatMessage.text(chat.id, 1, ChatSenderRole.AI, "host", "hi").copy(kind = ChatMessageKind.AI_FORMAL, replyTo = inbound.messageId)
+        val next = restored.copy(aiRepliesSent = 1, sequence = 1)
+        cipher.failWrites = true
+        assertThrows(java.io.IOException::class.java) { restarted.enqueue(reply, "visitor", conversation = next, receptionId = inbound.messageId) }
+        assertTrue(restarted.conversations().single().inbox.single().pending)
+        assertTrue(restarted.snapshot().isEmpty())
+        cipher.failWrites = false
+        assertTrue(restarted.enqueue(reply, "visitor", conversation = next, receptionId = inbound.messageId))
+
+        val afterReply = TunnelChatQueueStore(file, cipher) { settings }
+        val completed = afterReply.conversations().single()
+        assertFalse(completed.inbox.single().pending)
+        assertEquals(1, completed.aiRepliesSent)
+        assertEquals(inbound.messageId, afterReply.snapshot().single().message.replyTo)
+        assertFalse(afterReply.enqueue(reply.copy(messageId = "duplicate-reply"), "visitor", conversation = next, receptionId = inbound.messageId))
+    }
+
+    @Test fun tunnelChatHandoverRemovesOnlyItsQueuedAiAndInvalidatesPreHandoverReception() {
+        val cipher = CountingTunnelCipher()
+        val file = folder.newFile("handover.json")
+        val settings = TunnelChatSettings(endpointId = "host", queueMaxMessages = 2)
+        val store = TunnelChatQueueStore(file, cipher) { settings }
+        val chat = TunnelConversation("chat", settings.platformOrigin, "host", "visitor", visitor = false, verified = true)
+        store.save(chat)
+        fun visitorText(seq: Long) = ChatMessage.text(chat.id, seq, ChatSenderRole.VISITOR, "visitor", "message $seq")
+        val first = visitorText(1)
+        store.receive(chat, first)
+        val ai = ChatMessage.text(chat.id, 1, ChatSenderRole.AI, "host", "ai").copy(kind = ChatMessageKind.AI_FORMAL)
+        assertTrue(store.enqueue(ai, "visitor", conversation = chat.copy(aiRepliesSent = 1, sequence = 1), receptionId = first.messageId))
+        val second = visitorText(2)
+        store.receive(chat, second)
+        val other = ai.copy(messageId = "other-reply", conversationId = "other")
+        assertTrue(store.enqueue(other, "other-visitor"))
+
+        val before = store.conversations().single()
+        val human = ChatMessage.text(chat.id, 2, ChatSenderRole.ENDPOINT_USER, "host", "human").copy(kind = ChatMessageKind.HUMAN_FORMAL)
+        cipher.failWrites = true
+        assertThrows(java.io.IOException::class.java) { store.enqueue(human, "visitor", conversation = before.handover()) }
+        assertEquals(ConversationMode.AI, store.conversations().single().mode)
+        assertEquals(setOf(ai.messageId, other.messageId), store.snapshot().map { it.message.messageId }.toSet())
+        cipher.failWrites = false
+        assertTrue(store.enqueue(human, "visitor", conversation = before.handover()))
+
+        val restarted = TunnelChatQueueStore(file, cipher) { settings }
+        assertEquals(setOf(human.messageId, other.messageId), restarted.snapshot().map { it.message.messageId }.toSet())
+        val handedOver = restarted.conversations().single()
+        assertEquals(ConversationMode.HUMAN_HANDOVER, handedOver.mode)
+        assertEquals(1, handedOver.aiRepliesSent)
+        restarted.save(handedOver.resumeAi())
+        val resumed = restarted.conversations().single()
+        assertFalse(resumed.canPublish(resumed.inbox.last(), settings.maxAiReplies))
+        assertFalse(restarted.enqueue(ai, "visitor", conversation = resumed, receptionId = second.messageId))
+        restarted.receive(resumed, visitorText(3))
+        assertTrue(resumed.canPublish(restarted.conversations().single().inbox.last(), settings.maxAiReplies))
+    }
+
+    @Test fun tunnelChatRetriesInOneWriteAndPrunesHistoryWithoutReopeningClosedChats() {
+        val file = folder.newFile("history.json")
+        val cipher = CountingTunnelCipher()
+        val settings = TunnelChatSettings(endpointId = "host")
+        val store = TunnelChatQueueStore(file, cipher) { settings }
+        val chat = TunnelConversation("chat", settings.platformOrigin, "host", "visitor", visitor = false, verified = true)
+        val open = chat.copy(id = "open")
+        val now = 1_000L
+        val pastRetention = now + 31L * 24 * 60 * 60 * 1000
+        store.save(chat)
+        store.save(open)
+        store.receive(chat, ChatMessage.text(chat.id, 1, ChatSenderRole.VISITOR, "visitor", "old", now), now)
+        store.receive(open, ChatMessage.text(open.id, 1, ChatSenderRole.VISITOR, "visitor", "still pending", now), now)
+        store.save(store.conversation(chat.id, chat.platformOrigin, chat.localEndpointId)!!.copy(closed = true), now)
+
+        val messages = (1L..2L).map { ChatMessage.text(open.id, it, ChatSenderRole.ENDPOINT_USER, "host", "outbound $it", now) }
+        messages.forEach { assertTrue(store.enqueue(it, "visitor", pastRetention)) }
+        val due = store.due(pastRetention)
+        val writes = cipher.writes
+        store.markAttempts(due, now = pastRetention)
+        assertEquals(writes + 1, cipher.writes)
+        assertTrue(store.due(pastRetention).isEmpty())
+
+        val restored = TunnelChatQueueStore(file, cipher) { settings }
+        assertEquals(messages.map { it.messageId }, restored.due(pastRetention + 5_000).map { it.message.messageId })
+        val closed = restored.conversation(chat.id, chat.platformOrigin, chat.localEndpointId)!!
+        assertTrue(closed.closed)
+        assertTrue(closed.inbox.isEmpty())
+        assertFalse(TunnelConversation.acceptsOffer(closed, "visitor", freshLink = false))
+        assertTrue(restored.conversation(open.id, open.platformOrigin, open.localEndpointId)!!.inbox.single().pending)
+
+        val ended = ChatMessage.text(chat.id, 2, ChatSenderRole.VISITOR, "visitor", "ended", now)
+            .copy(kind = ChatMessageKind.CONVERSATION_EVENT, payload = JSONObject().put("event", "ended"))
+        assertEquals(ChatAck.Status.RECEIVED, restored.receive(closed, ended, pastRetention))
+        restored.due(pastRetention * 2)
+        val afterEnd = TunnelChatQueueStore(file, cipher) { settings }
+        assertEquals(ChatAck.Status.DUPLICATE, afterEnd.receive(closed, ended, pastRetention * 2))
+        assertEquals(ChatAck.Status.REJECTED, afterEnd.receive(closed, ended.copy(messageId = "different-end"), pastRetention * 2))
+        afterEnd.retireClosed(setOf(closed.id), pastRetention * 2)
+        assertNotNull(afterEnd.conversation(chat.id, chat.platformOrigin, chat.localEndpointId))
+        afterEnd.retireClosed(emptySet(), pastRetention * 2)
+        val afterRetirement = TunnelChatQueueStore(file, cipher) { settings }
+        assertTrue(afterRetirement.isRetired(chat.id, chat.platformOrigin, chat.localEndpointId))
+        assertNull(afterRetirement.conversation(chat.id, chat.platformOrigin, chat.localEndpointId))
+        assertThrows(IllegalArgumentException::class.java) { afterRetirement.save(chat) }
+        assertTrue(afterRetirement.conversation(open.id, open.platformOrigin, open.localEndpointId)!!.inbox.single().pending)
+    }
+
+    @Test fun tunnelChatReadsLegacyQueueAndRetainsItsDeduplicationIds() {
+        val file = folder.newFile("legacy-outbox.json")
+        val cipher = CountingTunnelCipher()
+        val settings = TunnelChatSettings(endpointId = "host")
+        val store = TunnelChatQueueStore(file, cipher) { settings }
+        val message = ChatMessage.text("chat", 1, ChatSenderRole.VISITOR, "visitor", "legacy")
+        val row = TunnelQueuedMessage(message, message.createdAt, "host", settings.platformOrigin)
+        val rows = org.json.JSONArray(listOf(row.toJson()))
+        fun write(json: String) = file.writeBytes(java.util.Base64.getEncoder().encode(cipher.encrypt(json.toByteArray())))
+        write(rows.toString())
+        assertEquals(message.messageId, store.snapshot().single().message.messageId)
+
+        val chat = TunnelConversation("chat", settings.platformOrigin, "host", "visitor", visitor = false, verified = true,
+            receivedMessageIds = listOf(message.messageId))
+        val legacyChat = chat.toJson().apply { remove("inbox"); remove("receptionVersion") }
+        write(JSONObject().put("rows", rows).put("conversations", org.json.JSONArray(listOf(legacyChat))).toString())
+        val upgraded = TunnelChatQueueStore(file, cipher) { settings }
+        assertEquals(ChatAck.Status.DUPLICATE, upgraded.receive(chat, message))
+    }
+
+    private class CountingTunnelCipher : TunnelChatQueueCipher {
+        private val cipher = FixedTunnelChatQueueCipher(ByteArray(32) { it.toByte() })
+        var writes = 0
+            private set
+        var failWrites = false
+        override fun encrypt(value: ByteArray): ByteArray {
+            if (failWrites) throw java.io.IOException("injected storage failure")
+            writes++
+            return cipher.encrypt(value)
+        }
+        override fun decrypt(value: ByteArray) = cipher.decrypt(value)
     }
 
     @Test fun tunnelPlatformClientUsesPublicDirectoryAndRegistrationContract() {

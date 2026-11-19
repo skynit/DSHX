@@ -4520,6 +4520,28 @@ test('voice incremental output bounds a whole tool turn at 16000 and reserves th
   } finally { f.voice.close(); }
 });
 
+test('voice cancellation stops a first prompt while its session is still being created', async () => {
+  const { voiceSession } = await import(pathToFileURL(join(core, 'voice.mjs')));
+  const created = Promise.withResolvers(), events = [];
+  let admits = 0;
+  const voice = voiceSession({
+    on() { return () => {}; },
+    sessionController: {
+      create: () => created.promise,
+      commands: { resolveAgent() { admits++; throw new Error('unexpected admission'); } },
+    },
+  });
+  const result = voice.call('prompt', { interaction: 'creating', text: '你好' }, event => events.push(event));
+  const rejected = assert.rejects(result, /已取消/);
+  try {
+    assert.deepEqual(await voice.call('cancel', { interaction: 'creating' }), { cancelled: true });
+    created.resolve({ sessionId: 'late-session' });
+    await rejected;
+    assert.deepEqual(events, []);
+    assert.equal(admits, 0);
+  } finally { created.resolve({ sessionId: 'unused' }); voice.close(); }
+});
+
 test('voice ready event preserves a newly created session before model admission and cancellation', async () => {
   const { voiceSession } = await import(pathToFileURL(join(core, 'voice.mjs')));
   const created = Promise.withResolvers(), resolved = Promise.withResolvers(), events = [];

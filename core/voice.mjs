@@ -142,6 +142,7 @@ export function voiceSession(ctx, host = policyHost) {
   const activeForAgent = agent => active.get(agent.session?.id) ?? [...active.values()].find(run => run.agent === agent);
   const tasks = new Map();
   const waiting = new Set();
+  const creating = new Set();
   function restore(run) {
     if (!run.selection || run.restored) return;
     run.restored = true;
@@ -171,7 +172,7 @@ export function voiceSession(ctx, host = policyHost) {
     }
   }
   function stop(run, error) {
-    if (active.get(run.session) !== run || run.cancelled) return;
+    if (run.cancelled || (active.get(run.session) !== run && !creating.has(run))) return;
     run.cancelled = true;
     removePending(run);
     restore(run);
@@ -194,7 +195,7 @@ export function voiceSession(ctx, host = policyHost) {
       pending.cancelled = true;
       pending.wake.resolve();
     }
-    const runs = [...active.values()].filter(candidate => !interaction || candidate.interaction === interaction);
+    const runs = [...active.values(), ...creating].filter(candidate => !interaction || candidate.interaction === interaction);
     if (runs.length === 0) return;
     const pending = runs.map(run => {
       stop(run, new Error('语音对话已取消。'));
@@ -389,7 +390,11 @@ export function voiceSession(ctx, host = policyHost) {
         done: Promise.withResolvers() };
       const timer = setTimeout(() => cancel(run.interaction), 170000);
       try {
-        if (!run.session) run.session = (await ctx.sessionController.create({})).sessionId;
+        if (!run.session) {
+          creating.add(run);
+          try { run.session = (await Promise.race([ctx.sessionController.create({}), reply])).sessionId; }
+          finally { creating.delete(run); }
+        }
         if (run.cancelled) throw new Error('语音对话已取消。');
         if (typeof run.session !== 'string' || !/^[A-Za-z0-9._:-]{1,128}$/.test(run.session)) throw new Error('语音会话编号无效。');
         if (active.has(run.session)) throw new Error('上一轮语音对话尚未结束。');

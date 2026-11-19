@@ -6,13 +6,10 @@ import org.json.JSONObject
 import java.io.File
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArraySet
-import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
-import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
 data class TunnelChatRuntimeState(
@@ -36,16 +33,19 @@ class TunnelChatRuntime(
     private val signaling = TunnelSignalingClient()
     private val sessionBindings = ConcurrentHashMap<String, SessionBinding>()
     private val authenticatedSessions = ConcurrentHashMap.newKeySet<String>()
-    private val conversationMessages = ConcurrentHashMap<String, CopyOnWriteArrayList<ChatMessage>>()
-    private val deduplicator = TunnelMessageDeduplicator()
+    private val conversationMessages = mutableMapOf<String, MutableList<ChatMessage>>()
+    private val retryInitialOffer = mutableSetOf<String>()
     private val admission = TunnelConversationAdmission(
         settings = { currentSettings },
         loadLastAcceptedAt = settingsStore::lastAcceptedAt,
         saveLastAcceptedAt = settingsStore::saveLastAcceptedAt,
     )
-    private val aiWorker = ThreadPoolExecutor(1, 1, 0L, TimeUnit.SECONDS, ArrayBlockingQueue(16), { task ->
+    private val aiWorker = Executors.newSingleThreadExecutor { task ->
         Thread(task, "dshx-tunnel-ai").apply { isDaemon = true }
-    }, ThreadPoolExecutor.AbortPolicy())
+    }
+    private var receiving = false
+    private var receptionEpoch = 0L
+    private var pendingReply: ReceptionReply? = null
     private val retryScheduler = Executors.newSingleThreadScheduledExecutor { task -> Thread(task, "dshx-tunnel-retry").apply { isDaemon = true } }
     @Volatile private var registration: TunnelPlatformRegistration? = null
     private val identity by lazy { AndroidTunnelEndpointIdentity() }
@@ -67,7 +67,6 @@ class TunnelChatRuntime(
             AndroidTunnelChatQueueCipher(),
         ) { currentSettings }
     }
-    private val records by lazy { queue.conversations().associateBy { key(it.id, it.platformOrigin, it.localEndpointId) }.toMutableMap() }
 
     init {
         if (withdrawals().isNotEmpty()) {
@@ -79,10 +78,11 @@ class TunnelChatRuntime(
                 syncWithdrawals()
                 synchronized(this) {
                     if (closed) return@synchronized
-                runCatching {
-                    if (engineReady && System.currentTimeMillis() >= nextRegistrationAttempt) start()
-                    if (state.status == Status.ONLINE) retryQueued()
-                }.onFailure { publishState("本地待发消息读取或重试失败。") }
+                    runCatching {
+                        if (engineReady && System.currentTimeMillis() >= nextRegistrationAttempt) start()
+                        if (state.status == Status.ONLINE) retryQueued()
+                        pumpReception()
+                    }.onFailure { publishState("本地聊天记录读取或重试失败。") }
                 }
             }
         }, 5L, 5L, TimeUnit.SECONDS)
@@ -94,7 +94,10 @@ class TunnelChatRuntime(
 
     fun setMessageListener(listener: ((ChatMessage, String) -> Unit)?) { messageListener = listener }
 
-    fun setAiResponder(responder: ((TunnelChatAiRequest) -> String?)?) { aiResponder = responder }
+    fun setAiResponder(responder: ((TunnelChatAiRequest) -> String?)?) {
+        aiResponder = responder
+        if (responder != null) onWorker { pumpReception() }
+    }
 
     fun settings(): TunnelChatSettings = currentSettings
 
@@ -145,7 +148,10 @@ class TunnelChatRuntime(
     @Synchronized fun setEngineReady(ready: Boolean) {
         if (engineReady == ready) return
         engineReady = ready
-        if (ready) start() else stop()
+        if (ready) {
+            start()
+            onWorker { pumpReception() }
+        } else stop()
     }
 
     @Synchronized private fun start() {
@@ -201,11 +207,14 @@ class TunnelChatRuntime(
 
     private fun stop() {
         generation++
+        receptionEpoch++
+        pendingReply = null
         acceptingSignals = false
         nextRegistrationAttempt = Long.MAX_VALUE
         signaling.close()
         sessionBindings.clear()
         authenticatedSessions.clear()
+        retryInitialOffer.clear()
         admission.clear()
         registration = null
         transport?.close()
@@ -230,7 +239,8 @@ class TunnelChatRuntime(
         require(conversation.visitor || conversation.verified) { "访客身份尚未验证。" }
         if (binding(conversation.id) != null) return
         val current = registration ?: throw IllegalStateException("端点尚未向平台注册。")
-        val sessionId = if (conversation.verified) UUID.randomUUID().toString() else conversation.id
+        val sessionId = if (conversation.needsInitialOffer(conversation.id in retryInitialOffer)) conversation.id
+            else UUID.randomUUID().toString()
         val attempt = SessionBinding(sessionId, conversation, initiator = true)
         sessionBindings[sessionId] = attempt
         try {
@@ -266,20 +276,23 @@ class TunnelChatRuntime(
         return message
     }
 
-    private fun sendAiFormalText(conversation: TunnelConversation, text: String) {
-        val message = textMessage(conversation, text, ChatSenderRole.AI, ChatMessageKind.AI_FORMAL)
+    private fun sendAiFormalText(conversation: TunnelConversation, receipt: TunnelReceipt, message: ChatMessage): Boolean {
         val next = conversation.copy(aiRepliesSent = conversation.aiRepliesSent + 1)
-        enqueue(message, next)
+        if (!enqueue(message, next, allowFull = true, receptionId = receipt.messageId)) return false
         appendMessage(message, currentSettings.endpointId)
         flushQueued(conversation.id)
-        notifyWaitingHuman(next)
+        record(conversation.id)?.let(::notifyWaitingHuman)
+        return true
     }
 
     @Synchronized fun sendHumanFormalText(conversationId: String, text: String): ChatMessage {
         val conversation = requireOpen(conversationId)
         require(conversation.verified && !conversation.visitor) { "访客身份尚未验证。" }
         val message = textMessage(conversation, text, ChatSenderRole.ENDPOINT_USER, ChatMessageKind.HUMAN_FORMAL)
-        enqueue(message, conversation.copy(mode = ConversationMode.HUMAN_HANDOVER))
+        val queuedAi = queue.snapshot().filter { it.message.conversationId == conversationId &&
+            it.message.kind == ChatMessageKind.AI_FORMAL && matchesEndpoint(it, conversation.remoteEndpointId) }.map { it.message.messageId }.toSet()
+        enqueue(message, conversation.handover())
+        conversationMessages[conversationId]?.removeAll { it.senderEndpointId == conversation.localEndpointId && it.messageId in queuedAi }
         appendMessage(message, currentSettings.endpointId)
         flushQueued(conversationId)
         return message
@@ -288,7 +301,7 @@ class TunnelChatRuntime(
     @Synchronized fun resumeAi(conversationId: String) {
         val conversation = requireOpen(conversationId)
         require(conversation.verified && !conversation.visitor) { "不能修改对方的接待模式。" }
-        save(conversation.copy(mode = ConversationMode.AI, waitingNotified = false))
+        save(conversation.resumeAi())
         publishState(state.message)
     }
 
@@ -322,26 +335,22 @@ class TunnelChatRuntime(
         retryScheduler.shutdownNow()
     }
 
-    private fun enqueue(message: ChatMessage, conversation: TunnelConversation, allowFull: Boolean = false): Boolean {
+    private fun enqueue(message: ChatMessage, conversation: TunnelConversation, allowFull: Boolean = false, receptionId: String? = null): Boolean {
         require(message.toJson().toString().toByteArray(Charsets.UTF_8).size <= TunnelChatProtocol.MAX_MESSAGE_BYTES) { "聊天消息过大。" }
         val next = conversation.copy(sequence = message.seq)
-        if (!queue.enqueue(message, next.remoteEndpointId, conversation = next)) {
+        if (!queue.enqueue(message, next.remoteEndpointId, conversation = next, receptionId = receptionId)) {
             check(allowFull) { "本地待发消息队列已满。" }
             return false
         }
-        records[key(next.id)] = next
         return true
     }
 
     private fun key(id: String, origin: String = currentSettings.platformOrigin, local: String = currentSettings.endpointId) =
         Triple(origin, local, id)
 
-    private fun record(id: String) = records[key(id)]
+    private fun record(id: String) = queue.conversation(id, currentSettings.platformOrigin, currentSettings.endpointId)
 
-    private fun save(conversation: TunnelConversation) {
-        queue.save(conversation)
-        records[key(conversation.id)] = conversation
-    }
+    private fun save(conversation: TunnelConversation) = queue.save(conversation)
 
     private fun newConversation(id: String, remote: String, visitor: Boolean) =
         TunnelConversation(id, currentSettings.platformOrigin, currentSettings.endpointId, remote, visitor)
@@ -362,12 +371,20 @@ class TunnelChatRuntime(
         payload = JSONObject().put("text", text),
     )
 
-    @Synchronized private fun flushQueued(conversationId: String) {
+    private fun flushQueued(conversationId: String, afterHandshake: Boolean = false) {
         val binding = binding(conversationId) ?: return
         if (!authenticatedSessions.contains(binding.sessionId)) return
-        queue.due().filter { it.message.conversationId == conversationId && matchesEndpoint(it, binding.remoteEndpointId) }.forEach { row ->
+        val due = queue.due()
+        // 结束通知必须在这条刚验签的连接上立即尝试，不能等退避跨过关闭计时器。
+        val rows = (if (afterHandshake && record(conversationId)?.closed == true) queue.snapshot().filter { it.message.isEnd() } else due)
+            .filter { it.message.conversationId == conversationId && matchesEndpoint(it, binding.remoteEndpointId) }
+        queue.markAttempts(rows)
+        sendQueued(binding, rows)
+    }
+
+    private fun sendQueued(binding: SessionBinding, rows: List<TunnelQueuedMessage>) {
+        rows.forEach { row ->
             val sent = authenticatedSessions.contains(binding.sessionId) && transport?.sendJson(binding.sessionId, TunnelChatProtocol.message(row.message)) == true
-            queue.markAttempt(row.message.messageId, delayMs = queue.retryDelayMs(row.attempts))
             if (!sent) publishState("离线消息仍在等待确认。")
         }
     }
@@ -377,25 +394,33 @@ class TunnelChatRuntime(
             row.message.senderEndpointId == currentSettings.endpointId
 
     private fun retryQueued() {
-        queue.due().groupBy { it.message.conversationId }.forEach { (conversationId, rows) ->
-            val row = rows.firstOrNull { matchesEndpoint(it, it.targetEndpointId) } ?: return@forEach
+        val ready = mutableListOf<Pair<SessionBinding, List<TunnelQueuedMessage>>>()
+        val reconnect = mutableListOf<TunnelConversation>()
+        val attempted = mutableListOf<TunnelQueuedMessage>()
+        val due = queue.due().filter { matchesEndpoint(it, it.targetEndpointId) }
+        queue.retireClosed(sessionBindings.values.map { it.conversationId }.toSet())
+        due.groupBy { it.message.conversationId }.forEach { (conversationId, rows) ->
+            val row = rows.first()
             val conversation = record(conversationId) ?: run {
                 // 旧版待发访客文本没有会话记录。无法恢复旧版接待状态，不为旧版 AI 正式回复重建状态。
                 if (row.message.senderRole != ChatSenderRole.VISITOR || row.message.kind != ChatMessageKind.TEXT) return@forEach
                 newConversation(conversationId, row.targetEndpointId, visitor = true)
                     .copy(sequence = rows.filter { matchesEndpoint(it, row.targetEndpointId) }.maxOf { it.message.seq }).also { save(it) }
             }
-            if (conversation.remoteEndpointId != row.targetEndpointId || conversation.closed && !row.message.isEnd()) return@forEach
+            val selected = rows.filter { matchesEndpoint(it, conversation.remoteEndpointId) && (!conversation.closed || it.message.isEnd()) }
+            if (selected.isEmpty()) return@forEach
             val binding = binding(conversationId)
-            if (binding != null) {
-                flushQueued(conversationId)
-            } else {
-                rows.filter { matchesEndpoint(it, conversation.remoteEndpointId) }.forEach {
-                    queue.markAttempt(it.message.messageId, delayMs = queue.retryDelayMs(it.attempts))
-                }
-                runCatching { connect(conversation) }
+            if (binding == null) {
+                attempted += selected
+                reconnect += conversation
+            } else if (binding.sessionId in authenticatedSessions) {
+                attempted += selected
+                ready += binding to selected
             }
         }
+        queue.markAttempts(attempted)
+        ready.forEach { (binding, rows) -> sendQueued(binding, rows) }
+        reconnect.forEach { runCatching { connect(it) } }
     }
 
     private fun handleSignalingEvent(event: TunnelSignalingEvent) {
@@ -447,11 +472,12 @@ class TunnelChatRuntime(
             "offer" -> {
                 val offer = event.payload.optString("sdp")
                 val conversationId = event.payload.optString("conversation_id", sessionId)
-                val reconnect = conversationId != sessionId
+                val freshLink = conversationId != sessionId
                 val previous = record(conversationId)
+                if (sessionBindings[sessionId]?.let { it.conversationId != conversationId || it.remoteEndpointId != source } == true) return
                 if (offer.isBlank() || !validId(sessionId) || !validId(conversationId) ||
-                    reconnect && previous?.verified != true || previous?.verified == true && !reconnect || previous != null &&
-                    (previous.remoteEndpointId != source || !reconnect && (previous.visitor || previous.closed))) {
+                    currentSettings.publication == TunnelPublication.HIDDEN || !TunnelConversation.acceptsOffer(previous, source, freshLink) ||
+                    previous == null && queue.isRetired(conversationId, currentSettings.platformOrigin, currentSettings.endpointId)) {
                     signaling.closeSession(sessionId, source)
                     return
                 }
@@ -464,7 +490,8 @@ class TunnelChatRuntime(
                     }
                     disconnectSession(existing.sessionId, notify = true)
                 }
-                when (admission.open(conversationId, reconnect = reconnect)) {
+                // 只有已绑定并验签的端点可以跳过新会话限频；未知会话仍走首次接待。
+                when (admission.open(conversationId, reconnect = previous?.verified == true || previous?.visitor == true)) {
                     is TunnelConversationAdmission.AdmissionResult.Accepted -> {
                         val conversation = previous ?: newConversation(conversationId, source, visitor = false)
                         val attempt = SessionBinding(sessionId, conversation, initiator = false)
@@ -541,7 +568,8 @@ class TunnelChatRuntime(
                 val conversation = record(binding.conversationId) ?: binding.conversation
                 if (!conversation.verified) save(conversation.copy(verified = true))
                 authenticatedSessions += binding.sessionId
-                flushQueued(binding.conversationId)
+                retryInitialOffer.remove(binding.conversationId)
+                flushQueued(binding.conversationId, afterHandshake = true)
                 if (conversation.closed) expireClosing(binding)
                 publishState(state.message)
                 return
@@ -565,40 +593,23 @@ class TunnelChatRuntime(
         }
         val message = runCatching { ChatMessage.fromJson(frame) }.getOrNull() ?: return
         if (message.conversationId != binding.conversationId || message.senderEndpointId != binding.remoteEndpointId) return
-        if (message.isEnd()) {
+        val permitted = if (message.isEnd()) {
             val role = if (conversation.visitor) ChatSenderRole.ENDPOINT_USER else ChatSenderRole.VISITOR
-            if (message.senderRole != role) return
-            if (!conversation.closed) {
-                save(conversation.copy(closed = true, receivedMessageIds = rememberMessage(conversation, message.messageId)))
-                appendMessage(message, binding.remoteEndpointId)
-            }
-            signalingAck(binding, ChatAck(message.messageId, message.conversationId, ChatAck.Status.RECEIVED))
-            expireClosing(binding)
-            return
-        }
-        if (conversation.closed) return
-        val permitted = if (conversation.visitor) {
+            message.senderRole == role
+        } else if (conversation.closed) false else if (conversation.visitor) {
             (message.senderRole == ChatSenderRole.AI && message.kind in setOf(ChatMessageKind.AI_FORMAL, ChatMessageKind.CONVERSATION_EVENT)) ||
                 (message.senderRole == ChatSenderRole.ENDPOINT_USER && message.kind == ChatMessageKind.HUMAN_FORMAL)
         } else message.senderRole == ChatSenderRole.VISITOR && message.kind == ChatMessageKind.TEXT
         if (!permitted) return
-        if (message.messageId in conversation.receivedMessageIds) {
-            signalingAck(binding, ChatAck(message.messageId, message.conversationId, ChatAck.Status.DUPLICATE))
-            return
+        val status = queue.receive(conversation, message)
+        if (status == ChatAck.Status.REJECTED) return
+        signalingAck(binding, ChatAck(message.messageId, message.conversationId, status))
+        if (message.isEnd()) expireClosing(binding)
+        if (status == ChatAck.Status.RECEIVED) {
+            messageListener?.invoke(message, binding.remoteEndpointId)
+            publishState(state.message)
+            pumpReception()
         }
-        val accepted = deduplicator.accept("${binding.remoteEndpointId}/${binding.conversationId}/${message.messageId}")
-        if (!accepted) {
-            signalingAck(binding, ChatAck(message.messageId, message.conversationId, ChatAck.Status.DUPLICATE))
-            return
-        }
-        val nextConversation = conversation.copy(
-            mode = if (conversation.visitor && message.kind == ChatMessageKind.HUMAN_FORMAL) ConversationMode.HUMAN_HANDOVER else conversation.mode,
-            receivedMessageIds = rememberMessage(conversation, message.messageId),
-        )
-        save(nextConversation)
-        signalingAck(binding, ChatAck(message.messageId, message.conversationId, ChatAck.Status.RECEIVED))
-        appendMessage(message, binding.remoteEndpointId)
-        if (message.senderRole == ChatSenderRole.VISITOR && !conversation.visitor) scheduleAi(nextConversation, message)
     }
 
     private fun signalingAck(binding: SessionBinding, ack: ChatAck) {
@@ -620,7 +631,7 @@ class TunnelChatRuntime(
     private fun publishState(message: String) = update(state.copy(message = message))
 
     private fun appendMessage(message: ChatMessage, remoteEndpointId: String) {
-        val rows = conversationMessages.getOrPut(message.conversationId) { CopyOnWriteArrayList() }
+        val rows = conversationMessages.getOrPut(message.conversationId) { mutableListOf() }
         if (rows.none { it.messageId == message.messageId }) {
             rows += message
             if (rows.size > 200) rows.removeAt(0)
@@ -629,64 +640,92 @@ class TunnelChatRuntime(
         publishState(state.message)
     }
 
-    private fun rememberMessage(conversation: TunnelConversation, messageId: String): List<String> =
-        (conversation.receivedMessageIds + messageId).takeLast(10_000)
-
     private fun TunnelConversation.canReply() = canReply(currentSettings.maxAiReplies)
 
-    private fun scheduleAi(conversation: TunnelConversation, message: ChatMessage) {
-        val text = message.payload.optString("text").takeIf { it.isNotBlank() } ?: return
+    private fun pumpReception() {
+        if (!engineReady || !currentSettings.enabled || receiving) return
         val responder = aiResponder ?: return
-        val scope = key(conversation.id)
+        pendingReply?.let {
+            if (!finishReception(it)) return
+            pendingReply = null
+        }
+        val conversations = currentConversations()
+        conversations.filter { !it.waitingNotified && it.aiRepliesSent > 0 && !it.canReply() }.forEach { notifyWaitingHuman(it) }
+        val (conversation, receipt) = conversations.mapNotNull { chat ->
+            if (chat.closed) null else chat.inbox.firstOrNull { it.pending }?.let { chat to it }
+        }.minByOrNull { (_, receipt) -> receipt.receivedAt } ?: return
+        val text = checkNotNull(receipt.message).payload.optString("text")
+        val formal = conversation.canPublish(receipt, currentSettings.maxAiReplies)
+        if (conversation.mode == ConversationMode.AI && receipt.receptionVersion == conversation.receptionVersion && !formal) {
+            if (!notifyWaitingHuman(conversation)) return
+            queue.finishReception(conversation, receipt.messageId)
+            onWorker { pumpReception() }
+            return
+        }
+        val epoch = receptionEpoch
         val sessionKey = UUID.nameUUIDFromBytes(JSONArray(listOf(conversation.platformOrigin, conversation.localEndpointId,
             conversation.remoteEndpointId, conversation.id)).toString().toByteArray(Charsets.UTF_8)).toString()
+        receiving = true
         try {
             aiWorker.execute {
-                val reception = synchronized(this) {
-                    if (!engineReady || !currentSettings.enabled || key(conversation.id) != scope) return@execute
-                    val live = record(conversation.id)?.takeUnless { it.closed } ?: return@execute
-                    if (!live.canReply() && live.mode == ConversationMode.AI) {
-                        onWorker { record(conversation.id)?.takeIf { key(it.id) == scope }?.let(::notifyWaitingHuman) }
-                        return@execute
-                    }
-                    live.mode
-                }
-                val formal = reception == ConversationMode.AI
                 val request = TunnelChatAiRequest(sessionKey, conversation.remoteEndpointId, text.take(4_000), formal)
                 val reply = runCatching { responder(request) }.getOrNull()?.trim().orEmpty()
                 onWorker {
-                    if (!engineReady || !currentSettings.enabled || key(conversation.id) != scope) return@onWorker
-                    val live = record(conversation.id)?.takeUnless { it.closed } ?: return@onWorker
-                    if (reply.isBlank()) {
-                        publishState(if (formal) "AI 回复失败，端点用户仍可回复。" else "未能生成 AI 内部建议。")
-                        return@onWorker
+                    receiving = false
+                    if (epoch == receptionEpoch) {
+                        pendingReply = ReceptionReply(conversation, receipt.messageId, formal, reply.take(4_000))
                     }
-                    runCatching {
-                        if (formal && live.canReply()) sendAiFormalText(live, reply.take(4_000))
-                        else if (live.mode == ConversationMode.HUMAN_HANDOVER) {
-                            val internal = textMessage(live, reply.take(4_000), ChatSenderRole.AI, ChatMessageKind.AI_SUGGESTION)
-                            appendMessage(internal, currentSettings.endpointId)
-                        }
-                    }.onFailure { publishState("AI 回复未能加入待发队列。") }
+                    runCatching { pumpReception() }.onFailure { publishState("AI 接待结果保存失败。") }
                 }
             }
         } catch (_: RejectedExecutionException) {
+            receiving = false
             publishState("AI 接待繁忙，端点用户仍可回复。")
         }
     }
 
-    private fun notifyWaitingHuman(conversation: TunnelConversation) {
-        if (conversation.closed || conversation.mode != ConversationMode.AI || conversation.canReply() || conversation.waitingNotified) return
-        val message = textMessage(conversation, "AI 正式回复已达上限，等待人工回复。", ChatSenderRole.AI, ChatMessageKind.CONVERSATION_EVENT)
-        message.payload.put("event", "waiting_human")
-        if (enqueue(message, conversation.copy(waitingNotified = true), allowFull = true)) {
-            appendMessage(message, currentSettings.endpointId)
-            flushQueued(conversation.id)
+    private fun finishReception(reply: ReceptionReply): Boolean {
+        val conversation = reply.conversation
+        if (key(conversation.id, conversation.platformOrigin, conversation.localEndpointId) != key(conversation.id)) return true
+        val live = record(conversation.id)?.takeIf { it.verified && !it.closed && it.remoteEndpointId == conversation.remoteEndpointId }
+            ?: return true
+        val receipt = live.inbox.firstOrNull { it.pending && it.messageId == reply.messageId } ?: return true
+        if (reply.text.isNotBlank() && reply.formal && live.canPublish(receipt, currentSettings.maxAiReplies)) {
+            val message = textMessage(live, reply.text, ChatSenderRole.AI, ChatMessageKind.AI_FORMAL).copy(replyTo = receipt.messageId)
+            if (!queue.canFit(message)) {
+                queue.finishReception(live, receipt.messageId)
+                publishState("AI 回复超过队列大小限制，端点用户仍可回复。")
+                return true
+            }
+            if (sendAiFormalText(live, receipt, message)) return true
+            publishState("待发队列已满，AI 回复将重试。")
+            return false
         }
+        queue.finishReception(live, receipt.messageId)
+        if (reply.text.isBlank()) {
+            publishState(if (reply.formal) "AI 回复失败，端点用户仍可回复。" else "未能生成 AI 内部建议。")
+        } else if (!reply.formal || live.mode == ConversationMode.HUMAN_HANDOVER) {
+            appendMessage(textMessage(live, reply.text, ChatSenderRole.AI, ChatMessageKind.AI_SUGGESTION), currentSettings.endpointId)
+        }
+        return true
     }
 
-    private fun snapshots(): List<TunnelChatConversationSnapshot> = (if (!currentSettings.enabled) emptyList() else records.values
-        .filter { it.platformOrigin == currentSettings.platformOrigin && it.localEndpointId == currentSettings.endpointId })
+    private fun notifyWaitingHuman(conversation: TunnelConversation): Boolean {
+        val live = record(conversation.id) ?: return true
+        if (!live.verified || live.visitor || live.closed || live.mode != ConversationMode.AI || live.canReply() || live.waitingNotified) return true
+        val message = textMessage(live, "AI 正式回复已达上限，等待人工回复。", ChatSenderRole.AI, ChatMessageKind.CONVERSATION_EVENT)
+        message.payload.put("event", "waiting_human")
+        if (!queue.canFit(message)) return true
+        if (!enqueue(message, live.copy(waitingNotified = true), allowFull = true)) return false
+        appendMessage(message, currentSettings.endpointId)
+        flushQueued(live.id)
+        return true
+    }
+
+    private fun currentConversations(): List<TunnelConversation> = if (!currentSettings.enabled) emptyList()
+        else queue.conversations().filter { it.platformOrigin == currentSettings.platformOrigin && it.localEndpointId == currentSettings.endpointId }
+
+    private fun snapshots(): List<TunnelChatConversationSnapshot> = currentConversations()
         .map { conversation ->
             val binding = binding(conversation.id)
             val connected = binding != null && binding.sessionId in authenticatedSessions
@@ -699,17 +738,34 @@ class TunnelChatRuntime(
                 closed = conversation.closed,
                 mode = conversation.mode,
                 aiRepliesSent = conversation.aiRepliesSent,
-                messages = conversationMessages[conversation.id]?.toList().orEmpty(),
+                messages = (conversation.inbox.mapNotNull { receipt -> receipt.message?.let { receipt.receivedAt to it } } +
+                    conversationMessages[conversation.id].orEmpty().map { it.createdAt to it })
+                    .sortedBy { it.first }.takeLast(200).map { it.second },
             )
         }.sortedBy { it.conversationId }
 
     private fun disconnectSession(sessionId: String, notify: Boolean = false) {
         val binding = sessionBindings.remove(sessionId) ?: return
-        authenticatedSessions.remove(sessionId)
+        val authenticated = authenticatedSessions.remove(sessionId)
+        val retry = !authenticated && binding.initiator && binding.conversation.visitor && binding.conversation.verified &&
+            !binding.conversation.closed && sessionId != binding.conversationId
+        if (!authenticated && binding.initiator && binding.conversation.visitor && binding.conversation.verified) {
+            // 对端可能在保存首次验签结果前退出。下次用原会话编号尝试首次接待，失败再尝试独立连接编号。
+            if (retry) retryInitialOffer += binding.conversationId
+            else retryInitialOffer -= binding.conversationId
+        }
         admission.close(binding.conversationId)
         if (notify && state.status == Status.ONLINE) signaling.closeSession(sessionId, binding.remoteEndpointId)
         transport?.discardSession(sessionId)
         publishState(state.message)
+        if (retry && state.status == Status.ONLINE) {
+            val run = generation
+            onWorker {
+                if (!isCurrent(run) || binding.conversationId !in retryInitialOffer || binding(binding.conversationId) != null) return@onWorker
+                val conversation = record(binding.conversationId)?.takeUnless { it.closed } ?: return@onWorker
+                runCatching { connect(conversation) }
+            }
+        }
     }
 
     private fun expireNegotiation(binding: SessionBinding) {
@@ -757,6 +813,8 @@ class TunnelChatRuntime(
     private fun isCurrent(run: Long): Boolean = run == generation && acceptingSignals && !closed
 
     private fun validId(value: String): Boolean = value.matches(Regex("[A-Za-z0-9][A-Za-z0-9._:-]{0,127}"))
+
+    private data class ReceptionReply(val conversation: TunnelConversation, val messageId: String, val formal: Boolean, val text: String)
 
     private class SessionBinding(val sessionId: String, val conversation: TunnelConversation, val initiator: Boolean) {
         val conversationId get() = conversation.id
