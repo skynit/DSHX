@@ -198,9 +198,9 @@ private fun TunnelChatSettingsContent(runtime: TunnelChatRuntime, runtimeState: 
         }
         Divider()
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            AssistantField("公开名称", displayName, 80, false, 1, "留空时使用端点编号")
-            AssistantField("公开身份介绍", introduction, 2_000, false, 4, "对同一平台的访客可见")
-            AssistantField("穿透平台", platform, 256, false, 1, TunnelChatProtocol.DEFAULT_PLATFORM_ORIGIN)
+            AssistantField("公开名称", displayName, 80, false, 1, "留空时使用端点编号", bottomSpacing = 0.dp)
+            AssistantField("公开身份介绍", introduction, 2_000, false, 4, "对同一平台的访客可见", bottomSpacing = 0.dp)
+            AssistantField("穿透平台", platform, 256, false, 1, TunnelChatProtocol.DEFAULT_PLATFORM_ORIGIN, bottomSpacing = 0.dp)
             Note("端点编号：${runtime.settings().endpointId}")
         }
         Divider()
@@ -215,8 +215,8 @@ private fun TunnelChatSettingsContent(runtime: TunnelChatRuntime, runtimeState: 
         }
         Divider()
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            AssistantField("接收间隔（秒）", interval, 5, false, 1, "默认 5 秒，仅限制新聊天")
-            AssistantField("每个会话的 AI 正式回复上限", maxReplies, 4, false, 1, "默认 10 条，设为 0 时不自动回复")
+            AssistantField("接收间隔（秒）", interval, 5, false, 1, "默认 5 秒，仅限制新聊天", bottomSpacing = 0.dp)
+            AssistantField("每个会话的 AI 正式回复上限", maxReplies, 4, false, 1, "默认 10 条，设为 0 时不自动回复", bottomSpacing = 0.dp)
         }
     }
     Section("远端能力")

@@ -63,6 +63,7 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
@@ -1064,7 +1065,11 @@ internal fun MemoryDialog(title: String, close: () -> Unit, scroll: Boolean = tr
 }
 
 @Composable
-internal fun AssistantField(label: String, state: TextFieldState, limit: Int, disabled: Boolean, lines: Int, hint: String = "", secret: Boolean = false, codePoints: Boolean = false, issue: String? = null, minLines: Int = 1) {
+internal fun AssistantField(
+    label: String, state: TextFieldState, limit: Int, disabled: Boolean, lines: Int, hint: String = "",
+    secret: Boolean = false, codePoints: Boolean = false, issue: String? = null, minLines: Int = 1,
+    bottomSpacing: Dp = 16.dp,
+) {
     var focused by remember { mutableStateOf(false) }
     val value = state.text.toString().trim()
     val size = if (codePoints) value.codePointCount(0, value.length) else value.length
@@ -1099,7 +1104,7 @@ internal fun AssistantField(label: String, state: TextFieldState, limit: Int, di
             lineLimits = if (lines == 1) TextFieldLineLimits.SingleLine else TextFieldLineLimits.MultiLine(minHeightInLines = minLines, maxHeightInLines = lines))
         if (invalid) Text(issue ?: "超出长度限制，请缩短后保存。", fontSize = 12.sp, color = colors.error)
     }
-    Spacer(Modifier.height(16.dp))
+    if (bottomSpacing > 0.dp) Spacer(Modifier.height(bottomSpacing))
 }
 
 @Composable
