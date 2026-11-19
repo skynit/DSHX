@@ -1,16 +1,29 @@
 package local.dshx.app
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -19,126 +32,229 @@ import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.runtime.setValue
 import androidx.compose.foundation.text.input.rememberTextFieldState
 import androidx.compose.foundation.text.input.setTextAndPlaceCursorAtEnd
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.composables.icons.lucide.Compass
 import com.composables.icons.lucide.Lucide
+import com.composables.icons.lucide.MessagesSquare
 import com.composables.icons.lucide.RotateCcw
 import com.composables.icons.lucide.Send
+import com.composables.icons.lucide.Settings2
 import com.composables.icons.lucide.X
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import top.yukonga.miuix.kmp.basic.Text
+import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 @Composable
-internal fun TunnelChatDirectoryAndConversations(runtime: TunnelChatRuntime, runtimeState: TunnelChatRuntimeState, platformOrigin: String) {
+internal fun TunnelChatScreen(
+    runtime: TunnelChatRuntime, runtimeState: TunnelChatRuntimeState, visible: Boolean, onSettings: () -> Unit,
+) {
+    val settings = runtime.settings()
+    var discover by rememberSaveable { mutableStateOf(false) }
+    var selectedConversationId by rememberSaveable { mutableStateOf<String?>(null) }
+    val drafts = rememberSaveableStateHolder()
+    BoxWithConstraints(Modifier.fillMaxSize()) {
+        val gutter = if (maxWidth >= 600.dp) 32.dp else 16.dp
+        Column(Modifier.align(Alignment.TopCenter).widthIn(max = 680.dp).fillMaxSize().padding(horizontal = gutter)) {
+            Row(Modifier.fillMaxWidth().padding(top = 12.dp, bottom = 16.dp), verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text("聊天", fontSize = 22.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.semantics { heading() })
+                    Note(runtimeState.message)
+                }
+                VoiceButton("聊天设置", Lucide.Settings2, onSettings, iconSize = 18)
+            }
+            Row(Modifier.fillMaxWidth().selectableGroup().clip(RoundedCornerShape(10.dp))
+                .background(MiuixTheme.colorScheme.surfaceVariant).padding(4.dp),
+                horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                listOf(Triple(false, "会话", Lucide.MessagesSquare), Triple(true, "发现", Lucide.Compass)).forEach { (value, label, icon) ->
+                    val selected = discover == value
+                    val tint = if (selected) MiuixTheme.colorScheme.onSurface else MiuixTheme.colorScheme.onSurfaceVariantSummary
+                    Row(Modifier.weight(1f).heightIn(min = 48.dp).clip(RoundedCornerShape(8.dp))
+                        .selectionBackground(selected).selectable(selected, role = Role.Tab) { discover = value },
+                        horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
+                        verticalAlignment = Alignment.CenterVertically) {
+                        Icon(icon, contentDescription = null, modifier = Modifier.size(16.dp), tint = tint)
+                        Text(label, fontSize = 14.sp, color = tint, fontWeight = if (selected) FontWeight.Medium else FontWeight.Normal)
+                    }
+                }
+            }
+            key(discover, settings.platformOrigin, selectedConversationId.takeUnless { discover }) {
+                Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()).padding(vertical = 16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    if (discover) {
+                        TunnelDirectory(runtime, settings, visible, onSettings) { conversationId ->
+                            selectedConversationId = conversationId
+                            discover = false
+                        }
+                    } else if (runtimeState.conversations.isEmpty()) {
+                        LibraryEmpty(Lucide.MessagesSquare, "暂无会话",
+                            if (settings.enabled) "从端点目录发起聊天，或等待访客联系。" else "穿透聊天尚未开启。") {
+                            if (settings.enabled) Action("发现端点", { discover = true }, icon = Lucide.Compass)
+                            else Action("打开聊天设置", onSettings, primary = true, icon = Lucide.Settings2)
+                        }
+                    } else {
+                        TunnelConversations(runtimeState.conversations, selectedConversationId, { selectedConversationId = it }) { conversation ->
+                            drafts.SaveableStateProvider(conversation.conversationId) { TunnelConversationPanel(runtime, conversation) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TunnelDirectory(
+    runtime: TunnelChatRuntime, settings: TunnelChatSettings, visible: Boolean, onSettings: () -> Unit, onOpen: (String) -> Unit,
+) {
     val scope = rememberCoroutineScope()
     val query = rememberTextFieldState()
-    val drafts = rememberSaveableStateHolder()
+    var submittedQuery by remember { mutableStateOf("") }
     var directory by remember { mutableStateOf<TunnelDirectoryPage?>(null) }
     var loading by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var opening by remember { mutableStateOf<String?>(null) }
-    var selectedConversationId by rememberSaveable { mutableStateOf<String?>(null) }
 
-    fun load(cursor: String? = null, append: Boolean = false) {
+    fun load(cursor: String? = null) {
         if (loading) return
+        val filter = if (cursor == null) query.text.toString().trim().take(80) else submittedQuery
         loading = true
         error = null
         scope.launch {
-            runCatching {
-                withContext(Dispatchers.IO) {
-                    runtime.listPublicEndpoints(platformOrigin, query.text.toString().trim().takeIf { it.isNotBlank() }, cursor)
+            try {
+                val next = withContext(Dispatchers.IO) {
+                    runtime.listPublicEndpoints(settings.platformOrigin, filter.ifBlank { null }, cursor)
                 }
-            }.onSuccess { next ->
-                directory = if (append && directory != null) {
-                    TunnelDirectoryPage((directory!!.items + next.items).distinctBy { it.endpointId }, next.nextCursor)
-                } else next
+                directory = if (cursor == null) next else
+                    next.copy(items = (directory?.items.orEmpty() + next.items).distinctBy { it.endpointId })
+                submittedQuery = filter
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                error = failure.message ?: "公共端点目录暂时不可用。"
+            } finally {
+                loading = false
             }
-                .onFailure { error = it.message ?: "公共端点目录暂时不可用。" }
-            loading = false
         }
     }
 
-    fun refresh() = load()
+    LaunchedEffect(visible) { if (visible && directory == null) load() }
 
-    LaunchedEffect(platformOrigin) { refresh() }
-
-    Section("公共端点目录")
-    Panel {
-        AssistantField("搜索端点", query, 80, loading, 1, "按公开名称或介绍搜索")
-        Action("刷新", ::refresh, enabled = !loading, icon = Lucide.RotateCcw)
-        error?.let { Text(it, fontSize = 13.sp, color = MiuixTheme.colorScheme.error) }
-        val items = directory?.items.orEmpty().filter { item ->
-            val filter = query.text.toString().trim()
-            filter.isBlank() || item.displayName.contains(filter, true) || item.publicIntroduction.contains(filter, true)
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Box(Modifier.weight(1f)) {
+            LibrarySearch(query, "搜索公开端点", submit = { load() })
         }
-        if (items.isEmpty()) {
-            Note(if (loading) "正在读取公共端点…" else "暂时没有可显示的公开端点。隐身端点不会出现在这里。")
-        } else {
+        LibraryIcon(Lucide.RotateCcw, "刷新端点目录", { load() }, enabled = !loading)
+    }
+    if (!settings.enabled) Panel(padding = 0) {
+        LinkRow("穿透聊天未开启", "开启后可联系公开端点", onSettings)
+    }
+    error?.let { Text(it, fontSize = 13.sp, color = MiuixTheme.colorScheme.error) }
+    val items = directory?.items.orEmpty()
+    if (items.isEmpty()) {
+        if (loading) Note("正在读取端点目录…")
+        else if (error == null) LibraryEmpty(Lucide.Compass,
+            if (submittedQuery.isBlank()) "暂无公开端点" else "没有匹配的端点",
+            if (submittedQuery.isBlank()) "隐身端点不会出现在目录中。" else "试试其他名称或身份介绍。")
+    } else {
+        Panel {
             items.forEachIndexed { index, endpoint ->
                 if (index > 0) Divider()
-                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    val isSelf = endpoint.endpointId == runtime.settings().endpointId
-                    Text(endpoint.displayName.ifBlank { endpoint.endpointId }, fontSize = 15.sp)
-                    Note(endpoint.publicIntroduction.ifBlank { "未填写公开身份介绍。" })
-                    Note("${if (isSelf) "本端" else if (endpoint.online) "在线" else "离线"} · ${if (endpoint.acceptance == TunnelAcceptance.ACCEPTING) "接受新聊天" else "暂停新聊天"} · ${endpoint.endpointId}")
-                    Action(if (opening == endpoint.endpointId) "正在发起…" else "发起聊天", {
+                Column(Modifier.padding(vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    val isSelf = endpoint.endpointId == settings.endpointId
+                    Text(endpoint.displayName.ifBlank { endpoint.endpointId }, fontSize = 15.sp, fontWeight = FontWeight.Medium)
+                    Note(when {
+                        isSelf -> "本端"
+                        endpoint.acceptance == TunnelAcceptance.PAUSED -> "暂停新聊天"
+                        endpoint.online -> "在线"
+                        else -> "离线"
+                    })
+                    if (endpoint.publicIntroduction.isNotBlank()) Note(endpoint.publicIntroduction)
+                    if (!isSelf) Action(if (opening == endpoint.endpointId) "正在发起…" else "发起聊天", {
                         if (opening != null) return@Action
                         opening = endpoint.endpointId
                         error = null
                         scope.launch {
                             try {
-                                runCatching {
-                                    withContext(Dispatchers.IO) { runtime.startConversation(endpoint, platformOrigin) }
-                                }
-                                    .onSuccess { selectedConversationId = it }
-                                    .onFailure { error = it.message ?: "聊天连接未能发起。" }
+                                val id = withContext(Dispatchers.IO) { runtime.startConversation(endpoint, settings.platformOrigin) }
+                                onOpen(id)
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
+                            } catch (failure: Exception) {
+                                error = failure.message ?: "聊天连接未能发起。"
                             } finally {
                                 opening = null
                             }
                         }
-                    }, enabled = opening == null && !isSelf && endpoint.acceptance == TunnelAcceptance.ACCEPTING && runtime.settings().enabled,
+                    }, enabled = opening == null && endpoint.acceptance == TunnelAcceptance.ACCEPTING && settings.enabled,
                         icon = Lucide.Send)
                 }
             }
-            directory?.nextCursor?.let { cursor ->
-                Spacer(Modifier.height(8.dp))
-                Action("加载更多", { load(cursor, append = true) }, enabled = !loading, icon = Lucide.RotateCcw)
-            }
         }
     }
+    directory?.nextCursor?.let { cursor -> Action("加载更多", { load(cursor) }, enabled = !loading) }
+}
 
-    if (runtimeState.conversations.isNotEmpty()) {
-        Section("聊天会话")
+@Composable
+private fun TunnelConversations(
+    conversations: List<TunnelChatConversationSnapshot>, selectedId: String?, onSelect: (String?) -> Unit,
+    content: @Composable (TunnelChatConversationSnapshot) -> Unit,
+) {
+    val selected = conversations.firstOrNull { it.conversationId == selectedId }
+    if (selected != null) {
+        Action("所有会话", { onSelect(null) })
         Panel {
-            runtimeState.conversations.forEachIndexed { index, conversation ->
+            val (title, summary) = selected.label(fullId = true)
+            Text(title, fontSize = 16.sp, fontWeight = FontWeight.Medium)
+            Note(summary)
+            Spacer(Modifier.height(12.dp))
+            content(selected)
+        }
+    } else {
+        Panel(padding = 0) {
+            conversations.forEachIndexed { index, conversation ->
                 if (index > 0) Divider()
-                val selected = selectedConversationId == conversation.conversationId
-                Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Text("${if (conversation.outgoing) "对方端点" else "访客"} · ${conversation.remoteEndpointId}", fontSize = 14.sp)
-                        val status = when {
-                            conversation.closed -> "已结束"
-                            conversation.connected -> "已连接"
-                            conversation.connecting -> "正在连接…"
-                            else -> "未连接"
-                        }
-                        Note(if (conversation.closed) status else "$status · ${conversation.mode.label()} · ${conversation.messages.size} 条消息")
-                    }
-                    Action(if (selected) "收起" else "查看", { selectedConversationId = if (selected) null else conversation.conversationId }, icon = if (selected) Lucide.X else Lucide.Send)
-                }
-                if (selected) {
-                    Spacer(Modifier.height(8.dp))
-                    drafts.SaveableStateProvider(conversation.conversationId) {
-                        TunnelConversationPanel(runtime, conversation)
-                    }
-                }
+                val (title, summary) = conversation.label()
+                LinkRow(title, summary) { onSelect(conversation.conversationId) }
             }
         }
     }
+}
+
+private fun TunnelChatConversationSnapshot.label(fullId: Boolean = false): Pair<String, String> {
+    val id = if (fullId || remoteEndpointId.length <= 12) remoteEndpointId else "…${remoteEndpointId.takeLast(8)}"
+    val title = "${if (outgoing) "端点" else "访客"} · $id"
+    val status = when {
+        closed -> "已结束"
+        connected -> "已连接"
+        connecting -> "正在连接…"
+        else -> "未连接"
+    }
+    val context = if (outgoing || closed) status else "$status · ${mode.label()}"
+    val preview = messages.asReversed().firstNotNullOfOrNull { message ->
+        when (message.kind) {
+            ChatMessageKind.TEXT, ChatMessageKind.AI_FORMAL, ChatMessageKind.HUMAN_FORMAL ->
+                message.payload.optString("text").trim().lineSequence().firstOrNull()
+            ChatMessageKind.IMAGE, ChatMessageKind.FILE -> message.payload.optJSONObject("attachment")?.optString("name")
+            else -> null
+        }
+    }
+    if (preview.isNullOrBlank()) return title to context
+    val snippet = if (preview.length <= 60) preview else "${preview.take(59).trimEnd()}…"
+    return title to "$context\n$snippet"
 }
 
 @Composable

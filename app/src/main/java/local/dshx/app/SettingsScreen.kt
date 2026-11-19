@@ -76,7 +76,7 @@ internal fun SettingsContent(
                 Divider()
                 LinkRow("手机操作与权限", "屏幕操作、悬浮提示与通知", { onPage(AppPage.Permissions) })
                 Divider()
-                LinkRow("穿透聊天", tunnelChatState.message, { onPage(AppPage.TunnelChat) })
+                LinkRow("聊天设置", tunnelChatState.message, { onPage(AppPage.TunnelChat) })
                 Divider()
                 LinkRow("实验体", "触发日志与培养设置", { onPage(AppPage.Hosting) })
                 Divider()
@@ -155,22 +155,21 @@ private fun TunnelChatSettingsContent(runtime: TunnelChatRuntime, runtimeState: 
     val platform = rememberTextFieldState(initial.platformOrigin)
     val interval = rememberTextFieldState((initial.newConversationIntervalMs / 1_000L).toString())
     val maxReplies = rememberTextFieldState(initial.maxAiReplies.toString())
-    var saved by remember { mutableStateOf(initial) }
-    var enabled by remember { mutableStateOf(initial.enabled) }
-    var publication by remember { mutableStateOf(initial.publication) }
-    var acceptance by remember { mutableStateOf(initial.acceptance) }
+    var enabled by rememberSaveable { mutableStateOf(initial.enabled) }
+    var publication by rememberSaveable { mutableStateOf(initial.publication) }
+    var acceptance by rememberSaveable { mutableStateOf(initial.acceptance) }
     var message by rememberSaveable { mutableStateOf<String?>(null) }
     var error by rememberSaveable { mutableStateOf<String?>(null) }
 
     fun save() {
         val seconds = interval.text.toString().trim().toLongOrNull()
         val replies = maxReplies.text.toString().trim().toIntOrNull()
-        if (seconds == null || replies == null) {
-            error = "限频和 AI 回复上限必须填写整数。"
+        if (seconds == null || seconds !in 1L..86_400L || replies == null || replies !in 0..1_000) {
+            error = "接收间隔须为 1 至 86400 秒，AI 回复上限须为 0 至 1000 条。"
             message = null
             return
         }
-        val next = saved.copy(
+        val next = runtime.settings().copy(
             enabled = enabled,
             platformOrigin = platform.text.toString(),
             displayName = displayName.text.toString(),
@@ -181,8 +180,7 @@ private fun TunnelChatSettingsContent(runtime: TunnelChatRuntime, runtimeState: 
             maxAiReplies = replies,
         )
         runCatching { runtime.saveSettings(next) }.onSuccess {
-            saved = it
-            message = "穿透聊天设置已保存。"
+            message = "聊天设置已保存。"
             error = null
         }.onFailure {
             error = it.message ?: "设置保存失败，请检查后重试。"
@@ -190,10 +188,9 @@ private fun TunnelChatSettingsContent(runtime: TunnelChatRuntime, runtimeState: 
         }
     }
 
-    Note("端点公开后，已登记到同一穿透平台的 DSHX 客户端都可以发现并尝试连接。平台只负责目录、认证和信令，不保存聊天正文。")
-    Section("公共端点")
+    Section("端点")
     Panel(padding = 0) {
-        SettingsRow("端点状态", runtimeState.message) {}
+        SettingsSwitch("穿透聊天", runtimeState.message, enabled) { enabled = it }
         if (runtimeState.pendingWithdrawal) {
             Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
                 Note("平台尚未确认撤下公开端点，客户端将自动重试。")
@@ -201,39 +198,35 @@ private fun TunnelChatSettingsContent(runtime: TunnelChatRuntime, runtimeState: 
         }
         Divider()
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            SettingsTitle("接收新聊天")
-            SettingsOptions(if (enabled) "on" else "off", listOf("on" to "开启", "off" to "关闭")) { enabled = it == "on" }
             AssistantField("公开名称", displayName, 80, false, 1, "留空时使用端点编号")
-            AssistantField("dsh 身份介绍", introduction, 2_000, false, 4, "告诉访客这个端点由谁接待、擅长什么")
+            AssistantField("公开身份介绍", introduction, 2_000, false, 4, "对同一平台的访客可见")
             AssistantField("穿透平台", platform, 256, false, 1, TunnelChatProtocol.DEFAULT_PLATFORM_ORIGIN)
-            SettingsTitle("发布状态")
-            SettingsOptions(publication.name.lowercase(), listOf("published" to "公开目录", "hidden" to "隐身")) {
-                publication = if (it == "published") TunnelPublication.PUBLISHED else TunnelPublication.HIDDEN
-            }
-            SettingsTitle("新聊天接收")
-            SettingsOptions(acceptance.name.lowercase(), listOf("accepting" to "接受", "paused" to "暂停")) {
-                acceptance = if (it == "accepting") TunnelAcceptance.ACCEPTING else TunnelAcceptance.PAUSED
-            }
-            AssistantField("新聊天最小间隔（秒）", interval, 6, false, 1, "默认 5 秒；已有聊天不受影响")
-            AssistantField("每个会话最多 AI 正式回复", maxReplies, 4, false, 1, "默认 10 条；人工正式发言后 AI 自动回复暂停")
+            Note("端点编号：${runtime.settings().endpointId}")
+        }
+        Divider()
+        SettingsSwitch("隐身模式", "不出现在目录中，也不接收新连接。", publication == TunnelPublication.HIDDEN) {
+            publication = if (it) TunnelPublication.HIDDEN else TunnelPublication.PUBLISHED
+        }
+    }
+    Section("接待规则")
+    Panel(padding = 0) {
+        SettingsSwitch("接收新聊天", "暂停接收不会结束已有聊天。", acceptance == TunnelAcceptance.ACCEPTING) {
+            acceptance = if (it) TunnelAcceptance.ACCEPTING else TunnelAcceptance.PAUSED
+        }
+        Divider()
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            AssistantField("接收间隔（秒）", interval, 5, false, 1, "默认 5 秒，仅限制新聊天")
+            AssistantField("每个会话的 AI 正式回复上限", maxReplies, 4, false, 1, "默认 10 条，设为 0 时不自动回复")
         }
     }
     Section("远端能力")
     Panel(padding = 0) {
         Column(Modifier.padding(16.dp)) {
-            Note("本地记忆、知识库、本地文件和手机操作暂未开放。")
+            Note("暂不开放本地记忆、知识库、文件和手机操作。")
         }
     }
-    Section("应用")
-    Panel {
-        Text("端点编号：${saved.endpointId}", fontSize = 13.sp)
-        Spacer(Modifier.height(12.dp))
-        Action("保存并应用", ::save, primary = true, icon = Lucide.Save)
-        SettingsFeedback(message, error)
-    }
-    androidx.compose.runtime.key(saved.platformOrigin) {
-        TunnelChatDirectoryAndConversations(runtime, runtimeState, saved.platformOrigin)
-    }
+    Action("保存设置", ::save, Modifier.fillMaxWidth(), primary = true, icon = Lucide.Save)
+    SettingsFeedback(message, error)
 }
 
 @Composable

@@ -72,6 +72,7 @@ import kotlinx.coroutines.runInterruptible
 import com.composables.icons.lucide.House
 import com.composables.icons.lucide.Lucide
 import com.composables.icons.lucide.MessageSquare
+import com.composables.icons.lucide.MessagesSquare
 import com.composables.icons.lucide.Settings2
 import com.composables.icons.lucide.ChevronDown
 import com.composables.icons.lucide.ChevronLeft
@@ -103,7 +104,8 @@ internal enum class AppPage(val title: String, val settings: Boolean = false) {
     Home("DSHX"), Chat("对话"), Settings("设置", true), Voice("语音聊天"), Logs("运行诊断"), Library("知识库"),
     Assistant("助手与资料", true), VoiceOptions("语音交互", true), Tasks("任务分工", true),
     Permissions("手机操作与权限", true), Hosting("实验体", true), HostingOptions("培养设置", true),
-    Apps("微应用", true), TunnelChat("穿透聊天", true), Backup("备份与恢复", true), Update("应用更新", true);
+    Apps("微应用", true), TunnelChat("聊天设置", true), Backup("备份与恢复", true), Update("应用更新", true),
+    TunnelInbox("聊天");
 
     val previous: AppPage get() = when {
         this == HostingOptions -> Hosting
@@ -111,6 +113,8 @@ internal enum class AppPage(val title: String, val settings: Boolean = false) {
         else -> Home
     }
 }
+
+private const val TUNNEL_TAB = 4
 
 internal val LocalStatusColor = staticCompositionLocalOf { Color(0xFF23845F) }
 
@@ -184,26 +188,31 @@ fun DshScreen(
 ) {
     var tab by rememberSaveable { mutableIntStateOf(0) }
     var settingsPage by rememberSaveable { mutableStateOf(AppPage.Settings) }
+    var tunnelSettings by rememberSaveable { mutableStateOf(false) }
     var logs by rememberSaveable { mutableStateOf(false) }
     var library by rememberSaveable { mutableStateOf(false) }
     var tabsShown by rememberSaveable { mutableStateOf(false) }
     val backGesture = remember { BackGesture() }
     var logText by remember { mutableStateOf("") }
     val savedPages = rememberSaveableStateHolder()
+    val tabPage = when (tab) {
+        1 -> AppPage.Chat
+        2 -> settingsPage
+        3 -> AppPage.Voice
+        TUNNEL_TAB -> if (tunnelSettings) AppPage.TunnelChat else AppPage.TunnelInbox
+        else -> AppPage.Home
+    }
     val page = when {
         library -> AppPage.Library
         logs -> AppPage.Logs
-        tab == 0 -> AppPage.Home
-        tab == 1 -> AppPage.Chat
-        tab == 3 -> AppPage.Voice
-        else -> settingsPage
+        else -> tabPage
     }
-    val previousPage = if (library || logs) when (tab) {
-        1 -> AppPage.Chat
-        3 -> AppPage.Voice
-        2 -> settingsPage
-        else -> AppPage.Home
-    } else page.previous
+    val previousPage = when {
+        library || logs -> tabPage
+        tab == TUNNEL_TAB && tunnelSettings -> AppPage.TunnelInbox
+        else -> page.previous
+    }
+    val showTabs = tabsShown || page == AppPage.TunnelInbox
     val visited = remember { mutableSetOf(page) }
     SideEffect { visited += page }
     val running = state.url != null
@@ -230,6 +239,7 @@ fun DshScreen(
         when {
             library -> library = false
             logs -> logs = false
+            tab == TUNNEL_TAB && tunnelSettings -> tunnelSettings = false
             tab == 2 && settingsPage != AppPage.Settings -> settingsPage = settingsPage.previous
             else -> { tab = 0; tabsShown = true }
         }
@@ -239,6 +249,7 @@ fun DshScreen(
         val changed = tab != index || logs || library
         tab = index; logs = false; library = false; tabsShown = false
         if (changed && index == 2) settingsPage = AppPage.Settings
+        if (index == TUNNEL_TAB) tunnelSettings = false
         if (startVoice && changed && index == 3 && running && voiceState.speechAvailable && !voiceState.active) onVoice("talk")
         if (changed && index == 1 && voiceState.active && !voiceState.downloading) onVoice("stop")
     }
@@ -267,21 +278,22 @@ fun DshScreen(
             modifier = Modifier.clipToBounds(),
             contentWindowInsets = WindowInsets(0, 0, 0, 0),
             bottomBar = {
-                if (!library && !logs && !(tab in 1..2 && keyboardOpen)) Column(
-                    Modifier.backBar { if (tabsShown) 1f else backGesture.backProgress }
-                        .then(if (tabsShown) Modifier else Modifier.clearAndSetSemantics {})
+                if (!library && !logs && !(keyboardOpen && (tab in 1..2 || tab == TUNNEL_TAB))) Column(
+                    Modifier.backBar { if (showTabs) 1f else backGesture.backProgress }
+                        .then(if (showTabs) Modifier else Modifier.clearAndSetSemantics {})
                         .background(MiuixTheme.colorScheme.surfaceVariant),
                 ) {
                     Divider()
                     Row(Modifier.fillMaxWidth().selectableGroup().padding(horizontal = 12.dp, vertical = 4.dp),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         listOf(Triple("工作台", Lucide.House, 0), Triple("对话", Lucide.MessageSquare, 1),
-                            Triple("语音", Lucide.Phone, 3), Triple("设置", Lucide.Settings2, 2)).forEach { (label, icon, index) ->
+                            Triple("语音", Lucide.Phone, 3), Triple("聊天", Lucide.MessagesSquare, TUNNEL_TAB),
+                            Triple("设置", Lucide.Settings2, 2)).forEach { (label, icon, index) ->
                             val selected = tab == index && !logs
                             Column(Modifier.weight(1f).heightIn(min = 48.dp).clip(RoundedCornerShape(8.dp))
                                 .selectionBackground(selected)
                                 .semantics { if (index == 3) contentDescription = "语音聊天" }
-                                .selectable(selected, enabled = tabsShown, role = Role.Tab, onClick = { selectTab(index) })
+                                .selectable(selected, enabled = showTabs, role = Role.Tab, onClick = { selectTab(index) })
                                 .padding(horizontal = 4.dp, vertical = 8.dp),
                                 verticalArrangement = Arrangement.spacedBy(4.dp, Alignment.CenterVertically), horizontalAlignment = Alignment.CenterHorizontally) {
                                 val color = if (selected) MiuixTheme.colorScheme.onSurface else MiuixTheme.colorScheme.onSurfaceVariantSummary
@@ -295,8 +307,11 @@ fun DshScreen(
         ) { padding ->
             BackPages(page, previousPage, backGesture,
                 enabled = !library && !logs && (page != AppPage.Home || !tabsShown), onBack = ::goBack,
-                pages = if (page.settings && page != AppPage.Settings) emptyList() else listOf(AppPage.Home, AppPage.Chat, AppPage.Voice, AppPage.Settings),
-                onPage = { selectTab(when (it) { AppPage.Chat -> 1; AppPage.Voice -> 3; AppPage.Settings -> 2; else -> 0 }, startVoice = false) },
+                pages = if (page.settings && page != AppPage.Settings) emptyList() else
+                    listOf(AppPage.Home, AppPage.Chat, AppPage.Voice, AppPage.TunnelInbox, AppPage.Settings),
+                onPage = { selectTab(when (it) {
+                    AppPage.Chat -> 1; AppPage.Voice -> 3; AppPage.TunnelInbox -> TUNNEL_TAB; AppPage.Settings -> 2; else -> 0
+                }, startVoice = false) },
                 web = page == AppPage.Chat && running && webReady && pageError == null,
                 canSwipe = { page != AppPage.Chat || !running || !webReady || pageError != null || canSwipeChat(it) },
                 modifier = Modifier.padding(padding).fillMaxSize()) { shownPage, current ->
@@ -315,6 +330,11 @@ fun DshScreen(
                     } else if (shownPage == AppPage.Voice && !showLogs) {
                         VoiceChat(Modifier.fillMaxSize(), voice, voiceState, running, state.busy, onVoice, onStart,
                             onSettings = { selectTab(2); settingsPage = AppPage.VoiceOptions }, onChat = { selectTab(1) }, onBack = ::goBack)
+                    } else if (shownPage == AppPage.TunnelInbox) {
+                        TunnelChatScreen(tunnelChat, tunnelChatState, visible = current, onSettings = {
+                            backGesture.reset()
+                            tunnelSettings = true
+                        })
                     } else if (shownPage == AppPage.Hosting || shownPage == AppPage.HostingOptions) {
                         SpecimenScreen(specimen, running, shownPage == AppPage.HostingOptions, current, ::goBack,
                             onOptions = { backGesture.reset(); settingsPage = AppPage.HostingOptions },
@@ -331,7 +351,12 @@ fun DshScreen(
                             if (shownPage != AppPage.Apps) Row(Modifier.fillMaxWidth().offset(x = if (hasBack) (-12).dp else 0.dp),
                                 verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
                                 if (hasBack) {
-                                    LibraryIcon(Lucide.ChevronLeft, if (shownPage.settings && shownPage != AppPage.Settings) "返回设置总览" else "返回工作台", ::goBack, iconSize = 16)
+                                    val backLabel = when {
+                                        shownPage == AppPage.TunnelChat && tab == TUNNEL_TAB -> "返回聊天"
+                                        shownPage.settings && shownPage != AppPage.Settings -> "返回设置总览"
+                                        else -> "返回工作台"
+                                    }
+                                    LibraryIcon(Lucide.ChevronLeft, backLabel, ::goBack, iconSize = 16)
                                 }
                                 Column(verticalArrangement = Arrangement.spacedBy(4.dp), modifier = Modifier.weight(1f)) {
                                     Text(shownPage.title, fontSize = 22.sp, fontWeight = FontWeight.SemiBold,
