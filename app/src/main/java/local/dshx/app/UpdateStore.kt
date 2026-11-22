@@ -86,11 +86,13 @@ internal class UpdateStore(
         return String(bytes, Charsets.UTF_8).removePrefix("\uFEFF")
     }
 
-    fun download(release: Release, target: File, cancelled: () -> Boolean, progress: (Long, Long) -> Unit) {
+    fun download(release: Release, target: File, cancelled: () -> Boolean, keepPartialOnStop: Boolean = false,
+        progress: (Long, Long) -> Unit,
+    ) {
         val artifact = release.artifact
         val directory = target.absoluteFile.parentFile!!
         val partName = "${target.name}.part"
-        val temporary = File(directory, "$partName.${artifact.hash}")
+        val temporary = partial(target, release)
         try {
             // 旧版临时文件没有记录对应的安装包，不能拿来续传。
             val partPattern = Regex("${Regex.escape(partName)}(?:\\.[a-f0-9]{64})?")
@@ -130,7 +132,7 @@ internal class UpdateStore(
             throw error
         } finally {
             call = null
-            if (cancelled()) Files.deleteIfExists(temporary.toPath())
+            if (cancelled() && !keepPartialOnStop) discardPartial(release, target)
         }
     }
 
@@ -218,6 +220,12 @@ internal class UpdateStore(
     companion object {
         const val MAX_APK = 1024L * 1024 * 1024
         private val BYTE_RANGE = Regex("bytes ([0-9]+)-([0-9]+)/([0-9]+)", RegexOption.IGNORE_CASE)
+
+        private fun partial(target: File, release: Release) = File("${target.absolutePath}.part.${release.artifact.hash}")
+
+        fun discardPartial(release: Release, target: File) {
+            Files.deleteIfExists(partial(target, release).toPath())
+        }
 
         private fun checkCancelled(cancelled: () -> Boolean) {
             if (cancelled()) throw InterruptedIOException("下载已取消。")

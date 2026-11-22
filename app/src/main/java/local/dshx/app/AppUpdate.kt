@@ -14,13 +14,19 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.core.content.FileProvider
 import com.android.apksig.ApkVerifier
+import okhttp3.OkHttpClient
+import java.io.EOFException
 import java.io.File
+import java.io.InterruptedIOException
+import java.net.ProtocolException
+import java.net.SocketException
+import java.net.UnknownHostException
 import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
-/** 应用级更新状态独立于引擎，离开设置页后下载仍可继续。 */
+/** 应用级更新状态独立于引擎，下载由 Android 调度。 */
 internal class AppUpdate(private val context: Context, private val endpoint: String = context.getString(R.string.update_url)) {
     data class State(
         val message: String = "检查是否有新版本", val busy: Boolean = false, val downloading: Boolean = false,
@@ -30,12 +36,13 @@ internal class AppUpdate(private val context: Context, private val endpoint: Str
 
     private val worker = Executors.newSingleThreadExecutor { task -> Thread(task, "dshx-update").apply { isDaemon = true } }
     private val main = Handler(Looper.getMainLooper())
-    private val cancelled = AtomicBoolean(false)
     private val root = File(context.filesDir, "updates")
     private val apk = File(root, "update.apk")
     private val pending = android.util.AtomicFile(File(root, "pending.json"))
     private val certificates by lazy { certificates(context) }
     private val store by lazy { UpdateStore(endpoint, certificates) }
+    private var queued = UpdateJob.pending(context)
+    private var running: Download? = null
     private var awaitingPermission = false
     var state by mutableStateOf(State())
         private set
@@ -43,11 +50,13 @@ internal class AppUpdate(private val context: Context, private val endpoint: Str
     val version: String get() = context.packageManager.getPackageInfo(context.packageName, 0).versionName.orEmpty()
 
     init {
-        state = State(message = "正在检查已下载文件", busy = true)
+        val request = queued
+        state = if (request == null) State(message = "正在检查已下载文件", busy = true) else waiting()
         worker.execute {
-            val restored = runCatching {
+            val restored = if (request != null) waiting().copy(release = runCatching { parse(request.manifest) }.getOrNull())
+            else runCatching {
                 require(pending.baseFile.length() <= 64 * 1024)
-                val release = store.parse(pending.readFully().toString(Charsets.UTF_8), context.packageName, Build.SUPPORTED_ABIS.toList(), Build.VERSION.SDK_INT)
+                val release = parse(pending.readFully().toString(Charsets.UTF_8))
                 if (release.code <= installedCode(context)) {
                     pending.delete(); apk.delete()
                     State(message = "当前版本已更新至 $version")
@@ -56,7 +65,7 @@ internal class AppUpdate(private val context: Context, private val endpoint: Str
                     State(message = "已下载 ${release.name}，可继续安装", release = release, ready = true)
                 }
             }.getOrElse { State() }
-            main.post { state = restored }
+            main.post { if (queued == request && running == null) state = restored }
         }
     }
 
@@ -83,33 +92,100 @@ internal class AppUpdate(private val context: Context, private val endpoint: Str
 
     fun download() {
         val release = state.release ?: return
-        if (state.busy) return
-        cancelled.set(false)
-        val old = state
-        state = old.copy(message = "正在下载 0%", busy = true, downloading = true, ready = false, error = null)
+        if (state.busy || state.ready) return
+        runCatching { UpdateJob.enqueue(context, release) }.onSuccess {
+            queued = it
+            state = waiting(state)
+        }.onFailure { state = state.copy(error = it.message ?: "无法提交系统下载任务，请重试。") }
+    }
+
+    fun startJob(request: UpdateJob.Request, client: OkHttpClient, progress: (Int) -> Unit, finish: (Boolean) -> Unit): Boolean {
+        if (queued != request || running != null) return false
+        val run = Download(UpdateStore(endpoint, certificates, client))
+        running = run
         worker.execute {
+            var release: UpdateStore.Release? = null
             val result = runCatching {
+                val selected = parse(request.manifest, run.store)
+                require(selected.code > installedCode(context)) { "此更新已安装，请重新检查更新。" }
+                release = selected
                 check(root.isDirectory || root.mkdirs()) { "无法创建更新目录。" }
                 var percent = -1L
-                store.download(release, apk, cancelled::get) { done, total ->
+                run.store.download(selected, apk, run.stopped::get, keepPartialOnStop = true) { done, total ->
                     val value = done * 100 / total
-                    if (value != percent) { percent = value; main.post { state = state.copy(message = "正在下载 $value%") } }
+                    if (value != percent) {
+                        percent = value
+                        main.post {
+                            if (running === run) {
+                                state = state.copy(message = "正在下载 $value%", release = selected)
+                                progress(value.toInt())
+                            }
+                        }
+                    }
                 }
-                if (cancelled.get()) error("下载已取消。")
-                main.post { state = state.copy(message = "正在校验安装包", downloading = false) }
-                verify(context, release, apk, certificates)
+                if (run.stopped.get()) throw InterruptedIOException()
+                main.post { if (running === run) state = state.copy(message = "正在校验安装包", downloading = false) }
+                verify(context, selected, apk, certificates)
+                if (run.stopped.get()) throw InterruptedIOException()
                 val output = pending.startWrite()
-                try { output.write(release.raw.toByteArray(Charsets.UTF_8)); pending.finishWrite(output) }
+                try { output.write(selected.raw.toByteArray(Charsets.UTF_8)); pending.finishWrite(output) }
                 catch (error: Exception) { pending.failWrite(output); throw error }
             }
             main.post {
-                state = old.copy(message = if (result.isSuccess) "下载完成，可安装 ${release.name}" else if (cancelled.get()) "下载已取消" else "下载未完成，可重试",
-                    ready = result.isSuccess, error = if (cancelled.get()) null else result.exceptionOrNull()?.message)
+                if (running !== run) return@post
+                running = null
+                val error = result.exceptionOrNull()
+                val retry = error is SocketException || error is InterruptedIOException || error is UnknownHostException ||
+                    error is EOFException || error is ProtocolException
+                state = when {
+                    retry -> waiting(state.copy(release = release ?: state.release), "等待系统恢复下载")
+                    error == null -> state.copy(message = "下载完成，可安装 ${release?.name}", busy = false, downloading = false, ready = true)
+                    else -> state.copy(message = "下载未完成，可重试", busy = false, downloading = false, ready = false, error = error.message)
+                }
+                if (!retry) queued = null
+                finish(retry)
+            }
+        }
+        return true
+    }
+
+    fun stopJob(request: UpdateJob.Request, retry: Boolean): Boolean {
+        if (queued != request) return false
+        running?.stop()
+        running = null
+        if (retry) state = waiting(state, "等待系统恢复下载")
+        else {
+            queued = null
+            state = state.copy(message = "下载已停止", busy = false, downloading = false)
+        }
+        return retry
+    }
+
+    fun cancel() {
+        if (!state.downloading) return
+        val request = queued ?: return
+        val release = state.release
+        stopJob(request, retry = false)
+        UpdateJob.cancel(context)
+        state = state.copy(message = "正在取消下载", busy = true)
+        worker.execute {
+            val result = runCatching { UpdateStore.discardPartial(release ?: parse(request.manifest), apk) }
+            main.post {
+                state = state.copy(message = "下载已取消", busy = false, error = result.exceptionOrNull()?.message)
             }
         }
     }
 
-    fun cancel() { if (state.downloading) { cancelled.set(true); store.cancel() } }
+    private fun parse(manifest: String, source: UpdateStore = store) =
+        source.parse(manifest, context.packageName, Build.SUPPORTED_ABIS.toList(), Build.VERSION.SDK_INT)
+
+    private fun waiting(previous: State = State(), message: String = "等待系统开始下载") =
+        previous.copy(message = message, busy = true, downloading = true, ready = false, error = null)
+
+    private class Download(val store: UpdateStore) {
+        val stopped = AtomicBoolean(false)
+        fun stop() { stopped.set(true); store.cancel() }
+    }
 
     fun install(activity: Activity, launch: (Intent) -> Unit) {
         val release = state.release ?: return

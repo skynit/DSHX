@@ -811,6 +811,34 @@ class CoreTest {
         }
     }
 
+    @Test fun updateSystemStopKeepsPartialUntilTheUserCancels() {
+        val signer = apkSigner()
+        okhttp3.mockwebserver.MockWebServer().use { server ->
+            server.start()
+            val base = server.url("/").toString()
+            val bytes = "valid apk contents".toByteArray()
+            val store = UpdateStore("${base}latest.json", signer.certificates)
+            val release = store.parse(signedUpdate(updateManifest(base, bytes), signer),
+                "local.dshx.app", listOf("arm64-v8a"), 34)
+            val target = File(folder.newFolder(), "update.apk")
+            var stopped = false
+            server.enqueue(MockResponse().setChunkedBody("valid ", 6))
+            assertThrows(java.io.InterruptedIOException::class.java) {
+                store.download(release, target, { stopped }, keepPartialOnStop = true) { done, _ -> stopped = done > 0 }
+            }
+            assertFalse(target.exists())
+            assertNull(server.takeRequest().getHeader("Range"))
+            assertEquals("valid ", target.parentFile!!.listFiles()!!.single().readText())
+
+            // 应用内取消后，同一版本不会继续使用已放弃的断点。
+            UpdateStore.discardPartial(release, target)
+            server.enqueue(MockResponse().setBody("valid apk contents"))
+            store.download(release, target, { false }) { _, _ -> }
+            assertNull(server.takeRequest().getHeader("Range"))
+            assertArrayEquals(bytes, target.readBytes())
+        }
+    }
+
     @Test fun updateResumeHandlesFullResponseAndRejectsBadRangesOrContent() {
         val signer = apkSigner()
         okhttp3.mockwebserver.MockWebServer().use { server ->
