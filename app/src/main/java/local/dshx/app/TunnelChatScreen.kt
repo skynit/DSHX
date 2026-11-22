@@ -2,6 +2,7 @@ package local.dshx.app
 
 import android.graphics.Bitmap
 import android.net.Uri
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
@@ -27,8 +28,6 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.selection.selectable
-import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -58,10 +57,12 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.composables.icons.lucide.ChevronLeft
 import com.composables.icons.lucide.Compass
 import com.composables.icons.lucide.ImagePlus
 import com.composables.icons.lucide.Lucide
 import com.composables.icons.lucide.MessagesSquare
+import com.composables.icons.lucide.Plus
 import com.composables.icons.lucide.RotateCcw
 import com.composables.icons.lucide.Send
 import com.composables.icons.lucide.Settings2
@@ -91,35 +92,33 @@ internal fun TunnelChatScreen(
     val listState = key(settings.platformOrigin, settings.endpointId) { rememberLazyListState() }
     val conversations = runtimeState.conversations
     val selected = conversations.firstOrNull { it.conversationId == selectedConversationId }
+    val closeDiscovery = { discover = false }
+    BackHandler(visible && discover, onBack = closeDiscovery)
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val gutter = if (maxWidth >= 600.dp) 32.dp else 16.dp
         Column(Modifier.align(Alignment.TopCenter).widthIn(max = 680.dp).fillMaxSize().padding(horizontal = gutter)) {
-            TunnelChatHeader(runtimeState, onSettings)
-            Row(Modifier.fillMaxWidth().selectableGroup().clip(RoundedCornerShape(10.dp))
-                .background(MiuixTheme.colorScheme.secondary).padding(4.dp),
-                horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                val inboxLabel = if (conversations.isEmpty()) "会话" else "会话 ${conversations.size}"
-                listOf(Triple(false, inboxLabel, Lucide.MessagesSquare), Triple(true, "发现", Lucide.Compass)).forEach { (value, label, icon) ->
-                    val active = discover == value
-                    val colors = MiuixTheme.colorScheme
-                    Row(Modifier.weight(1f).heightIn(min = 48.dp).clip(RoundedCornerShape(8.dp))
-                        .background(if (active) colors.surfaceVariant else Color.Transparent)
-                        .selectable(active, role = Role.Tab) { discover = value },
-                        horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
-                        verticalAlignment = Alignment.CenterVertically) {
-                        Icon(icon, contentDescription = null, modifier = Modifier.size(16.dp), tint = colors.onSurfaceVariantSummary)
-                        Text(label, fontSize = 14.sp, color = colors.onSurface, fontWeight = if (active) FontWeight.Medium else FontWeight.Normal)
+            TunnelChatHeader(runtimeState, onSettings, onBack = closeDiscovery.takeIf { discover })
+            if (!discover && selected == null) {
+                if (conversations.isEmpty()) {
+                    Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState())) {
+                        LibraryEmpty(Lucide.MessagesSquare, "暂无会话",
+                            if (settings.enabled) "从端点目录发起聊天，或等待访客联系。" else "穿透聊天尚未开启。") {
+                            if (!settings.enabled) Action("打开聊天设置", onSettings, primary = true, icon = Lucide.Settings2)
+                        }
+                    }
+                } else {
+                    val zone = ZoneId.systemDefault()
+                    val today = LocalDate.now(zone)
+                    Section("会话 · ${conversations.size}")
+                    LazyColumn(Modifier.weight(1f).fillMaxWidth(), state = listState,
+                        contentPadding = PaddingValues(vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        items(conversations, key = { it.conversationId }) { conversation ->
+                            TunnelConversationRow(conversation, zone, today) { selectedConversationId = conversation.conversationId }
+                        }
                     }
                 }
-            }
-            if (!discover && selected == null && conversations.isNotEmpty()) {
-                val zone = ZoneId.systemDefault()
-                val today = LocalDate.now(zone)
-                LazyColumn(Modifier.weight(1f).fillMaxWidth(), state = listState,
-                    contentPadding = PaddingValues(vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    items(conversations, key = { it.conversationId }) { conversation ->
-                        TunnelConversationRow(conversation, zone, today) { selectedConversationId = conversation.conversationId }
-                    }
+                Box(Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 12.dp), contentAlignment = Alignment.CenterEnd) {
+                    VoiceButton("发现端点", Lucide.Plus, { discover = true }, size = 56)
                 }
             } else {
                 key(discover, settings.platformOrigin, selected?.conversationId.takeUnless { discover }) {
@@ -138,12 +137,6 @@ internal fun TunnelChatScreen(
                                 Spacer(Modifier.height(12.dp))
                                 drafts.SaveableStateProvider(selected.conversationId) { TunnelConversationPanel(runtime, selected) }
                             }
-                        } else {
-                            LibraryEmpty(Lucide.MessagesSquare, "暂无会话",
-                                if (settings.enabled) "从端点目录发起聊天，或等待访客联系。" else "穿透聊天尚未开启。") {
-                                if (settings.enabled) Action("发现端点", { discover = true }, icon = Lucide.Compass)
-                                else Action("打开聊天设置", onSettings, primary = true, icon = Lucide.Settings2)
-                            }
                         }
                     }
                 }
@@ -153,7 +146,7 @@ internal fun TunnelChatScreen(
 }
 
 @Composable
-private fun TunnelChatHeader(state: TunnelChatRuntimeState, onSettings: () -> Unit) {
+private fun TunnelChatHeader(state: TunnelChatRuntimeState, onSettings: () -> Unit, onBack: (() -> Unit)?) {
     val colors = MiuixTheme.colorScheme
     val label = when (state.status) {
         Status.DISABLED -> "未开启"
@@ -170,7 +163,8 @@ private fun TunnelChatHeader(state: TunnelChatRuntimeState, onSettings: () -> Un
     }
     Column(Modifier.fillMaxWidth().padding(top = 12.dp, bottom = 12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("聊天", fontSize = 26.sp, lineHeight = 32.sp, fontWeight = FontWeight.SemiBold,
+            if (onBack != null) LibraryIcon(Lucide.ChevronLeft, "返回会话", onBack, iconSize = 18)
+            Text(if (onBack != null) "发现" else "聊天", fontSize = 26.sp, lineHeight = 32.sp, fontWeight = FontWeight.SemiBold,
                 modifier = Modifier.semantics { heading() })
             Box(Modifier.weight(1f)) {
                 Row(Modifier.background(colors.secondary, CircleShape).padding(horizontal = 8.dp, vertical = 4.dp)) {
