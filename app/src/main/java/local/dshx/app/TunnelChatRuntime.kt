@@ -1,6 +1,8 @@
 package local.dshx.app
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.net.Uri
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -34,6 +36,9 @@ class TunnelChatRuntime(
     private val sessionBindings = ConcurrentHashMap<String, SessionBinding>()
     private val authenticatedSessions = ConcurrentHashMap.newKeySet<String>()
     private val conversationMessages = mutableMapOf<String, MutableList<ChatMessage>>()
+    private val imageFiles = TunnelImageFiles(File(context.noBackupFilesDir, "tunnel-images"))
+    private val imageDeliveries = mutableMapOf<Triple<String, String, String>, TunnelImageDelivery>()
+    private var preparingImage = false
     private val retryInitialOffer = mutableSetOf<String>()
     private val admission = TunnelConversationAdmission(
         settings = { currentSettings },
@@ -69,6 +74,7 @@ class TunnelChatRuntime(
     }
 
     init {
+        submit { synchronized(this) { imageFiles.trim(discardParts = true) } }
         if (withdrawals().isNotEmpty()) {
             state = state.copy(pendingWithdrawal = true)
             submit { syncWithdrawals() }
@@ -81,11 +87,13 @@ class TunnelChatRuntime(
                     runCatching {
                         if (engineReady && System.currentTimeMillis() >= nextRegistrationAttempt) start()
                         if (state.status == Status.ONLINE) retryQueued()
+                        sessionBindings.values.forEach { it.images.expire() }
                         pumpReception()
                     }.onFailure { publishState("本地聊天记录读取或重试失败。") }
                 }
             }
         }, 5L, 5L, TimeUnit.SECONDS)
+        retryScheduler.scheduleAtFixedRate({ onWorker { imageFiles.trim() } }, 1L, 1L, TimeUnit.HOURS)
     }
 
     fun observe(listener: (TunnelChatRuntimeState) -> Unit) { listeners.add(listener); listener(state) }
@@ -109,7 +117,10 @@ class TunnelChatRuntime(
         } else publishedOrigins
         currentSettings = settingsStore.save(clean.copy(endpointId = previous.endpointId), origins)
         publishedOrigins = origins
-        if (previous.platformOrigin != clean.platformOrigin) conversationMessages.clear()
+        if (previous.platformOrigin != clean.platformOrigin) {
+            conversationMessages.clear()
+            imageDeliveries.clear()
+        }
         if (!clean.enabled) stop()
         else if (previous != currentSettings && engineReady) {
             if (previous.platformOrigin != clean.platformOrigin || clean.publication == TunnelPublication.HIDDEN) stop()
@@ -212,6 +223,7 @@ class TunnelChatRuntime(
         acceptingSignals = false
         nextRegistrationAttempt = Long.MAX_VALUE
         signaling.close()
+        sessionBindings.values.forEach { it.images.close() }
         sessionBindings.clear()
         authenticatedSessions.clear()
         retryInitialOffer.clear()
@@ -298,6 +310,61 @@ class TunnelChatRuntime(
         return message
     }
 
+    fun sendImage(conversationId: String, uri: Uri, retryId: String? = null): String {
+        require(uri.scheme == "content") { "请重新选择图片。" }
+        val (original, id) = synchronized(this) {
+            check(!preparingImage) { "正在读取另一张图片。" }
+            val binding = requireImageSession(conversationId)
+            val last = imageDeliveries[key(conversationId)]
+            val id = retryId?.takeIf { last?.messageId == it && !last.delivered } ?: UUID.randomUUID().toString()
+            preparingImage = true
+            binding to id
+        }
+        try {
+            val input = runCatching { context.contentResolver.openInputStream(uri) }.getOrNull()
+                ?: error("无法读取所选图片，请重新选择。")
+            val (temp, attachment) = try { input.use { imageFiles.prepare(it, id) } }
+                catch (_: java.io.IOException) { error("无法读取或保存所选图片，请重试。") }
+            try {
+                synchronized(this) {
+                    val conversation = requireOpen(conversationId)
+                    val binding = requireImageSession(conversationId)
+                    check(binding === original) { "聊天连接已变更，请重试。" }
+                    val role = if (conversation.visitor) ChatSenderRole.VISITOR else ChatSenderRole.ENDPOINT_USER
+                    val message = ChatMessage(id, conversationId, conversation.sequence + 1, role, conversation.localEndpointId,
+                        ChatMessageKind.IMAGE, System.currentTimeMillis(), payload = JSONObject().put("attachment", attachment.toJson()))
+                    val file = imageFiles.stage(conversation, message, temp)
+                    try {
+                        save(conversation.copy(sequence = message.seq))
+                        imageDeliveries.remove(key(conversationId))
+                        binding.images.start(message, file)
+                    } catch (error: Exception) {
+                        file.delete()
+                        throw error
+                    }
+                    publishState(state.message)
+                }
+            } finally { temp.delete() }
+        } finally { synchronized(this) { preparingImage = false } }
+        return id
+    }
+
+    fun imagePreview(message: ChatMessage): Bitmap? {
+        val file = synchronized(this) {
+            record(message.conversationId)?.takeIf { message.senderEndpointId == it.localEndpointId || message.senderEndpointId == it.remoteEndpointId }
+                ?.let { imageFiles.file(it, message) }
+        } ?: return null
+        return TunnelImageFiles.preview(file)
+    }
+
+    private fun requireImageSession(id: String): SessionBinding {
+        requireOpen(id)
+        val binding = checkNotNull(binding(id)?.takeIf { it.sessionId in authenticatedSessions }) { "连接后才能发送图片。" }
+        check(binding.supportsImages) { "对方版本暂不支持图片。" }
+        check(!binding.images.sending) { "上一张图片还在发送。" }
+        return binding
+    }
+
     @Synchronized fun resumeAi(conversationId: String) {
         val conversation = requireOpen(conversationId)
         require(conversation.verified && !conversation.visitor) { "不能修改对方的接待模式。" }
@@ -307,6 +374,7 @@ class TunnelChatRuntime(
 
     @Synchronized fun endConversation(conversationId: String) {
         val conversation = requireOpen(conversationId)
+        binding(conversationId)?.images?.close()
         val ended = conversation.copy(closed = true)
         if (conversation.verified) {
             val role = if (conversation.visitor) ChatSenderRole.VISITOR else ChatSenderRole.ENDPOINT_USER
@@ -568,6 +636,8 @@ class TunnelChatRuntime(
                 val conversation = record(binding.conversationId) ?: binding.conversation
                 if (!conversation.verified) save(conversation.copy(verified = true))
                 authenticatedSessions += binding.sessionId
+                if (!conversation.closed) transport?.sendJson(binding.sessionId, JSONObject()
+                    .put("protocol", TunnelChatProtocol.CHAT).put("type", "image_ready"))
                 retryInitialOffer.remove(binding.conversationId)
                 flushQueued(binding.conversationId, afterHandshake = true)
                 if (conversation.closed) expireClosing(binding)
@@ -579,6 +649,14 @@ class TunnelChatRuntime(
             return
         }
         val conversation = record(binding.conversationId) ?: return
+        if (type == "image_ready") {
+            if (!conversation.closed && !binding.supportsImages) {
+                binding.supportsImages = true
+                publishState(state.message)
+            }
+            return
+        }
+        if (binding.supportsImages && !conversation.closed && binding.images.handle(frame)) return
         if (type == "ack") {
             runCatching { ChatAck.fromJson(frame) }.getOrNull()?.takeIf { it.conversationId == binding.conversationId }
                 ?.takeIf { it.status == ChatAck.Status.RECEIVED || it.status == ChatAck.Status.DUPLICATE }
@@ -598,17 +676,72 @@ class TunnelChatRuntime(
             message.senderRole == role
         } else if (conversation.closed) false else if (conversation.visitor) {
             (message.senderRole == ChatSenderRole.AI && message.kind in setOf(ChatMessageKind.AI_FORMAL, ChatMessageKind.CONVERSATION_EVENT)) ||
-                (message.senderRole == ChatSenderRole.ENDPOINT_USER && message.kind == ChatMessageKind.HUMAN_FORMAL)
-        } else message.senderRole == ChatSenderRole.VISITOR && message.kind == ChatMessageKind.TEXT
+                (message.senderRole == ChatSenderRole.ENDPOINT_USER && message.kind in setOf(ChatMessageKind.HUMAN_FORMAL, ChatMessageKind.IMAGE))
+        } else message.senderRole == ChatSenderRole.VISITOR && message.kind in setOf(ChatMessageKind.TEXT, ChatMessageKind.IMAGE)
         if (!permitted) return
+        if (message.kind == ChatMessageKind.IMAGE) {
+            if (binding.supportsImages) offerImage(binding, conversation, message)
+            return
+        }
         val status = queue.receive(conversation, message)
         if (status == ChatAck.Status.REJECTED) return
         signalingAck(binding, ChatAck(message.messageId, message.conversationId, status))
-        if (message.isEnd()) expireClosing(binding)
+        if (message.isEnd()) {
+            binding.images.close()
+            expireClosing(binding)
+        }
         if (status == ChatAck.Status.RECEIVED) {
             messageListener?.invoke(message, binding.remoteEndpointId)
             publishState(state.message)
             pumpReception()
+        }
+    }
+
+    private fun offerImage(binding: SessionBinding, conversation: TunnelConversation, offer: ChatMessage) {
+        val attachment = offer.imageAttachment()
+        val message = offer.copy(replyTo = null, payload = JSONObject().put("attachment", attachment.toJson()))
+        val previous = conversation.inbox.firstOrNull { it.messageId == message.messageId }?.message
+        val existing = imageFiles.file(conversation, message)
+        when {
+            previous?.kind == ChatMessageKind.IMAGE && previous.imageAttachment() == attachment && existing.length() == attachment.size ->
+                binding.images.confirm(message)
+            existing.exists() || previous != null || binding.images.receiving -> binding.images.reject(message)
+            else -> {
+                val target = runCatching { imageFiles.reserve(conversation, message) }.getOrNull()
+                if (target == null) binding.images.reject(message) else binding.images.accept(message, target)
+            }
+        }
+    }
+
+    private fun receiveImage(binding: SessionBinding, message: ChatMessage, source: File): Boolean {
+        val conversation = record(binding.conversationId)?.takeUnless { it.closed } ?: return false
+        if (TunnelImageFiles.imageMime(source) != message.imageAttachment().mimeType) return false
+        val saved = imageFiles.store(conversation, message, source)
+        var accepted = false
+        try {
+            accepted = queue.receive(conversation, message) == ChatAck.Status.RECEIVED
+            if (accepted) publishState(state.message)
+            return accepted
+        } finally { if (!accepted) saved.delete() }
+    }
+
+    private fun finishImage(binding: SessionBinding, message: ChatMessage, delivered: Boolean) {
+        val chat = binding.conversation
+        val staged = imageFiles.staged(chat, message)
+        val delivery = runCatching {
+            if (!delivered) return@runCatching false
+            val saved = imageFiles.store(chat, message, staged)
+            val dropped = try { queue.confirmSentImage(chat, message) } catch (error: Exception) {
+                saved.delete()
+                throw error
+            }
+            conversationMessages[chat.id]?.removeAll { it.senderEndpointId == chat.localEndpointId && it.messageId in dropped }
+            true
+        }.getOrDefault(false)
+        staged.delete()
+        if (key(chat.id, chat.platformOrigin, chat.localEndpointId) == key(chat.id)) {
+            imageDeliveries[key(chat.id)] = TunnelImageDelivery(message.messageId, delivery)
+            publishState(state.message)
         }
     }
 
@@ -652,7 +785,7 @@ class TunnelChatRuntime(
         val conversations = currentConversations()
         conversations.filter { !it.waitingNotified && it.aiRepliesSent > 0 && !it.canReply() }.forEach { notifyWaitingHuman(it) }
         val (conversation, receipt) = conversations.mapNotNull { chat ->
-            if (chat.closed) null else chat.inbox.firstOrNull { it.pending }?.let { chat to it }
+            if (chat.closed || binding(chat.id)?.images?.sending == true) null else chat.inbox.firstOrNull { it.pending }?.let { chat to it }
         }.minByOrNull { (_, receipt) -> receipt.receivedAt } ?: return
         val text = checkNotNull(receipt.message).payload.optString("text")
         val formal = conversation.canPublish(receipt, currentSettings.maxAiReplies)
@@ -691,6 +824,7 @@ class TunnelChatRuntime(
             ?: return true
         val receipt = live.inbox.firstOrNull { it.pending && it.messageId == reply.messageId } ?: return true
         if (reply.text.isNotBlank() && reply.formal && live.canPublish(receipt, currentSettings.maxAiReplies)) {
+            if (binding(live.id)?.images?.sending == true) return false
             val message = textMessage(live, reply.text, ChatSenderRole.AI, ChatMessageKind.AI_FORMAL).copy(replyTo = receipt.messageId)
             if (!queue.canFit(message)) {
                 queue.finishReception(live, receipt.messageId)
@@ -739,14 +873,19 @@ class TunnelChatRuntime(
                 mode = conversation.mode,
                 aiRepliesSent = conversation.aiRepliesSent,
                 messages = (conversation.inbox.mapNotNull { receipt -> receipt.message?.let { receipt.receivedAt to it } } +
+                    conversation.sentImages.map { it.createdAt to it } +
                     conversationMessages[conversation.id].orEmpty().map { it.createdAt to it })
                     .sortedBy { it.first }.takeLast(200).map { it.second },
+                canSendImage = !conversation.closed && connected && binding.supportsImages,
+                sendingImage = binding?.images?.sending == true,
+                imageDelivery = imageDeliveries[key(conversation.id)],
             )
         }.sortedBy { it.conversationId }
 
     private fun disconnectSession(sessionId: String, notify: Boolean = false) {
         val binding = sessionBindings.remove(sessionId) ?: return
         val authenticated = authenticatedSessions.remove(sessionId)
+        binding.images.close()
         val retry = !authenticated && binding.initiator && binding.conversation.visitor && binding.conversation.verified &&
             !binding.conversation.closed && sessionId != binding.conversationId
         if (!authenticated && binding.initiator && binding.conversation.visitor && binding.conversation.verified) {
@@ -816,12 +955,18 @@ class TunnelChatRuntime(
 
     private data class ReceptionReply(val conversation: TunnelConversation, val messageId: String, val formal: Boolean, val text: String)
 
-    private class SessionBinding(val sessionId: String, val conversation: TunnelConversation, val initiator: Boolean) {
+    private inner class SessionBinding(val sessionId: String, val conversation: TunnelConversation, val initiator: Boolean) {
         val conversationId get() = conversation.id
         val remoteEndpointId get() = conversation.remoteEndpointId
         val handshake = TunnelPeerHandshake(remoteEndpointId, sessionId, initiator, conversationId)
         var helloSent = false
         var closing = false
+        var supportsImages = false
+        val images = TunnelImageTransfer(
+            { frame -> transport?.sendJson(sessionId, frame) == true },
+            { message, source -> receiveImage(this, message, source) },
+            { message, delivered -> finishImage(this, message, delivered) },
+        )
     }
 
     private fun WebRtcChatEvent.sessionId(): String = when (this) {

@@ -40,6 +40,8 @@ files/
     └── custom-model/              # 用户导入的小模型及摘要清单
 cache/
 └── engine/                        # 引擎临时文件
+no_backup/
+└── tunnel-images/                 # 穿透聊天图片，不进入系统或普通会话备份
 ```
 
 记忆和知识的 `state.json` 使用上游 `{unit, global, tables}` 外层格式，业务状态位于 `global`；不能把文档里的某个业务对象直接覆盖为整个文件。Node 是这两类正式业务状态的唯一写入方，Android 的目录迁移和暂存文件交接不改变这一分工。

@@ -1,5 +1,10 @@
 package local.dshx.app
 
+import android.graphics.Bitmap
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -25,6 +30,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -35,6 +41,7 @@ import androidx.compose.foundation.text.input.setTextAndPlaceCursorAtEnd
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
@@ -42,6 +49,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.composables.icons.lucide.Compass
+import com.composables.icons.lucide.ImagePlus
 import com.composables.icons.lucide.Lucide
 import com.composables.icons.lucide.MessagesSquare
 import com.composables.icons.lucide.RotateCcw
@@ -267,6 +275,22 @@ private fun TunnelConversationPanel(
     var busy by remember { mutableStateOf(false) }
     var failure by remember { mutableStateOf<String?>(null) }
     var confirmEnd by remember { mutableStateOf(false) }
+    var selectedImage by rememberSaveable { mutableStateOf<Uri?>(null) }
+    var submittedImage by rememberSaveable { mutableStateOf<String?>(null) }
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            selectedImage = uri
+            submittedImage = null
+            failure = null
+        }
+    }
+    val delivery = conversation.imageDelivery?.takeIf { it.messageId == submittedImage }
+    LaunchedEffect(delivery) {
+        if (delivery?.delivered == true) {
+            selectedImage = null
+            submittedImage = null
+        }
+    }
     fun run(action: () -> Unit, onSuccess: () -> Unit = {}) {
         if (busy) return
         busy = true
@@ -291,17 +315,28 @@ private fun TunnelConversationPanel(
                 ChatMessageKind.AI_FORMAL -> "AI"
                 ChatMessageKind.HUMAN_FORMAL -> "人工"
                 ChatMessageKind.TEXT -> if (conversation.outgoing) "我" else "访客"
+                ChatMessageKind.IMAGE -> if ((message.senderRole == ChatSenderRole.VISITOR) == conversation.outgoing) "我" else "对方"
                 ChatMessageKind.CONVERSATION_EVENT -> "会话状态"
                 else -> "对方"
             }
             Column(Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
                 Text(role, fontSize = 12.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
-                Text(text, fontSize = 14.sp, lineHeight = 21.sp)
+                if (message.kind == ChatMessageKind.IMAGE) {
+                    key(message.senderEndpointId, message.messageId) { TunnelImage(runtime, message) }
+                } else Text(text, fontSize = 14.sp, lineHeight = 21.sp)
             }
         }
         if (conversation.closed) return@Column
         AssistantField("发送消息", draft, 4_000, busy, 4, "输入文本")
         failure?.let { Text(it, fontSize = 13.sp, color = MiuixTheme.colorScheme.error) }
+        if (selectedImage != null) {
+            Note(when {
+                conversation.sendingImage -> "正在发送图片…"
+                delivery?.delivered == false -> "图片未确认送达，可重试。"
+                !conversation.connected -> "连接后可发送图片。"
+                else -> "已选择图片"
+            })
+        }
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             if (!conversation.connected) {
                 Action(if (conversation.connecting) "正在连接…" else "重连",
@@ -315,6 +350,23 @@ private fun TunnelConversationPanel(
                     else runtime.sendHumanFormalText(conversation.conversationId, text)
                 }, { draft.setTextAndPlaceCursorAtEnd("") })
             }, enabled = !busy && draft.text.isNotBlank(), primary = true, icon = Lucide.Send)
+            if (conversation.canSendImage || selectedImage != null) {
+                val uri = selectedImage
+                if (uri == null) Action("选图", {
+                    try { picker.launch(tunnelImageTypes) } catch (_: android.content.ActivityNotFoundException) {
+                        failure = "无法打开图片选择器。"
+                    }
+                }, enabled = !busy && !conversation.sendingImage, icon = Lucide.ImagePlus)
+                else {
+                    Action("发送图片", {
+                        var id: String? = null
+                        run({ id = runtime.sendImage(conversation.conversationId, uri, delivery?.takeUnless { it.delivered }?.messageId) },
+                            { submittedImage = id })
+                    }, enabled = !busy && conversation.canSendImage && !conversation.sendingImage, icon = Lucide.ImagePlus)
+                    Action("移除图片", { selectedImage = null; submittedImage = null; failure = null },
+                        enabled = !busy && !conversation.sendingImage, icon = Lucide.X)
+                }
+            }
             if (!conversation.outgoing && conversation.mode == ConversationMode.HUMAN_HANDOVER) {
                 Action("恢复 AI", { run({ runtime.resumeAi(conversation.conversationId) }) }, enabled = !busy)
             }
@@ -325,6 +377,22 @@ private fun TunnelConversationPanel(
                 Action("结束聊天", { confirmEnd = true }, enabled = !busy, icon = Lucide.X)
             }
         }
+    }
+}
+
+@Composable
+private fun TunnelImage(runtime: TunnelChatRuntime, message: ChatMessage) {
+    val name = message.payload.optJSONObject("attachment")?.optString("name").orEmpty().ifBlank { "聊天图片" }
+    val preview by produceState<Pair<Boolean, Bitmap?>>(false to null, runtime, message.messageId) {
+        value = true to withContext(Dispatchers.IO) { runtime.imagePreview(message) }
+    }
+    val image = preview.second
+    if (image == null) {
+        Note(if (preview.first) "图片不可用" else "正在读取图片…")
+    } else {
+        Image(remember(image) { image.asImageBitmap() }, contentDescription = name,
+            modifier = Modifier.padding(top = 4.dp).widthIn(max = 280.dp).heightIn(max = 220.dp)
+                .clip(RoundedCornerShape(8.dp)))
     }
 }
 
