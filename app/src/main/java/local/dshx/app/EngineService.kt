@@ -6,6 +6,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.Context
 import android.content.Intent
 import android.os.Handler
 import android.os.IBinder
@@ -23,7 +24,9 @@ class DshApp : Application(), PhoneEvents {
         override fun call(method: String, args: org.json.JSONObject, owner: String, valid: () -> Boolean) =
             PhoneControl(this@DshApp).appCall(method, args, owner, valid)
     }) }
-    override fun phoneConnected() { appHost.start() }
+    internal val accessibility by lazy { AccessibilityRecovery(this) }
+    override fun phoneConnected() { accessibility.refresh(); appHost.start() }
+    override fun phoneDisconnected() { accessibility.refresh() }
     override fun phoneChanged() { appHost.screenEvent() }
     override fun phoneStopped() { appHost.cancelPhone() }
     override fun ownsPhoneWindow(id: Int) = PhoneWindow.current?.owns(id) == true
@@ -78,7 +81,7 @@ class EngineService : Service() {
     private val listener: (EngineState) -> Unit = { state ->
         if (running) taskPower.setActive(state.taskRunning) else taskPower.stop()
         if (state.url != null && readySince == 0L) readySince = SystemClock.elapsedRealtime()
-        (application as DshApp).tunnelChat.setEngineReady(state.url != null && running)
+        (application as DshApp).tunnelChat.setEngineReady(running && engine.ready(state))
         restartId?.let { if (engine.restartStatus(it).optString("state") == "succeeded") restartId = null }
         getSystemService(NotificationManager::class.java).notify(1, notification(state.phase))
     }
@@ -94,11 +97,18 @@ class EngineService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         latestStart = startId
         main.removeCallbacks(retry)
-        if (intent?.action == "stop") {
+        if (intent?.action == STOP) {
+            preferences(this).edit().putBoolean("stopped", true).apply()
             running = false
             (application as DshApp).tunnelChat.setEngineReady(false)
             taskPower.stop()
             if (!engine.stop()) finish()
+            return START_NOT_STICKY
+        }
+        if (intent?.action == START) preferences(this).edit().remove("stopped").apply()
+        if (!shouldStart(this)) {
+            engine.cancelRestart()
+            if (!engine.active) finish()
             return START_NOT_STICKY
         }
         if (intent?.action == "restart") {
@@ -189,7 +199,7 @@ class EngineService : Service() {
 
     private fun notification(text: String): Notification {
         val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-        val stop = PendingIntent.getService(this, 1, Intent(this, EngineService::class.java).setAction("stop"), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        val stop = PendingIntent.getService(this, 1, Intent(this, EngineService::class.java).setAction(STOP), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         return Notification.Builder(this, "engine")
             .setSmallIcon(android.R.drawable.stat_notify_sync)
             .setContentTitle("DSHX · $text")
@@ -198,5 +208,21 @@ class EngineService : Service() {
             .addAction(Notification.Action.Builder(null, "停止", stop).build())
             .setOngoing(true)
             .build()
+    }
+
+    companion object {
+        internal const val STOP = "stop"
+        internal const val START = "start"
+
+        internal fun shouldStart(context: Context) = !preferences(context).getBoolean("stopped", false)
+
+        internal fun start(context: Context, explicit: Boolean) {
+            if (!explicit && !shouldStart(context)) return
+            context.startForegroundService(Intent(context, EngineService::class.java).apply {
+                if (explicit) action = START
+            })
+        }
+
+        private fun preferences(context: Context) = context.getSharedPreferences("engine", Context.MODE_PRIVATE)
     }
 }

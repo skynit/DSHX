@@ -258,8 +258,8 @@ class MainActivity : ComponentActivity() {
                 state = state, bundle = bundle, webVersion = WebView.getCurrentWebViewPackage()?.versionName,
                 theme = theme,
                 onTheme = { value -> theme = value; preferences.edit().putString("theme", value).apply() },
-                onStart = ::startEngine,
-                onStop = { startService(Intent(this, EngineService::class.java).setAction("stop")) },
+                onStart = { startEngine(explicit = true) },
+                onStop = { startService(Intent(this, EngineService::class.java).setAction(EngineService.STOP)) },
                 diagnostics = engine::diagnostics, pageError = pageError,
                 enginePage = enginePage, onEnginePageHandled = { enginePage = null },
                 engineInfo = engine::engineInfo, engineStatus = { engine.engineStatus() },
@@ -298,8 +298,8 @@ class MainActivity : ComponentActivity() {
         if (!engine.active && !engine.state.busy && (savedInstanceState == null || engine.state.phase == "未启动")) startEngine()
     }
 
-    private fun startEngine() {
-        try { startForegroundService(Intent(this, EngineService::class.java)) }
+    private fun startEngine(explicit: Boolean = false) {
+        try { EngineService.start(this, explicit) }
         catch (_: RuntimeException) { Toast.makeText(this, "无法启动 dsh，请在工作台重试。", Toast.LENGTH_LONG).show() }
     }
 
@@ -422,9 +422,19 @@ class MainActivity : ComponentActivity() {
         engine.phone.resume()
         engine.phone.device.attach(this)
         phoneRevision++
+        (application as DshApp).accessibility.refresh()
         accessibilityNotice = !accessibilityHandled && !engine.phone.accessibilityEnabled()
     }
-    override fun onPause() { engine.phone.device.detach(this); super.onPause() }
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        (application as DshApp).accessibility.setFocused(hasFocus)
+    }
+
+    override fun onPause() {
+        (application as DshApp).accessibility.setFocused(false)
+        engine.phone.device.detach(this)
+        super.onPause()
+    }
 
     private fun phonePermission(action: String) {
         try {

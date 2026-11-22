@@ -1,8 +1,5 @@
 package local.dshx.app
 
-import android.content.Intent
-import android.provider.Settings
-import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -19,7 +16,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
@@ -769,17 +765,23 @@ private fun VoiceChoice(title: String, summary: String, selected: Boolean, enabl
 @Composable
 private fun PhoneSettings(phone: PhoneControl, revision: Int, permission: (String) -> Unit) {
     val status = remember(revision) { phone.status() }
-    val context = LocalView.current.context
+    val recovery = (LocalContext.current.applicationContext as DshApp).accessibility
+    val accessibility by recovery.state.collectAsState()
     val capabilities = status.getJSONObject("capabilities")
     Note("按需要开启系统权限。未授权项会说明影响，不要求一次全部开启。")
     Section("屏幕操作")
     Panel(padding = 0) {
-        SettingsRow("无障碍服务", if (status.optBoolean("accessibility")) "服务已连接，可读取屏幕并执行点击。" else "尚未授权，用于读取屏幕并执行点击。") {
-            Action("打开设置", {
-                try { context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
-                catch (_: RuntimeException) { Toast.makeText(context, "无法打开系统设置，请手动进入无障碍设置。", Toast.LENGTH_SHORT).show() }
-            })
+        SettingsRow("无障碍服务", when {
+            accessibility.connected -> "已连接"
+            accessibility.repairing -> "正在尝试恢复连接"
+            accessibility.enabled -> "系统已开启，服务未连接"
+            else -> "系统未开启"
+        }) {
+            Action("打开设置", { permission("accessibility") })
         }
+        Divider()
+        SettingsSwitch("自动恢复无障碍", if (accessibility.canRepair) "只尝试恢复仍开启的服务。" else "未授予系统设置写入权限。",
+            checked = accessibility.automatic, enabled = accessibility.canRepair || accessibility.automatic, onChange = recovery::setAutomatic)
         Divider()
         SettingsRow("悬浮提示", if (capabilities.optBoolean("overlayPermission")) "系统已允许，可在其他应用上方显示操作提示。" else "尚未授权，用于在其他应用上方显示操作提示。") {
             Action("打开设置", { permission("overlay") })

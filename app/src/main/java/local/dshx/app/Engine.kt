@@ -90,11 +90,13 @@ class Engine(private val context: Context, private val worker: Executor = Execut
     fun engineStatus(args: JSONObject = JSONObject(), session: String? = null): JSONObject {
         validateControl("status", args)
         val current = state
-        return JSONObject().put("active", active).put("ready", current.url != null && tools.state.connected && !cancelled.get())
+        return JSONObject().put("active", active).put("ready", ready(current))
             .put("phase", current.phase).put("message", logs.clean(current.message)).put("busy", current.busy)
             .put("operation", control.status(if (args.has("operationId")) args.getString("operationId") else null, session))
             .put("stableUrl", "dshx://engine").put("currentAddress", currentAddress() ?: JSONObject.NULL)
     }
+
+    internal fun ready(state: EngineState) = state.url != null && tools.state.connected && !cancelled.get()
 
     fun engineLogs(args: JSONObject = JSONObject()): JSONObject {
         validateControl("logs", args)

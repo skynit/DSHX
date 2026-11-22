@@ -68,6 +68,7 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 internal fun AppsSettings(running: Boolean, phoneRevision: Int, call: (String, JSONObject) -> JSONObject,
     create: (JSONObject) -> JSONObject, openSession: (String) -> Unit, permission: (String) -> Unit, back: () -> Unit) {
     val context = LocalContext.current
+    val accessibility by (context.applicationContext as DshApp).accessibility.state.collectAsState()
     val scope = rememberCoroutineScope()
     var status by remember { mutableStateOf<JSONObject?>(null) }
     var selected by rememberSaveable { mutableStateOf<String?>(null) }
@@ -172,7 +173,7 @@ internal fun AppsSettings(running: Boolean, phoneRevision: Int, call: (String, J
         host.observe(listener)
         onDispose { host.remove(listener) }
     }
-    LaunchedEffect(phoneRevision) {
+    LaunchedEffect(phoneRevision, accessibility.enabled, accessibility.connected) {
         try { refresh() } catch (error: Exception) { failure = error.message ?: "无法读取微应用状态。" }
     }
     val rows = status?.optJSONArray("apps")?.let { list -> (0 until list.length()).map { list.getJSONObject(it) } }.orEmpty()
@@ -287,7 +288,7 @@ internal fun AppsSettings(running: Boolean, phoneRevision: Int, call: (String, J
                 mutate(if (on) "enable" else "disable", JSONObject().put("id", selected).apply { if (on) put("settings", draft) })
             }
             if (app.optJSONObject("package")?.getJSONArray("capabilities")?.let { values -> (0 until values.length()).any { values.getString(it).startsWith("screen.") } } == true && status?.optJSONObject("phone")?.optBoolean("accessibility") != true) {
-                Column(Modifier.padding(start = 16.dp, end = 16.dp, bottom = 16.dp)) { Action("开启无障碍服务", { permission("accessibility") }) }
+                Column(Modifier.padding(start = 16.dp, end = 16.dp, bottom = 16.dp)) { Action("打开无障碍设置", { permission("accessibility") }) }
             }
         }
         val packageInfo = app.optJSONObject("package")
@@ -503,9 +504,13 @@ internal fun appState(app: JSONObject, status: JSONObject?): String = when {
     !status?.optString("runtimeError").isNullOrBlank() -> "文件发生变化，已暂停"
     app.optJSONObject("package")?.has("background") == true && status?.optJSONObject("runtime")?.optJSONObject(app.optString("id"))?.optBoolean("background") != true -> "后台启动中"
     app.optJSONObject("package")?.getJSONArray("capabilities")?.let { values -> (0 until values.length()).any { values.getString(it).startsWith("screen.") } } != true -> "已启用"
-    status?.optJSONObject("phone")?.optBoolean("accessibility") != true -> "等待无障碍权限"
-    status?.optJSONObject("phone")?.optBoolean("ready") != true -> "暂时无法操作手机"
-    else -> "正在监听"
+    else -> status?.optJSONObject("phone").let { phone ->
+        when {
+            phone?.optBoolean("accessibility") == true -> if (phone.optBoolean("ready")) "正在监听" else "暂时无法操作手机"
+            phone?.optBoolean("accessibilityEnabled") == true -> "无障碍未连接"
+            else -> "等待无障碍权限"
+        }
+    }
 }
 
 internal fun appEvent(event: JSONObject): String {

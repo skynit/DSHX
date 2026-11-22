@@ -26,6 +26,7 @@ internal open class AppPhone(private val context: Context, private val enabled: 
 /** 由实际 Android Application 接收无障碍生命周期；独立应用没有聊天操作小窗。 */
 interface PhoneEvents {
     fun phoneConnected()
+    fun phoneDisconnected() {}
     fun phoneChanged()
     fun phoneStopped()
     fun ownsPhoneWindow(id: Int): Boolean = false

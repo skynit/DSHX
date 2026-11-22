@@ -1038,6 +1038,18 @@ class CoreTest {
         } finally { page.destroy() }
     }
 
+    @Test fun openingAppDoesNotUndoAnExplicitEngineStop() {
+        val app = RuntimeEnvironment.getApplication()
+        val shadow = shadowOf(app)
+        val service = Robolectric.buildService(EngineService::class.java).create()
+        try { service.get().onStartCommand(Intent().setAction("stop"), 0, 1) }
+        finally { service.destroy() }
+        while (shadow.nextStartedService != null) { }
+        val page = Robolectric.buildActivity(MainActivity::class.java).create()
+        try { assertNull(shadow.nextStartedService) }
+        finally { page.destroy() }
+    }
+
     @Test @Config(sdk = [26, 34]) fun engineServiceRestartsAfterSystemRecreationAndHonorsExplicitStop() {
         val engine = (RuntimeEnvironment.getApplication() as DshApp).engine
         val jobs = mutableListOf<Runnable>()
@@ -1055,6 +1067,15 @@ class CoreTest {
             shadowOf(Looper.getMainLooper()).idleFor(2, TimeUnit.MINUTES)
             assertEquals(1, jobs.size)
             assertTrue(shadowOf(service).isStoppedBySelf)
+            ReflectionHelpers.setField(engine, "active", false)
+            ReflectionHelpers.setField(engine, "state", EngineState(phase = "已停止"))
+            assertEquals(android.app.Service.START_NOT_STICKY, service.onStartCommand(null, 0, 4))
+            assertEquals(1, jobs.size)
+            EngineService.start(service, explicit = true)
+            val start = shadowOf(RuntimeEnvironment.getApplication()).nextStartedService
+            assertEquals(EngineService::class.java.name, start?.component?.className)
+            assertEquals(android.app.Service.START_STICKY, service.onStartCommand(start, 0, 5))
+            assertEquals(2, jobs.size)
         } finally { controller.destroy() }
     }
 
@@ -1229,7 +1250,7 @@ class CoreTest {
             assertFalse(wake.isHeld)
             listener(EngineState(taskRunning = true))
             assertFalse(wake.isHeld)
-            service.onStartCommand(Intent(), 0, 3)
+            service.onStartCommand(Intent().setAction("start"), 0, 3)
             listener(EngineState(taskRunning = true))
             assertTrue(ReflectionHelpers.getField<PowerManager.WakeLock>(power, "wake").isHeld)
         } finally { controller.destroy() }
@@ -1253,7 +1274,7 @@ class CoreTest {
             own.flattenToString())
         assertTrue(control.accessibilityEnabled())
         android.provider.Settings.Secure.putInt(resolver, android.provider.Settings.Secure.ACCESSIBILITY_ENABLED, 0)
-        assertFalse(control.accessibilityEnabled())
+        assertTrue(control.accessibilityEnabled()) // 全局运行状态不等于本服务的开启记录。
         android.provider.Settings.Secure.putInt(resolver, android.provider.Settings.Secure.ACCESSIBILITY_ENABLED, 1)
         android.provider.Settings.Secure.putString(resolver, android.provider.Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
             "another.app/.Reader")
@@ -5370,6 +5391,71 @@ class CoreTest {
         } finally { controller.destroy() }
     }
 
+    @Test fun phoneStatusDistinguishesSystemAuthorizationFromTheConnection() {
+        val app = RuntimeEnvironment.getApplication()
+        val control = PhoneControl(app)
+        val serviceName = android.content.ComponentName(app, PhoneService::class.java).flattenToShortString()
+        val key = android.provider.Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+        assertFalse(control.status().getBoolean("accessibilityEnabled"))
+        android.provider.Settings.Secure.putString(app.contentResolver, key, serviceName)
+        assertTrue(control.status().getBoolean("accessibilityEnabled"))
+        assertFalse(control.status().getBoolean("accessibility"))
+        val service = phoneService()
+        try { assertTrue(control.status().getBoolean("accessibility")) }
+        finally { service.destroy() }
+        assertTrue(control.status().getBoolean("accessibilityEnabled"))
+        assertFalse(control.status().getBoolean("accessibility"))
+    }
+
+    @Test fun accessibilityRecoveryRequiresOptInAndRespectsSystemSettingsChanges() {
+        val app = RuntimeEnvironment.getApplication() as DshApp
+        val recovery = app.accessibility
+        val secure = android.provider.Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+        val own = android.content.ComponentName(app, PhoneService::class.java).flattenToShortString()
+        val other = "example.reader/.Reader"
+        fun services() = android.provider.Settings.Secure.getString(app.contentResolver, secure)
+        fun set(value: String) { android.provider.Settings.Secure.putString(app.contentResolver, secure, value) }
+        val main = shadowOf(Looper.getMainLooper())
+        recovery.setFocused(true)
+        set("$other:$own")
+        recovery.setAutomatic(true)
+        assertFalse(recovery.state.value.automatic)
+        shadowOf(app).grantPermissions(android.Manifest.permission.WRITE_SECURE_SETTINGS)
+        recovery.refresh()
+        main.idleFor(3, TimeUnit.SECONDS)
+        assertEquals("$other:$own", services())
+        recovery.setAutomatic(true)
+        main.idleFor(2, TimeUnit.SECONDS)
+        assertTrue(recovery.state.value.repairing)
+        assertEquals(other, services())
+        main.idleFor(1, TimeUnit.SECONDS)
+        assertEquals("$other:$own", services())
+
+        main.idleFor(30, TimeUnit.SECONDS)
+        recovery.refresh()
+        set(other) // 用户在等待期间关闭了系统开关。
+        main.idleFor(3, TimeUnit.SECONDS)
+        assertEquals(other, services())
+        assertFalse(recovery.state.value.enabled)
+
+        set("$other:$own")
+        recovery.refresh()
+        main.idleFor(2, TimeUnit.SECONDS)
+        set("$other:example.another/.Reader")
+        main.idleFor(1, TimeUnit.SECONDS)
+        assertEquals("$other:example.another/.Reader", services())
+
+        main.idleFor(30, TimeUnit.SECONDS)
+        set("$other:$own")
+        recovery.refresh()
+        main.idleFor(2, TimeUnit.SECONDS)
+        assertTrue(recovery.state.value.repairing)
+        recovery.setFocused(false)
+        recovery.setFocused(true)
+        main.idleFor(1, TimeUnit.SECONDS)
+        assertEquals(other, services())
+    }
+
     @Test fun phoneControlRejectsUnknownMethodsExtraFieldsAndMissingTextButAllowsAnEmptyString() {
         val control = PhoneControl(RuntimeEnvironment.getApplication())
         val checks = AtomicInteger()
@@ -5466,6 +5552,42 @@ class CoreTest {
             shadowOf(Looper.getMainLooper()).idle()
             assertTrue(shadowOf(controller.get()).globalActionsPerformed.isEmpty())
             assertFalse(control.enabled())
+        } finally {
+            worker.shutdownNow()
+            assertTrue(worker.awaitTermination(3, TimeUnit.SECONDS))
+            controller.destroy()
+        }
+    }
+
+    @Test @LooperMode(LooperMode.Mode.PAUSED)
+    fun phoneControlDoesNotDispatchQueuedWorkOnAReconnectedService() {
+        val app = RuntimeEnvironment.getApplication()
+        val control = PhoneControl(app)
+        val controller = phoneService()
+        val worker = Executors.newSingleThreadExecutor()
+        val service = controller.get()
+        try {
+            shadowOf(app.getSystemService(KeyguardManager::class.java)).apply {
+                setKeyguardLocked(false)
+                setIsDeviceLocked(false)
+            }
+            shadowOf(app.getSystemService(PowerManager::class.java)).turnScreenOn(true)
+            for ((method, args) in listOf("home" to JSONObject(), "open" to JSONObject().put("package", "example.app"))) {
+                val queued = CountDownLatch(1)
+                val checks = AtomicInteger()
+                val result = worker.submit<JSONObject> {
+                    control.execute(method, args, "root") {
+                        if (checks.incrementAndGet() >= 2) queued.countDown()
+                        true
+                    }
+                }
+                assertTrue(queued.await(3, TimeUnit.SECONDS))
+                service.onUnbind(Intent())
+                ReflectionHelpers.callInstanceMethod<Void>(service, "onServiceConnected")
+                shadowOf(Looper.getMainLooper()).idle()
+                phoneFailure("accessibility_offline", result.get(3, TimeUnit.SECONDS))
+            }
+            assertTrue(shadowOf(service).globalActionsPerformed.isEmpty())
         } finally {
             worker.shutdownNow()
             assertTrue(worker.awaitTermination(3, TimeUnit.SECONDS))

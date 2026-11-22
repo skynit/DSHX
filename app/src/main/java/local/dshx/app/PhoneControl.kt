@@ -2,9 +2,7 @@ package local.dshx.app
 
 import android.app.KeyguardManager
 import android.content.Context
-import android.content.ComponentName
 import android.content.Intent
-import android.provider.Settings
 import android.content.pm.ApplicationInfo
 import java.util.Locale
 import android.os.Build
@@ -30,12 +28,7 @@ class PhoneControl(context: Context) {
     fun enabled(): Boolean = settings.getBoolean("enabled", true)
 
     /** 检查系统授权，不把服务尚在连接误判为未授权，也不把其他应用的授权算作本应用。 */
-    fun accessibilityEnabled(): Boolean {
-        if (Settings.Secure.getInt(context.contentResolver, Settings.Secure.ACCESSIBILITY_ENABLED, 0) != 1) return false
-        val service = ComponentName(context, PhoneService::class.java)
-        return Settings.Secure.getString(context.contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES)
-            .orEmpty().split(':').any { ComponentName.unflattenFromString(it) == service }
-    }
+    fun accessibilityEnabled(): Boolean = AccessibilityRecovery.enabled(context)
 
     /** 回到应用时恢复默认允许；小窗中的停止仍会立即取消操作，系统授权另行检查。 */
     fun resume() {
@@ -64,7 +57,7 @@ class PhoneControl(context: Context) {
         val online = PhoneService.current != null
         val locked = locked()
         val interactive = interactive()
-        return success().put("enabled", enabled).put("accessibility", online)
+        return success().put("enabled", enabled).put("accessibility", online).put("accessibilityEnabled", accessibilityEnabled())
             .put("deviceReady", enabled && !locked && interactive)
             .put("ready", enabled && online && !locked && interactive).put("locked", locked).put("interactive", interactive)
             .put("screenshotSupported", Build.VERSION.SDK_INT >= 30)
@@ -121,13 +114,13 @@ class PhoneControl(context: Context) {
         if (Looper.myLooper() == Looper.getMainLooper()) return failure("wrong_thread", "手机操作必须从后台线程调用")
         // 复制参数，避免调用方在排队期间更改待执行内容。
         val input = JSONObject(args.toString())
-        val call = Call(valid, method in screenMethods, if (method == "ask") ASK_TIMEOUT else TIMEOUT, method == "key" && input.optString("name") == "lock", PhoneDevice.capability(method, input), method == "export")
+        val call = Call(valid, method in screenMethods, method == "open", if (method == "ask") ASK_TIMEOUT else TIMEOUT,
+            method == "key" && input.optString("name") == "lock", PhoneDevice.capability(method, input), method == "export")
         if (!pending.compareAndSet(null, call)) return failure("busy", "已有手机请求正在处理")
         val work = Runnable {
             try {
                 checkCall(call)
-                val service = PhoneService.current
-                call.service = service
+                val service = call.connection?.service
                 val check = { checkCall(call) }
                 // 与取消/超时完成回执使用同一把锁，避免回执宣称未派发后才开始动作。
                 val dispatch = { synchronized(call) { check(); call.dispatched = true } }
@@ -158,7 +151,7 @@ class PhoneControl(context: Context) {
                     else -> call.cleanup = device.execute(method, input, check, dispatch, { call.finish(it) }, { enabled() && runCatching(valid).getOrDefault(false) })
                 }
             } catch (error: Exception) {
-                PhoneService.current?.clear(session)
+                call.connection?.service?.takeIf { call.connection === PhoneService.connection }?.clear(session)
                 call.finish(errorResult(error))
             }
         }
@@ -194,7 +187,7 @@ class PhoneControl(context: Context) {
             main.post {
                 call.cleanup?.invoke()
                 reply?.let(window::result)
-                if (!delivered) PhoneService.current?.clear(session)
+                if (!delivered && call.connection === PhoneService.connection) call.connection?.service?.clear(session)
             }
             pending.compareAndSet(call, null)
         }
@@ -227,9 +220,10 @@ class PhoneControl(context: Context) {
             throw PhoneFailure("cancelled", "手机请求已取消；实际界面结果需重新观察")
         }
         if (!enabled()) throw PhoneFailure("disabled", "手机操作开关未开启")
-        val service = PhoneService.current
-        if (call.needsService && service == null) throw PhoneFailure("accessibility_offline", "无障碍服务未连接")
-        if (call.needsService && call.service != null && call.service !== service) throw PhoneFailure("accessibility_offline", "无障碍服务连接已更换")
+        if (call.needsService && call.connection == null) throw PhoneFailure("accessibility_offline", "无障碍服务未连接")
+        if ((call.needsService || call.opensApp) && call.connection !== PhoneService.connection) {
+            throw PhoneFailure("accessibility_offline", "无障碍服务连接已变化，请重新观察")
+        }
         if (!completed && !(call.locking && call.dispatched)) requireReady()
     }
 
@@ -280,11 +274,11 @@ class PhoneControl(context: Context) {
         return success().put("accepted", true).put("package", name)
     }
 
-    private class Call(val valid: () -> Boolean, val needsService: Boolean, timeout: Long, val locking: Boolean, val capability: String?, val exporting: Boolean) {
+    private class Call(val valid: () -> Boolean, val needsService: Boolean, val opensApp: Boolean, timeout: Long, val locking: Boolean, val capability: String?, val exporting: Boolean) {
         val deadline = SystemClock.elapsedRealtime() + timeout
         val done = CountDownLatch(1)
         val result = AtomicReference<JSONObject?>()
-        @Volatile var service: PhoneService? = null
+        val connection = PhoneService.connection
         @Volatile var dispatched = false
         @Volatile var cleanup: (() -> Unit)? = null
         @Synchronized fun finish(value: JSONObject) { if (result.compareAndSet(null, value)) done.countDown() }

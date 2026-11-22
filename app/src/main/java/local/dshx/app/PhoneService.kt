@@ -50,7 +50,7 @@ class PhoneService : AccessibilityService() {
     override fun onServiceConnected() {
         current?.takeIf { it !== this }?.offline()
         clear()
-        current = this
+        connection = Connection(this)
         events?.phoneConnected()
     }
 
@@ -76,9 +76,14 @@ class PhoneService : AccessibilityService() {
     override fun onDestroy() { offline(); super.onDestroy() }
 
     private fun offline() {
+        val wasConnected = current === this
+        if (wasConnected) connection = null
         events?.phoneStopped()
         clear()
-        if (current === this) { current = null; events?.closePhoneWindow() }
+        if (wasConnected) {
+            events?.closePhoneWindow()
+            events?.phoneDisconnected()
+        }
     }
 
     internal fun clear(owner: String? = null) {
@@ -499,9 +504,12 @@ class PhoneService : AccessibilityService() {
     private fun boundsJson(bounds: Rect): JSONObject = JSONObject().put("left", bounds.left).put("top", bounds.top)
         .put("right", bounds.right).put("bottom", bounds.bottom)
 
+    internal class Connection(val service: PhoneService)
+
     companion object {
-        @Volatile internal var current: PhoneService? = null
+        @Volatile internal var connection: Connection? = null
             private set
+        internal val current: PhoneService? get() = connection?.service
 
         internal fun requireInput(text: String) {
             if (text.codePointCount(0, text.length) > 2000 || text.toByteArray(Charsets.UTF_8).size > 8192) {
