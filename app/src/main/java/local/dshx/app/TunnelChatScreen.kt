@@ -6,11 +6,14 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -20,9 +23,13 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
@@ -41,11 +48,14 @@ import androidx.compose.foundation.text.input.setTextAndPlaceCursorAtEnd
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.composables.icons.lucide.Compass
@@ -55,6 +65,7 @@ import com.composables.icons.lucide.MessagesSquare
 import com.composables.icons.lucide.RotateCcw
 import com.composables.icons.lucide.Send
 import com.composables.icons.lucide.Settings2
+import com.composables.icons.lucide.UserRound
 import com.composables.icons.lucide.X
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -63,6 +74,11 @@ import kotlinx.coroutines.withContext
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.theme.MiuixTheme
+import java.time.Instant
+import java.time.LocalDate
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.util.Locale
 
 @Composable
 internal fun TunnelChatScreen(
@@ -72,54 +88,98 @@ internal fun TunnelChatScreen(
     var discover by rememberSaveable { mutableStateOf(false) }
     var selectedConversationId by rememberSaveable { mutableStateOf<String?>(null) }
     val drafts = rememberSaveableStateHolder()
+    val listState = key(settings.platformOrigin, settings.endpointId) { rememberLazyListState() }
+    val conversations = runtimeState.conversations
+    val selected = conversations.firstOrNull { it.conversationId == selectedConversationId }
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val gutter = if (maxWidth >= 600.dp) 32.dp else 16.dp
         Column(Modifier.align(Alignment.TopCenter).widthIn(max = 680.dp).fillMaxSize().padding(horizontal = gutter)) {
-            Row(Modifier.fillMaxWidth().padding(top = 12.dp, bottom = 16.dp), verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text("聊天", fontSize = 22.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.semantics { heading() })
-                    Note(runtimeState.message)
-                }
-                VoiceButton("聊天设置", Lucide.Settings2, onSettings, iconSize = 18)
-            }
+            TunnelChatHeader(runtimeState, onSettings)
             Row(Modifier.fillMaxWidth().selectableGroup().clip(RoundedCornerShape(10.dp))
-                .background(MiuixTheme.colorScheme.surfaceVariant).padding(4.dp),
+                .background(MiuixTheme.colorScheme.secondary).padding(4.dp),
                 horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                listOf(Triple(false, "会话", Lucide.MessagesSquare), Triple(true, "发现", Lucide.Compass)).forEach { (value, label, icon) ->
-                    val selected = discover == value
-                    val tint = if (selected) MiuixTheme.colorScheme.onSurface else MiuixTheme.colorScheme.onSurfaceVariantSummary
+                val inboxLabel = if (conversations.isEmpty()) "会话" else "会话 ${conversations.size}"
+                listOf(Triple(false, inboxLabel, Lucide.MessagesSquare), Triple(true, "发现", Lucide.Compass)).forEach { (value, label, icon) ->
+                    val active = discover == value
+                    val colors = MiuixTheme.colorScheme
                     Row(Modifier.weight(1f).heightIn(min = 48.dp).clip(RoundedCornerShape(8.dp))
-                        .selectionBackground(selected).selectable(selected, role = Role.Tab) { discover = value },
+                        .background(if (active) colors.surfaceVariant else Color.Transparent)
+                        .selectable(active, role = Role.Tab) { discover = value },
                         horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
                         verticalAlignment = Alignment.CenterVertically) {
-                        Icon(icon, contentDescription = null, modifier = Modifier.size(16.dp), tint = tint)
-                        Text(label, fontSize = 14.sp, color = tint, fontWeight = if (selected) FontWeight.Medium else FontWeight.Normal)
+                        Icon(icon, contentDescription = null, modifier = Modifier.size(16.dp), tint = colors.onSurfaceVariantSummary)
+                        Text(label, fontSize = 14.sp, color = colors.onSurface, fontWeight = if (active) FontWeight.Medium else FontWeight.Normal)
                     }
                 }
             }
-            key(discover, settings.platformOrigin, selectedConversationId.takeUnless { discover }) {
-                Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()).padding(vertical = 16.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    if (discover) {
-                        TunnelDirectory(runtime, settings, visible, onSettings) { conversationId ->
-                            selectedConversationId = conversationId
-                            discover = false
-                        }
-                    } else if (runtimeState.conversations.isEmpty()) {
-                        LibraryEmpty(Lucide.MessagesSquare, "暂无会话",
-                            if (settings.enabled) "从端点目录发起聊天，或等待访客联系。" else "穿透聊天尚未开启。") {
-                            if (settings.enabled) Action("发现端点", { discover = true }, icon = Lucide.Compass)
-                            else Action("打开聊天设置", onSettings, primary = true, icon = Lucide.Settings2)
-                        }
-                    } else {
-                        TunnelConversations(runtimeState.conversations, selectedConversationId, { selectedConversationId = it }) { conversation ->
-                            drafts.SaveableStateProvider(conversation.conversationId) { TunnelConversationPanel(runtime, conversation) }
+            if (!discover && selected == null && conversations.isNotEmpty()) {
+                val zone = ZoneId.systemDefault()
+                val today = LocalDate.now(zone)
+                LazyColumn(Modifier.weight(1f).fillMaxWidth(), state = listState,
+                    contentPadding = PaddingValues(vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(conversations, key = { it.conversationId }) { conversation ->
+                        TunnelConversationRow(conversation, zone, today) { selectedConversationId = conversation.conversationId }
+                    }
+                }
+            } else {
+                key(discover, settings.platformOrigin, selected?.conversationId.takeUnless { discover }) {
+                    Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()).padding(vertical = 16.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        if (discover) {
+                            TunnelDirectory(runtime, settings, visible, onSettings) { conversationId ->
+                                selectedConversationId = conversationId
+                                discover = false
+                            }
+                        } else if (selected != null) {
+                            Action("所有会话", { selectedConversationId = null })
+                            Panel {
+                                Text("${selected.peerLabel} · ${selected.remoteEndpointId}", fontSize = 16.sp, fontWeight = FontWeight.Medium)
+                                Note(listOfNotNull(selected.connectionLabel, selected.receptionLabel, selected.preview()?.text).joinToString(" · "))
+                                Spacer(Modifier.height(12.dp))
+                                drafts.SaveableStateProvider(selected.conversationId) { TunnelConversationPanel(runtime, selected) }
+                            }
+                        } else {
+                            LibraryEmpty(Lucide.MessagesSquare, "暂无会话",
+                                if (settings.enabled) "从端点目录发起聊天，或等待访客联系。" else "穿透聊天尚未开启。") {
+                                if (settings.enabled) Action("发现端点", { discover = true }, icon = Lucide.Compass)
+                                else Action("打开聊天设置", onSettings, primary = true, icon = Lucide.Settings2)
+                            }
                         }
                     }
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun TunnelChatHeader(state: TunnelChatRuntimeState, onSettings: () -> Unit) {
+    val colors = MiuixTheme.colorScheme
+    val label = when (state.status) {
+        Status.DISABLED -> "未开启"
+        Status.STARTING -> "正在启动"
+        Status.ONLINE -> "信令在线"
+        Status.OFFLINE -> "信令离线"
+        Status.FAILED -> "信令异常"
+    }
+    val tint = when (state.status) {
+        Status.ONLINE -> LocalStatusColor.current
+        Status.STARTING -> colors.primary
+        Status.FAILED -> colors.error
+        else -> colors.onSurfaceVariantSummary
+    }
+    Column(Modifier.fillMaxWidth().padding(top = 12.dp, bottom = 12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text("聊天", fontSize = 26.sp, lineHeight = 32.sp, fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.semantics { heading() })
+            Box(Modifier.weight(1f)) {
+                Row(Modifier.background(colors.secondary, CircleShape).padding(horizontal = 8.dp, vertical = 4.dp)) {
+                    TunnelStatus(label, tint)
+                }
+            }
+            VoiceButton("聊天设置", Lucide.Settings2, onSettings, iconSize = 18)
+        }
+        if (state.status != Status.DISABLED) Note(state.message)
     }
 }
 
@@ -217,52 +277,96 @@ private fun TunnelDirectory(
 }
 
 @Composable
-private fun TunnelConversations(
-    conversations: List<TunnelChatConversationSnapshot>, selectedId: String?, onSelect: (String?) -> Unit,
-    content: @Composable (TunnelChatConversationSnapshot) -> Unit,
+private fun TunnelConversationRow(
+    conversation: TunnelChatConversationSnapshot, zone: ZoneId, today: LocalDate, onOpen: () -> Unit,
 ) {
-    val selected = conversations.firstOrNull { it.conversationId == selectedId }
-    if (selected != null) {
-        Action("所有会话", { onSelect(null) })
-        Panel {
-            val (title, summary) = selected.label(fullId = true)
-            Text(title, fontSize = 16.sp, fontWeight = FontWeight.Medium)
-            Note(summary)
-            Spacer(Modifier.height(12.dp))
-            content(selected)
+    val colors = MiuixTheme.colorScheme
+    val shape = RoundedCornerShape(10.dp)
+    var focused by remember { mutableStateOf(false) }
+    val preview = remember(conversation.messages) { conversation.preview() }
+    val id = conversation.remoteEndpointId.let { if (it.length <= 12) it else "…${it.takeLast(8)}" }
+    val subtitle = listOfNotNull(conversation.receptionLabel, preview?.text ?: "暂无消息").joinToString(" · ")
+    Row(Modifier.fillMaxWidth().heightIn(min = 72.dp).clip(shape).background(colors.surfaceVariant)
+        .border(if (focused) 2.dp else 1.dp, if (focused) colors.primary else colors.outline, shape)
+        .onFocusChanged { focused = it.isFocused }.clickable(role = Role.Button, onClick = onOpen).padding(12.dp),
+        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        Box(Modifier.size(40.dp).background(colors.secondary, CircleShape), contentAlignment = Alignment.Center) {
+            Icon(if (conversation.outgoing) Lucide.MessagesSquare else Lucide.UserRound, contentDescription = null,
+                modifier = Modifier.size(18.dp), tint = colors.onSurfaceVariantSummary)
         }
-    } else {
-        Panel(padding = 0) {
-            conversations.forEachIndexed { index, conversation ->
-                if (index > 0) Divider()
-                val (title, summary) = conversation.label()
-                LinkRow(title, summary) { onSelect(conversation.conversationId) }
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(conversation.peerLabel, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                    Text(id, fontSize = 12.sp, color = colors.onSurface, maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.background(colors.secondary, RoundedCornerShape(4.dp)).padding(horizontal = 4.dp, vertical = 2.dp))
+                }
+                TunnelStatus(conversation.connectionLabel, when {
+                    conversation.closed -> colors.onSurfaceVariantSummary
+                    conversation.connected -> LocalStatusColor.current
+                    conversation.connecting -> colors.primary
+                    else -> colors.onSurfaceVariantSummary
+                })
+            }
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(subtitle, Modifier.weight(1f), fontSize = 13.sp, lineHeight = 18.sp,
+                    color = colors.onSurfaceVariantSummary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                if (preview != null) {
+                    Text(conversationTime(preview.createdAt, zone, today), fontSize = 12.sp,
+                        color = colors.onSurfaceVariantSummary, maxLines = 1)
+                }
             }
         }
     }
 }
 
-private fun TunnelChatConversationSnapshot.label(fullId: Boolean = false): Pair<String, String> {
-    val id = if (fullId || remoteEndpointId.length <= 12) remoteEndpointId else "…${remoteEndpointId.takeLast(8)}"
-    val title = "${if (outgoing) "端点" else "访客"} · $id"
-    val status = when {
+@Composable
+private fun TunnelStatus(label: String, tint: Color) {
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+        Spacer(Modifier.size(6.dp).background(tint, CircleShape))
+        Text(label, fontSize = 12.sp, lineHeight = 16.sp, color = MiuixTheme.colorScheme.onSurface)
+    }
+}
+
+private val TunnelChatConversationSnapshot.peerLabel: String get() = if (outgoing) "端点" else "访客"
+private val TunnelChatConversationSnapshot.receptionLabel: String? get() = if (outgoing || closed) null else mode.label()
+private val TunnelChatConversationSnapshot.connectionLabel: String
+    get() = when {
         closed -> "已结束"
         connected -> "已连接"
-        connecting -> "正在连接…"
+        connecting -> "连接中"
         else -> "未连接"
     }
-    val context = if (outgoing || closed) status else "$status · ${mode.label()}"
-    val preview = messages.asReversed().firstNotNullOfOrNull { message ->
-        when (message.kind) {
+
+internal data class TunnelConversationPreview(val text: String, val createdAt: Long)
+
+internal fun TunnelChatConversationSnapshot.preview(): TunnelConversationPreview? =
+    messages.asReversed().firstNotNullOfOrNull { message ->
+        val text = when (message.kind) {
             ChatMessageKind.TEXT, ChatMessageKind.AI_FORMAL, ChatMessageKind.HUMAN_FORMAL ->
-                message.payload.optString("text").trim().lineSequence().firstOrNull()
+                message.payload.optString("text")
             ChatMessageKind.IMAGE, ChatMessageKind.FILE -> message.payload.optJSONObject("attachment")?.optString("name")
             else -> null
         }
+        val line = text?.trim()?.lineSequence()?.firstOrNull()?.takeIf { it.isNotBlank() } ?: return@firstNotNullOfOrNull null
+        val snippet = if (line.length <= 60) line else "${line.take(59).trimEnd()}…"
+        TunnelConversationPreview(snippet, message.createdAt)
     }
-    if (preview.isNullOrBlank()) return title to context
-    val snippet = if (preview.length <= 60) preview else "${preview.take(59).trimEnd()}…"
-    return title to "$context\n$snippet"
+
+private val conversationHour = DateTimeFormatter.ofPattern("HH:mm", Locale.ROOT)
+private val conversationDay = DateTimeFormatter.ofPattern("M/d", Locale.ROOT)
+private val conversationYear = DateTimeFormatter.ofPattern("uuuu/M/d", Locale.ROOT)
+
+internal fun conversationTime(createdAt: Long, zone: ZoneId, today: LocalDate): String {
+    val time = Instant.ofEpochMilli(createdAt).atZone(zone)
+    return when {
+        time.toLocalDate() == today -> time.format(conversationHour)
+        time.toLocalDate() == today.minusDays(1) -> "昨天"
+        time.year == today.year -> time.format(conversationDay)
+        else -> time.format(conversationYear)
+    }
 }
 
 @Composable

@@ -196,6 +196,29 @@ class CoreTest {
         }
     }
 
+    @Test fun tunnelConversationPreviewUsesTheLatestPublicMessageAndItsTime() {
+        val message = ChatMessage("m1", "chat", 1, ChatSenderRole.VISITOR, "guest", ChatMessageKind.TEXT, 1000L,
+            payload = JSONObject().put("text", "第一行\n第二行"))
+        val suggestion = message.copy(messageId = "m2", kind = ChatMessageKind.AI_SUGGESTION, createdAt = 2000L)
+        val end = message.copy(messageId = "m3", kind = ChatMessageKind.CONVERSATION_EVENT, createdAt = 3000L)
+        val chat = TunnelChatConversationSnapshot("chat", "guest", outgoing = false, connected = false, connecting = false,
+            closed = true, mode = ConversationMode.AI, aiRepliesSent = 0, messages = listOf(message, suggestion, end))
+
+        assertEquals(TunnelConversationPreview("第一行", 1000L), chat.preview())
+        assertNull(chat.copy(messages = listOf(suggestion, end)).preview())
+    }
+
+    @Test fun tunnelConversationTimeUsesTheLocalDate() {
+        val zone = java.time.ZoneId.of("Asia/Shanghai")
+        val today = java.time.LocalDate.of(2026, 11, 23)
+        fun label(utc: String) = conversationTime(java.time.Instant.parse(utc).toEpochMilli(), zone, today)
+
+        assertEquals("00:32", label("2026-11-22T16:32:00Z"))
+        assertEquals("昨天", label("2026-11-22T15:32:00Z"))
+        assertEquals("11/19", label("2026-11-19T09:00:00Z"))
+        assertEquals("2025/12/31", label("2025-12-30T16:00:00Z"))
+    }
+
     @Test fun tunnelImageTransfersMultipleWindowsBeforeConfirmingDelivery() {
         val first = mutableListOf<JSONObject>()
         val second = mutableListOf<JSONObject>()
