@@ -15,7 +15,6 @@ import androidx.compose.runtime.setValue
 import androidx.core.content.FileProvider
 import com.android.apksig.ApkVerifier
 import java.io.File
-import java.security.MessageDigest
 import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
 import java.util.concurrent.Executors
@@ -91,7 +90,6 @@ internal class AppUpdate(private val context: Context, private val endpoint: Str
         worker.execute {
             val result = runCatching {
                 check(root.isDirectory || root.mkdirs()) { "无法创建更新目录。" }
-                require(root.usableSpace > release.artifact.size * 2 + 32L * 1024 * 1024) { "存储空间不足，请清理后重试。" }
                 var percent = -1L
                 store.download(release, apk, cancelled::get) { done, total ->
                     val value = done * 100 / total
@@ -105,7 +103,7 @@ internal class AppUpdate(private val context: Context, private val endpoint: Str
                 catch (error: Exception) { pending.failWrite(output); throw error }
             }
             main.post {
-                state = old.copy(message = if (result.isSuccess) "下载完成，可安装 ${release.name}" else if (cancelled.get()) "下载已取消" else "下载未完成",
+                state = old.copy(message = if (result.isSuccess) "下载完成，可安装 ${release.name}" else if (cancelled.get()) "下载已取消" else "下载未完成，可重试",
                     ready = result.isSuccess, error = if (cancelled.get()) null else result.exceptionOrNull()?.message)
             }
         }
@@ -168,12 +166,7 @@ internal class AppUpdate(private val context: Context, private val endpoint: Str
         @Suppress("DEPRECATION")
         fun verify(context: Context, release: UpdateStore.Release, file: File, certificates: List<X509Certificate>) {
             require(file.isFile && file.length() == release.artifact.size) { "已下载的安装包不完整，请重新下载。" }
-            val digest = MessageDigest.getInstance("SHA-256")
-            file.inputStream().use { input ->
-                val buffer = ByteArray(64 * 1024)
-                while (true) { val count = input.read(buffer); if (count < 0) break; digest.update(buffer, 0, count) }
-            }
-            require(UpdateStore.hex(digest.digest()) == release.artifact.hash) { "安装包内容发生变化，请重新下载。" }
+            require(UpdateStore.hash(file) == release.artifact.hash) { "安装包内容发生变化，请重新下载。" }
             val result = ApkVerifier.Builder(file).setMinCheckedPlatformVersion(26).build().verify()
             require(result.isVerified && result.signerCertificates.map { UpdateStore.hash(it.encoded) }.toSet() ==
                 certificates.map { UpdateStore.hash(it.encoded) }.toSet()) { "安装包签名与当前应用不一致。" }

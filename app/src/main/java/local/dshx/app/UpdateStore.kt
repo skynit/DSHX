@@ -1,12 +1,16 @@
 package local.dshx.app
 
 import okhttp3.Call
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.EOFException
 import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
 import java.io.InterruptedIOException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption.ATOMIC_MOVE
@@ -83,32 +87,97 @@ internal class UpdateStore(
     }
 
     fun download(release: Release, target: File, cancelled: () -> Boolean, progress: (Long, Long) -> Unit) {
-        val temporary = File(target.path + ".part")
+        val artifact = release.artifact
+        val directory = target.absoluteFile.parentFile!!
+        val partName = "${target.name}.part"
+        val temporary = File(directory, "$partName.${artifact.hash}")
         try {
-            request(release.artifact.url).use { response ->
-                require(response.code == 200) { "安装包下载失败（${response.code}）。" }
-                val body = response.body ?: error("服务器没有返回安装包。")
-                require(body.contentLength() == -1L || body.contentLength() == release.artifact.size) { "安装包大小不符。" }
-                val digest = MessageDigest.getInstance("SHA-256")
-                var done = 0L
-                body.byteStream().use { input -> temporary.outputStream().use { output ->
-                    val buffer = ByteArray(64 * 1024)
-                    while (true) {
-                        if (cancelled()) throw InterruptedIOException("下载已取消。")
-                        val count = input.read(buffer)
-                        if (count < 0) break
-                        done += count
-                        require(done <= release.artifact.size) { "安装包超过预期大小。" }
-                        output.write(buffer, 0, count); digest.update(buffer, 0, count)
-                        progress(done, release.artifact.size)
-                    }
-                    output.fd.sync()
-                } }
-                require(done == release.artifact.size && hex(digest.digest()) == release.artifact.hash) { "安装包内容校验失败，请重新下载。" }
+            // 旧版临时文件没有记录对应的安装包，不能拿来续传。
+            val partPattern = Regex("${Regex.escape(partName)}(?:\\.[a-f0-9]{64})?")
+            directory.listFiles()?.filter { it != temporary && it.isFile && partPattern.matches(it.name) }
+                ?.forEach { Files.deleteIfExists(it.toPath()) }
+            checkCancelled(cancelled)
+            // 应用可能在文件改名后、登记可安装状态前被系统结束。
+            if (target.isFile && target.length() == artifact.size && hash(target, cancelled) == artifact.hash) {
+                checkCancelled(cancelled)
+                Files.deleteIfExists(temporary.toPath())
+                progress(artifact.size, artifact.size)
+                return
             }
-            if (cancelled()) throw InterruptedIOException("下载已取消。")
+            if (temporary.length() > artifact.size) Files.deleteIfExists(temporary.toPath())
+            var offset = temporary.length()
+            check(directory.usableSpace > artifact.size - offset + 32L * 1024 * 1024) { "存储空间不足，请清理后重试。" }
+            progress(offset, artifact.size)
+            while (offset < artifact.size) {
+                offset = request(artifact.url, cancelled) {
+                    header("Accept-Encoding", "identity") // 文件偏移必须对应原始字节。
+                    if (offset > 0) header("Range", "bytes=$offset-")
+                }.use { response ->
+                    if (offset > 0 && response.code == 416) {
+                        Files.deleteIfExists(temporary.toPath())
+                        progress(0, artifact.size)
+                        0L
+                    } else receive(response, artifact, temporary, offset, cancelled, progress)
+                }
+            }
+            require(temporary.length() == artifact.size && hash(temporary, cancelled) == artifact.hash) {
+                "安装包内容校验失败，请重新下载。"
+            }
+            checkCancelled(cancelled)
             Files.move(temporary.toPath(), target.toPath(), ATOMIC_MOVE, REPLACE_EXISTING)
-        } finally { call = null; temporary.delete() }
+        } catch (error: IllegalArgumentException) {
+            Files.deleteIfExists(temporary.toPath())
+            throw error
+        } finally {
+            call = null
+            if (cancelled()) Files.deleteIfExists(temporary.toPath())
+        }
+    }
+
+    private fun receive(response: Response, artifact: Artifact, file: File, offset: Long,
+        cancelled: () -> Boolean, progress: (Long, Long) -> Unit,
+    ): Long {
+        var done = 0L
+        val end = when (response.code) {
+            200 -> artifact.size
+            206 -> {
+                val header = response.headers.values("Content-Range").singleOrNull().orEmpty()
+                val range = BYTE_RANGE.matchEntire(header)
+                val start = range?.groupValues?.get(1)?.toLongOrNull()
+                val last = range?.groupValues?.get(2)?.toLongOrNull()
+                val size = range?.groupValues?.get(3)?.toLongOrNull()
+                require(offset > 0 && start == offset && last != null && last in offset until artifact.size && size == artifact.size) {
+                    "安装包续传范围无效。"
+                }
+                done = offset
+                last + 1
+            }
+            else -> throw IOException("安装包下载失败（${response.code}）。")
+        }
+        require(response.header("Content-Encoding").let { it == null || it.equals("identity", ignoreCase = true) }) {
+            "安装包下载编码无效。"
+        }
+        val body = response.body ?: error("服务器没有返回安装包。")
+        val length = body.contentLength()
+        require(length == -1L || length == end - done) { "安装包大小不符。" }
+        checkCancelled(cancelled)
+        if (done != offset) progress(done, artifact.size)
+        FileOutputStream(file, done > 0).use { output ->
+            val input = body.byteStream()
+            val buffer = ByteArray(64 * 1024)
+            while (true) {
+                checkCancelled(cancelled)
+                val count = input.read(buffer)
+                if (count < 0) break
+                require(count <= end - done) { "安装包超过预期大小。" }
+                output.write(buffer, 0, count)
+                done += count
+                progress(done, artifact.size)
+            }
+            if (done != end) throw EOFException("安装包下载中断，可重试。")
+            output.fd.sync()
+        }
+        return done
     }
 
     private fun address(value: String) {
@@ -118,9 +187,13 @@ internal class UpdateStore(
             url.username.isEmpty() && url.password.isEmpty() && url.fragment == null) { "更新文件必须来自配置的下载服务器。" }
     }
 
-    private fun request(value: String): okhttp3.Response {
+    private fun request(value: String, cancelled: () -> Boolean = { false }, headers: Request.Builder.() -> Unit = {}): Response {
         address(value)
-        return client.newCall(Request.Builder().url(value).header("Cache-Control", "no-cache").build()).also { call = it }.execute()
+        val request = Request.Builder().url(value).header("Cache-Control", "no-cache").apply(headers).build()
+        val next = client.newCall(request)
+        call = next
+        if (cancelled()) next.cancel()
+        return next.execute()
     }
 
     private fun read(url: String, maximum: Int): ByteArray = try {
@@ -144,6 +217,26 @@ internal class UpdateStore(
 
     companion object {
         const val MAX_APK = 1024L * 1024 * 1024
+        private val BYTE_RANGE = Regex("bytes ([0-9]+)-([0-9]+)/([0-9]+)", RegexOption.IGNORE_CASE)
+
+        private fun checkCancelled(cancelled: () -> Boolean) {
+            if (cancelled()) throw InterruptedIOException("下载已取消。")
+        }
+
+        fun hash(file: File, cancelled: () -> Boolean = { false }): String {
+            val digest = MessageDigest.getInstance("SHA-256")
+            file.inputStream().use { input ->
+                val buffer = ByteArray(64 * 1024)
+                while (true) {
+                    checkCancelled(cancelled)
+                    val count = input.read(buffer)
+                    if (count < 0) break
+                    digest.update(buffer, 0, count)
+                }
+            }
+            return hex(digest.digest())
+        }
+
         fun hash(bytes: ByteArray): String = hex(MessageDigest.getInstance("SHA-256").digest(bytes))
         fun hex(bytes: ByteArray): String = bytes.joinToString("") { "%02x".format(it.toInt() and 255) }
 

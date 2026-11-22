@@ -10,7 +10,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.error import HTTPError
 from urllib.parse import urlparse
 from urllib.request import urlopen
@@ -156,7 +156,8 @@ def prepare(args):
     if old_commit:
         run("git", "merge-base", "--is-ancestor", old_commit, commit)
     history = run("git", "log", "--reverse", "--format=%h %s", f"{old_commit}..{commit}" if old_commit else commit, "--")
-    notes = (f"DSHX {name}\n版本编号：{code}\n发布时间：{datetime.now(timezone.utc).isoformat(timespec='seconds')}\n\n"
+    prepared_at = datetime.now(timezone(timedelta(hours=8)))
+    notes = (f"DSHX {name}\n版本编号：{code}\n准备时间：{prepared_at:%Y-%m-%d %H:%M:%S}（北京时间）\n\n"
              f"本次更新提交：\n\n{history or '本次发布没有新增代码提交。'}\n\n"
              f"代码仓库：https://github.com/skynit/DSHX\n本次提交：{commit}\n"
              f"上次发布：{old_commit or '首次发布，包含当前提交之前的完整历史'}\n").encode("utf-8")

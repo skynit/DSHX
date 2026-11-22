@@ -754,17 +754,110 @@ class CoreTest {
             server.enqueue(okhttp3.mockwebserver.MockResponse().setBody("valid apk contents"))
             store.download(release, target, { false }) { _, _ -> }
             assertArrayEquals(bytes, target.readBytes())
+            val previous = "old apk contents!".toByteArray()
+            target.writeBytes(previous)
             server.enqueue(okhttp3.mockwebserver.MockResponse().setBody("wrong apk contents"))
             assertThrows(IllegalArgumentException::class.java) { store.download(release, target, { false }) { _, _ -> } }
-            assertArrayEquals(bytes, target.readBytes())
-            assertFalse(File(target.path + ".part").exists())
+            assertArrayEquals(previous, target.readBytes())
+            assertEquals(listOf(target), target.parentFile!!.listFiles()!!.toList())
             server.enqueue(okhttp3.mockwebserver.MockResponse().setBody("更新说明"))
             assertEquals("更新说明", store.notes(release))
             server.enqueue(okhttp3.mockwebserver.MockResponse().setBody("篡改后的更新说明"))
             assertThrows(IllegalArgumentException::class.java) { store.notes(release) }
             server.enqueue(okhttp3.mockwebserver.MockResponse().setBody("valid apk contents"))
-            assertThrows(java.io.InterruptedIOException::class.java) { store.download(release, target, { true }) { _, _ -> } }
+            var cancelled = false
+            assertThrows(java.io.InterruptedIOException::class.java) {
+                store.download(release, target, { cancelled }) { done, _ -> if (done > 0) cancelled = true }
+            }
+            assertArrayEquals(previous, target.readBytes())
+            assertEquals(listOf(target), target.parentFile!!.listFiles()!!.toList())
+        }
+    }
+
+    @Test fun updateResumesInterruptedDownloadAfterReopening() {
+        val signer = apkSigner()
+        okhttp3.mockwebserver.MockWebServer().use { server ->
+            server.start()
+            val base = server.url("/").toString()
+            val endpoint = "${base}latest.json"
+            val bytes = "valid apk contents".toByteArray()
+            val store = UpdateStore(endpoint, signer.certificates)
+            val release = store.parse(signedUpdate(updateManifest(base, bytes), signer), "local.dshx.app", listOf("arm64-v8a"), 34)
+            val target = File(folder.newFolder(), "update.apk")
+            server.enqueue(MockResponse().setBody("valid ").setHeader("Content-Length", bytes.size)
+                .setSocketPolicy(okhttp3.mockwebserver.SocketPolicy.DISCONNECT_AT_END))
+            assertThrows(java.io.IOException::class.java) { store.download(release, target, { false }) { _, _ -> } }
+            assertFalse(target.exists())
+            assertNull(server.takeRequest(1, java.util.concurrent.TimeUnit.SECONDS)!!.getHeader("Range"))
+
+            server.enqueue(MockResponse().setResponseCode(206).setBody("apk ")
+                .setHeader("Content-Range", "bytes 6-9/18"))
+            server.enqueue(MockResponse().setResponseCode(206).setBody("contents")
+                .setHeader("Content-Range", "bytes 10-17/18"))
+            val progress = mutableListOf<Long>()
+            val reopened = UpdateStore(endpoint, signer.certificates)
+            reopened.download(release, target, { false }) { done, _ -> progress += done }
+            assertEquals("bytes=6-", server.takeRequest(1, java.util.concurrent.TimeUnit.SECONDS)!!.getHeader("Range"))
+            assertEquals("bytes=10-", server.takeRequest(1, java.util.concurrent.TimeUnit.SECONDS)!!.getHeader("Range"))
+            assertEquals(6L, progress.first())
+            assertEquals(18L, progress.last())
             assertArrayEquals(bytes, target.readBytes())
+            assertEquals(listOf(target), target.parentFile!!.listFiles()!!.toList())
+
+            // 已改名但尚未登记的完整包可以重新校验，无须再发网络请求。
+            server.enqueue(MockResponse().setResponseCode(503))
+            UpdateStore(endpoint, signer.certificates).download(release, target, { false }) { _, _ -> }
+            assertEquals(3, server.requestCount)
+        }
+    }
+
+    @Test fun updateResumeHandlesFullResponseAndRejectsBadRangesOrContent() {
+        val signer = apkSigner()
+        okhttp3.mockwebserver.MockWebServer().use { server ->
+            server.start()
+            val base = server.url("/").toString()
+            val bytes = "valid apk contents".toByteArray()
+            val store = UpdateStore("${base}latest.json", signer.certificates)
+            val release = store.parse(signedUpdate(updateManifest(base, bytes), signer), "local.dshx.app", listOf("arm64-v8a"), 34)
+            val retries = listOf(
+                200 to MockResponse().setBody("valid apk contents"),
+                416 to MockResponse(),
+                206 to MockResponse().setBody("apk contents").setHeader("Content-Range", "bytes 5-16/18"),
+                206 to MockResponse().setBody("bad contents").setHeader("Content-Range", "bytes 6-17/18"),
+            )
+            fun requestedRange() = server.takeRequest(1, java.util.concurrent.TimeUnit.SECONDS)!!.getHeader("Range")
+            for ((status, retry) in retries) {
+                val target = File(folder.newFolder(), "update.apk")
+                server.enqueue(MockResponse().setChunkedBody("valid ", 2))
+                assertThrows(java.io.EOFException::class.java) { store.download(release, target, { false }) { _, _ -> } }
+                assertFalse(target.exists())
+                assertNull(requestedRange())
+
+                server.enqueue(retry.setResponseCode(status))
+                when (status) {
+                    416 -> {
+                        server.enqueue(MockResponse().setBody("valid apk contents"))
+                        store.download(release, target, { false }) { _, _ -> }
+                        assertEquals("bytes=6-", requestedRange())
+                        assertNull(requestedRange())
+                        assertArrayEquals(bytes, target.readBytes())
+                    }
+                    200 -> {
+                        store.download(release, target, { false }) { _, _ -> }
+                        assertEquals("bytes=6-", requestedRange())
+                        assertArrayEquals(bytes, target.readBytes())
+                    }
+                    else -> {
+                        assertThrows(IllegalArgumentException::class.java) { store.download(release, target, { false }) { _, _ -> } }
+                        assertFalse(target.exists())
+                        assertEquals("bytes=6-", requestedRange())
+                        server.enqueue(MockResponse().setBody("valid apk contents"))
+                        store.download(release, target, { false }) { _, _ -> }
+                        assertNull(requestedRange())
+                        assertArrayEquals(bytes, target.readBytes())
+                    }
+                }
+            }
         }
     }
 
