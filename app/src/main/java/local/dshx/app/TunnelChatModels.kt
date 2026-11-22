@@ -11,7 +11,7 @@ import java.util.UUID
 object TunnelChatProtocol {
     const val CHAT = "dshx-chat/1"
     const val SIGNALING = "cwnas-webrtc-signaling"
-    const val DEFAULT_PLATFORM_ORIGIN = "https://cwnas.net"
+    const val DEFAULT_PLATFORM_ORIGIN = "https://filesharing.asia"
     const val SIGNALING_PATH = "/api/v1/signaling"
     const val REGISTER_PATH = "/api/v1/dshx/chat/endpoints/register"
     const val DIRECTORY_PATH = "/api/v1/dshx/chat/endpoints"

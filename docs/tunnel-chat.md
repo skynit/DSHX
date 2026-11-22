@@ -1,6 +1,6 @@
 # 穿透聊天设计
 
-状态：本仓库已实现独立穿透平台与 Android 文本、在线图片聊天。默认地址仍为 `https://cwnas.net`，本次未在该地址部署或修改服务。可另行运行 DSHX 平台供测试客户端使用。
+状态：本仓库实现了独立穿透平台与 Android 文本、在线图片聊天。Android 默认使用 `https://filesharing.asia`。该地址是客户端默认配置，平台构建不会发布或修改公网服务。旧版已保存的平台地址不会自动覆盖；如仍使用旧默认地址，可在「设置 → 穿透聊天」中改为新地址。
 
 ## 当前客户端与平台契约
 
@@ -18,15 +18,25 @@
 
 当前界面开放文本、在线图片、AI 接待与人工接管。记忆、知识库、通用文件和 Phone control 未开放。成功建立 TURN 中继（由网络服务器转发加密流量）需要平台提供有效的 ICE 配置和 TURN 凭据；未在两台 Android 设备上验证。重连保留本地待发文字、已验证会话关系、人工接管状态、AI 正式回复计数和有限的收件记录；本端已投递的图片保存记录，已投递的文字仍只在内存中。
 
-## 运行自建平台
+## 打包和运行穿透平台
 
-在已安装 core 依赖的 DSHX 仓库根目录运行：
+在 DSHX 仓库根目录执行以下命令。构建需要 Python 3、Node.js 24 或更新版本及 npm，无需 Android SDK、APK 或 CWNAS 项目。
 
 ```bash
-node core/tunnel-platform.mjs
+python3 tools/tunnel.py build
 ```
 
-默认只监听 `127.0.0.1:9082`，可用 `DSHX_TUNNEL_PORT` 改端口。用提供有效证书的 HTTPS 反向代理转发 `/api/v1/dshx/chat/` 和 `/api/v1/signaling`；后一条需允许 WebSocket 升级并转发 `Authorization`。两台 DSHX 客户端在「设置 → 穿透聊天」填写同一 HTTPS 地址，开启穿透聊天并启动引擎。平台进程本身不转发正文；独立 coturn 服务提供 TURN 中继，部署步骤见下节。`DSHX_TUNNEL_ICE_SERVERS` 可设置为 WebRTC ICE（网络路径发现）服务器的 JSON 数组，例如 `[{"urls":["stun:stun.example.org:3478"]}]`，继续用于 STUN 或兼容既有配置。不要在该变量中配置长期 TURN 密码，应使用平台签发的临时凭据。
+生成 `build/dshx-tunnel-platform.tar.gz`，包含服务入口和锁定版本的 `ws`（服务端用于接收 WebSocket 信令的库）。将压缩包上传到服务器，在压缩包所在目录执行以下命令。服务器只需要 Node.js 24 或更新版本，不必再用 npm 安装依赖：
+
+```bash
+tar -xzf dshx-tunnel-platform.tar.gz
+cd dshx-tunnel-platform
+node tunnel-platform.mjs
+```
+
+默认只监听 `127.0.0.1:9082`，可用 `DSHX_TUNNEL_PORT` 改端口。由公网 HTTPS 反向代理（负责接收域名请求并转交本机平台进程）转发 `/api/v1/dshx/chat/` 和 `/api/v1/signaling`；后一条需允许 WebSocket 升级并转发 `Authorization`。部署到 `filesharing.asia` 时，须在反向代理配置该域名的有效证书；自建平台使用自己的域名和证书。两台 DSHX 客户端使用同一平台地址，开启穿透聊天并启动引擎；使用自建平台时，在「设置 → 穿透聊天」填写其 HTTPS 地址。
+
+平台进程本身不转发正文；独立 coturn 服务提供 TURN 中继，部署步骤见下节。`DSHX_TUNNEL_ICE_SERVERS` 可设置为 WebRTC ICE（网络路径发现）服务器的 JSON 数组，例如 `[{"urls":["stun:stun.example.org:3478"]}]`，继续用于 STUN 或兼容既有配置。不要在该变量中配置长期 TURN 密码，应使用平台签发的临时凭据。
 
 当前为单进程平台，端点目录保存在内存，重启后由客户端重新注册。断开的公开端点最多保留 7 天，便于对方选择离线投递；目录读取无需账号，发起连接必须持有注册凭证。限频与并发由接收方客户端执行。部署到公网前仍需加上反代层限流和运维监控；本服务无账号层、持久目录或举报功能；已支持基于端点签名注册的临时 TURN 凭据发放。
 
@@ -53,13 +63,13 @@ TURN 是客户端直连失败时使用的网络转发服务。平台负责发放
 5. 更新平台程序后执行 `systemctl daemon-reload`、`systemctl enable --now dshx-turn`、`systemctl restart dshx-tunnel`。
 6. 在云安全组和主机防火墙放行 `3478/TCP`、`3478/UDP`、`49160–49259/UDP`。`3478` 是客户端入口；后一个范围承载中继数据，缺失时即使凭据正确也不能建立中继聊天。
 
-模板限制每用户 16 个分配、全局 200 个分配、每分配每方向 1 MiB/s 和全局 20 MiB/s；实际容量也受中继端口范围与服务器带宽限制。禁止中继访问内网、回环、组播和云元数据地址，关闭管理端口与 RFC 6062 TCP 对端分配。`no-tcp-relay` 仍允许客户端通过 TCP 连接 TURN，再使用 UDP 中继端口通信。当前模板提供 `turn:` UDP/TCP 入口，未提供 `turns:` TLS 入口；WebRTC 业务数据仍由双方数据通道加密。官方平台默认地址保持不变，使用测试服务时客户端仍填写 `https://dshx-tunnel.filesharing.asia:8443`。
+模板限制每用户 16 个分配、全局 200 个分配、每分配每方向 1 MiB/s 和全局 20 MiB/s；实际容量也受中继端口范围与服务器带宽限制。禁止中继访问内网、回环、组播和云元数据地址，关闭管理端口与 RFC 6062 TCP 对端分配。`no-tcp-relay` 仍允许客户端通过 TCP 连接 TURN，再使用 UDP 中继端口通信。当前模板提供 `turn:` UDP/TCP 入口，未提供 `turns:` TLS 入口；WebRTC 业务数据仍由双方数据通道加密。模板中的地址用于下面的历史测试，不是客户端默认平台地址；新部署时替换为实际中继地址。
 
 验证时必须检查实际选中的 ICE 路径为 `relay`，并在 DataChannel 上双向发送文本；服务 active、取得候选或仅完成信令均不能代替此验证。测试程序通过也不代表两台 Android 客户端、AI 接待和人工接管已通过真机验收。
 
 ### 测试平台验收（2026-11-19）
 
-服务器 `47.119.120.17` 已运行独立 `dshx-turn.service`，系统包为 coturn `4.5.2-3.1~ubuntu22.04.1`。公网安全组放行后，测试结果如下：
+测试使用 `https://dshx-tunnel.filesharing.asia:8443`，不是当前默认平台地址。服务器 `47.119.120.17` 当时运行独立 `dshx-turn.service`，系统包为 coturn `4.5.2-3.1~ubuntu22.04.1`。公网安全组放行后，测试结果如下：
 
 | 验证范围 | 结果 |
 |---|---|
