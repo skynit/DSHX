@@ -72,7 +72,7 @@ class CoreTest {
         val settings = TunnelChatSettings().validate()
 
         assertFalse(settings.enabled)
-        assertEquals("https://filesharing.asia", settings.platformOrigin)
+        assertEquals("https://dshx-tunnel.filesharing.asia:8443", settings.platformOrigin)
         assertEquals(TunnelPublication.PUBLISHED, settings.publication)
         assertEquals(TunnelAcceptance.ACCEPTING, settings.acceptance)
         assertEquals(5_000L, settings.newConversationIntervalMs)
@@ -84,8 +84,8 @@ class CoreTest {
         assertFalse(settings.phoneControlEnabled)
     }
 
-    @Test fun tunnelChatSettingsUseOfficialPlatformOnlyWhenNoAddressIsSaved() {
-        assertEquals("https://filesharing.asia", TunnelChatSettings.fromJson(JSONObject()).platformOrigin)
+    @Test fun tunnelChatSettingsUseDefaultPlatformOnlyWhenNoAddressIsSaved() {
+        assertEquals(TunnelChatProtocol.DEFAULT_PLATFORM_ORIGIN, TunnelChatSettings.fromJson(JSONObject()).platformOrigin)
         val custom = TunnelChatSettings(platformOrigin = "https://chat.example.org:8443")
         assertEquals(custom.platformOrigin, TunnelChatSettings.fromJson(custom.toJson()).platformOrigin)
     }

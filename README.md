@@ -73,7 +73,7 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 ### 单独构建穿透平台
 
-穿透平台是供 DSHX 客户端注册聊天端点、发现对端和交换连接参数的服务，不包含在手机安装包中。Android 默认平台地址是 `https://filesharing.asia`，也可以使用自建服务。在仓库根目录执行：
+穿透平台是供 DSHX 客户端注册聊天端点、发现对端和交换连接参数的服务，不包含在手机安装包中。Android 默认平台地址是 `https://dshx-tunnel.filesharing.asia:8443`，也可以使用自建服务。在仓库根目录执行：
 
 ```bash
 python3 tools/tunnel.py build
