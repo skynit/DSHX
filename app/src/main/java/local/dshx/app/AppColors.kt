@@ -12,6 +12,7 @@ internal class AppColors(dark: Boolean) {
     val selected = if (dark) 0xFF292929.toInt() else 0xFFF0F1EF.toInt()
     val danger = if (dark) 0xFFE3848A.toInt() else 0xFFB33D48.toInt()
     val success = if (dark) 0xFF63B58B.toInt() else 0xFF23845F.toInt()
+    val warning = if (dark) 0xFFDBAC64.toInt() else 0xFF8B5C15.toInt()
     val noteBackground = if (dark) 0xFF34342E.toInt() else 0xFFEAE6DC.toInt()
     val noteForeground = if (dark) 0xFFD4CBB7.toInt() else 0xFF655F51.toInt()
     val screenBackground = if (dark) 0xFF283440.toInt() else 0xFFE5EDF5.toInt()

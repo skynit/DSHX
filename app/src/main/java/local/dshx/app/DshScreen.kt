@@ -118,6 +118,7 @@ internal enum class AppPage(val title: String, val settings: Boolean = false) {
 private const val TUNNEL_TAB = 4
 
 internal val LocalStatusColor = staticCompositionLocalOf { Color(0xFF23845F) }
+internal val LocalWarningColor = staticCompositionLocalOf { Color(AppColors(dark = false).warning) }
 
 /** One semantic palette is shared by the Miuix controls and product surfaces. */
 @Composable
@@ -143,7 +144,10 @@ private fun AppTheme(theme: String, content: @Composable () -> Unit) {
             decorView.systemUiVisibility = if (dark) 0 else View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
         }
     }
-    CompositionLocalProvider(LocalStatusColor provides Color(palette.success)) {
+    CompositionLocalProvider(
+        LocalStatusColor provides Color(palette.success),
+        LocalWarningColor provides Color(palette.warning),
+    ) {
         MiuixTheme(colors = colors.copy(
             primary = primary, onPrimary = if (dark) Color(0xFF172336) else Color.White,
             surface = background, onSurface = text, surfaceVariant = surface,

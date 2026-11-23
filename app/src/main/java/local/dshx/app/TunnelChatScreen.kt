@@ -60,6 +60,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.compositeOver
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
@@ -67,6 +69,7 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.error
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.style.TextAlign
@@ -519,22 +522,15 @@ private fun TunnelConversationHeader(
     menu: @Composable () -> Unit,
 ) {
     val colors = MiuixTheme.colorScheme
-    val tint = when {
-        conversation.connected -> LocalStatusColor.current
-        conversation.connecting -> colors.primary
-        else -> colors.onSurfaceVariantSummary
-    }
     Row(Modifier.fillMaxWidth().heightIn(min = 64.dp).padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
         LibraryIcon(Lucide.ChevronLeft, "返回会话", onBack)
         Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text(if (conversation.outgoing) "公开端点" else "访客", Modifier.semantics { heading() },
-                    fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
-                Spacer(Modifier.size(7.dp).background(tint, CircleShape))
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(if (conversation.outgoing) "公开端点" else "访客", Modifier.weight(1f, fill = false).semantics { heading() },
+                    fontSize = 18.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                if (conversation.connected) TunnelLinkBadge(conversation)
             }
-            if (conversation.connected) {
-                TunnelLinkBadge(conversation)
-            } else {
+            if (!conversation.connected) {
                 Text(listOfNotNull(conversation.remoteEndpointId.takeLast(8), conversation.connectionLabel, conversation.receptionLabel)
                     .joinToString(" · "), fontSize = 12.sp, lineHeight = 17.sp, color = colors.onSurfaceVariantSummary,
                     textAlign = TextAlign.Center)
@@ -558,20 +554,31 @@ private fun TunnelLinkBadge(conversation: TunnelChatConversationSnapshot) {
         null -> "路径待确认" to Lucide.CircleHelp
     }
     val latency = tunnelRoundTripLabel(link?.roundTripMs)
+    val grade = tunnelLatencyGrade(link?.roundTripMs)
+    val tone = when (grade) {
+        TunnelLatencyGrade.UNKNOWN -> colors.onSurfaceVariantSummary
+        TunnelLatencyGrade.LOW -> LocalStatusColor.current
+        TunnelLatencyGrade.ELEVATED -> LocalWarningColor.current
+        TunnelLatencyGrade.HIGH -> colors.error
+    }
+    val background = tone.copy(alpha = 0.10f).compositeOver(colors.surface)
+    val foreground = lerp(tone, colors.onSurface, 0.20f)
     var expanded by remember(conversation.conversationId) { mutableStateOf(false) }
     var focused by remember { mutableStateOf(false) }
     Box(Modifier.heightIn(min = 48.dp).widthIn(min = 48.dp).clip(CircleShape)
         .onFocusChanged { focused = it.isFocused }
         .clickable(role = Role.Button, onClickLabel = "查看连接详情", interactionSource = null,
-            indication = remember(colors.onSurface) { MiuixIndication(colors.onSurface) }, onClick = { expanded = true }),
+            indication = remember(colors.onSurface) { MiuixIndication(colors.onSurface) }, onClick = { expanded = true })
+        .semantics { stateDescription = grade.label },
         contentAlignment = Alignment.Center) {
         Box {
             val ring = if (focused) Modifier.border(2.dp, colors.primary, CircleShape) else Modifier
-            Row(Modifier.background(colors.secondary, CircleShape).then(ring).padding(horizontal = 10.dp, vertical = 4.dp),
-                verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                Icon(icon, contentDescription = null, modifier = Modifier.size(15.dp), tint = colors.onSurface)
-                Text("$label · ${if (link?.roundTripMs == null) "延迟待测" else latency}", fontSize = 13.sp,
-                    lineHeight = 18.sp, color = colors.onSurface)
+            Row(Modifier.widthIn(min = 104.dp).background(background, CircleShape).then(ring)
+                .padding(horizontal = 8.dp, vertical = 3.dp), verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp, Alignment.CenterHorizontally)) {
+                Icon(icon, contentDescription = null, modifier = Modifier.size(14.dp), tint = foreground)
+                Text("$label · $latency", fontSize = 12.sp, lineHeight = 18.sp, color = foreground,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
             if (expanded) {
                 val endpoint = conversation.remoteEndpointId.let { if (it.length > 8) "…${it.takeLast(8)}" else it }
@@ -621,6 +628,17 @@ internal fun tunnelRoundTripLabel(milliseconds: Long?): String = when (milliseco
     null -> "待测"
     0L -> "< 1 ms"
     else -> "$milliseconds ms"
+}
+
+internal enum class TunnelLatencyGrade(val label: String) {
+    UNKNOWN("延迟待测"), LOW("低延迟"), ELEVATED("延迟偏高"), HIGH("高延迟"),
+}
+
+internal fun tunnelLatencyGrade(milliseconds: Long?): TunnelLatencyGrade = when {
+    milliseconds == null -> TunnelLatencyGrade.UNKNOWN
+    milliseconds < 100 -> TunnelLatencyGrade.LOW
+    milliseconds < 200 -> TunnelLatencyGrade.ELEVATED
+    else -> TunnelLatencyGrade.HIGH
 }
 
 private val ChatMessage.timelineKey: String get() = "$senderEndpointId/$messageId"

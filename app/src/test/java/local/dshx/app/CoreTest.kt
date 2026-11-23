@@ -97,6 +97,15 @@ class CoreTest {
         assertEquals("待测", tunnelRoundTripLabel(null))
     }
 
+    @Test fun tunnelChatLatencyGradesChangeAt100And200Milliseconds() {
+        assertEquals(TunnelLatencyGrade.UNKNOWN, tunnelLatencyGrade(null))
+        assertEquals(TunnelLatencyGrade.LOW, tunnelLatencyGrade(0L))
+        assertEquals(TunnelLatencyGrade.LOW, tunnelLatencyGrade(99L))
+        assertEquals(TunnelLatencyGrade.ELEVATED, tunnelLatencyGrade(100L))
+        assertEquals(TunnelLatencyGrade.ELEVATED, tunnelLatencyGrade(199L))
+        assertEquals(TunnelLatencyGrade.HIGH, tunnelLatencyGrade(200L))
+    }
+
     @Test fun tunnelChatSettingsUsePublicEndpointAndTenAiRepliesByDefault() {
         val settings = TunnelChatSettings().validate()
 
