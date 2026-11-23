@@ -6,11 +6,13 @@ import org.webrtc.IceCandidate
 import org.webrtc.MediaConstraints
 import org.webrtc.PeerConnection
 import org.webrtc.PeerConnectionFactory
+import org.webrtc.RTCStats
 import org.webrtc.SdpObserver
 import org.webrtc.SessionDescription
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.roundToLong
 
 data class WebRtcChatSessionInfo(val sessionId: String, val remoteEndpointId: String, val state: State) {
     enum class State { CONNECTING, CONNECTED, CLOSED, FAILED }
@@ -83,6 +85,18 @@ class WebRtcChatTransport(
     }
 
     fun sendJson(sessionId: String, value: org.json.JSONObject): Boolean = send(sessionId, value.toString().toByteArray(Charsets.UTF_8))
+
+    internal fun readLink(sessionId: String, onResult: (TunnelChatLink?) -> Unit) {
+        val session = sessions[sessionId] ?: return
+        val ice = session.peer.iceConnectionState()
+        if (ice != PeerConnection.IceConnectionState.CONNECTED && ice != PeerConnection.IceConnectionState.COMPLETED) {
+            onResult(null)
+            return
+        }
+        session.peer.getStats { report ->
+            if (session.active()) onResult(selectedChatLink(report.statsMap))
+        }
+    }
 
     /** 清理已经从 Runtime 中移除的会话，不再次回调状态机。 */
     fun discardSession(sessionId: String) {
@@ -252,6 +266,26 @@ class WebRtcChatTransport(
             state = WebRtcChatSessionInfo.State.CLOSED
         }
     }
+}
+
+internal fun selectedChatLink(stats: Map<String, RTCStats>): TunnelChatLink? {
+    val pairId = stats.values.firstNotNullOfOrNull { entry ->
+        if (entry.type == "transport") entry.members["selectedCandidatePairId"] as? String else null
+    } ?: return null
+    val pair = stats[pairId]?.takeIf { it.type == "candidate-pair" && it.members["state"] == "succeeded" } ?: return null
+    fun candidateType(member: String, type: String): String? = stats[pair.members[member] as? String]
+        ?.takeIf { it.type == type }?.members?.get("candidateType") as? String
+    val local = candidateType("localCandidateId", "local-candidate")
+    val remote = candidateType("remoteCandidateId", "remote-candidate")
+    val direct = setOf("host", "srflx", "prflx")
+    val path = when {
+        local == "relay" || remote == "relay" -> TunnelChatLink.Path.RELAY
+        local in direct && remote in direct -> TunnelChatLink.Path.DIRECT
+        else -> null
+    }
+    val roundTripMs = (pair.members["currentRoundTripTime"] as? Number)?.toDouble()?.let { it * 1_000 }
+        ?.takeIf { it.isFinite() && it >= 0.0 }?.roundToLong()
+    return TunnelChatLink(path, roundTripMs)
 }
 
 private object WebRtcFactory {

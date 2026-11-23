@@ -39,6 +39,7 @@ import org.robolectric.annotation.LooperMode
 import org.robolectric.shadows.ShadowAccessibilityService
 import org.robolectric.shadows.ShadowSpeechRecognizer
 import org.robolectric.util.ReflectionHelpers
+import org.webrtc.RTCStats
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -67,6 +68,34 @@ import kotlinx.coroutines.withTimeout
 @Config(sdk = [34])
 class CoreTest {
     @get:Rule val folder = TemporaryFolder()
+
+    @Test fun tunnelChatLinkShowsTheSelectedPathAndItsRoundTripTime() {
+        fun report(local: String, remote: String, selected: String? = "chosen", seconds: Double? = 0.0368): Map<String, RTCStats> {
+            fun stat(id: String, type: String, vararg members: Pair<String, Any>) = RTCStats(0L, type, id, mapOf(*members))
+            val pair = mapOf("state" to "succeeded", "localCandidateId" to "local", "remoteCandidateId" to "remote")
+            return listOf(
+                RTCStats(0L, "candidate-pair", "other", pair + ("currentRoundTripTime" to 0.001)),
+                RTCStats(0L, "candidate-pair", "chosen", pair + seconds?.let { mapOf("currentRoundTripTime" to it) }.orEmpty()),
+                stat("local", "local-candidate", "candidateType" to local),
+                stat("remote", "remote-candidate", "candidateType" to remote),
+                RTCStats(0L, "transport", "transport", selected?.let { mapOf("selectedCandidatePairId" to it) }.orEmpty()),
+            ).associateBy { it.id }
+        }
+
+        val direct = TunnelChatLink.Path.DIRECT
+        val relay = TunnelChatLink.Path.RELAY
+        assertEquals(TunnelChatLink(direct, 37L), selectedChatLink(report("host", "srflx")))
+        assertEquals(TunnelChatLink(relay, 37L), selectedChatLink(report("host", "relay")))
+        assertEquals(TunnelChatLink(relay, 37L), selectedChatLink(report("relay", "prflx")))
+        assertEquals(TunnelChatLink(null, 37L), selectedChatLink(report("host", "unknown")))
+        assertEquals(TunnelChatLink(direct, 0L), selectedChatLink(report("host", "host", seconds = 0.0002)))
+        assertEquals(TunnelChatLink(relay, null), selectedChatLink(report("relay", "host", seconds = null)))
+        assertEquals(TunnelChatLink(relay, null), selectedChatLink(report("relay", "host", seconds = Double.NaN)))
+        assertNull(selectedChatLink(report("host", "host", selected = null)))
+        assertEquals("37 ms", tunnelRoundTripLabel(37L))
+        assertEquals("< 1 ms", tunnelRoundTripLabel(0L))
+        assertEquals("待测", tunnelRoundTripLabel(null))
+    }
 
     @Test fun tunnelChatSettingsUsePublicEndpointAndTenAiRepliesByDefault() {
         val settings = TunnelChatSettings().validate()

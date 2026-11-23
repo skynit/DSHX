@@ -1,5 +1,7 @@
 package local.dshx.app
 
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import android.content.Context
 import android.graphics.Bitmap
 import android.net.Uri
@@ -87,7 +89,10 @@ class TunnelChatRuntime(
                     runCatching {
                         if (engineReady && System.currentTimeMillis() >= nextRegistrationAttempt) start()
                         if (state.status == Status.ONLINE) retryQueued()
-                        sessionBindings.values.forEach { it.images.expire() }
+                        sessionBindings.values.forEach {
+                            it.images.expire()
+                            if (it.sessionId in authenticatedSessions && !it.closing) sampleLink(it)
+                        }
                         pumpReception()
                     }.onFailure { publishState("本地聊天记录读取或重试失败。") }
                 }
@@ -636,6 +641,7 @@ class TunnelChatRuntime(
                 val conversation = record(binding.conversationId) ?: binding.conversation
                 if (!conversation.verified) save(conversation.copy(verified = true))
                 authenticatedSessions += binding.sessionId
+                if (!conversation.closed) sampleLink(binding)
                 if (!conversation.closed) transport?.sendJson(binding.sessionId, JSONObject()
                     .put("protocol", TunnelChatProtocol.CHAT).put("type", "image_ready"))
                 retryInitialOffer.remove(binding.conversationId)
@@ -879,6 +885,7 @@ class TunnelChatRuntime(
                 canSendImage = !conversation.closed && connected && binding.supportsImages,
                 sendingImage = binding?.images?.sending == true,
                 imageDelivery = imageDeliveries[key(conversation.id)],
+                link = binding?.link?.takeIf { connected && !conversation.closed },
             )
         }.sortedBy { it.conversationId }
 
@@ -905,6 +912,10 @@ class TunnelChatRuntime(
                 runCatching { connect(conversation) }
             }
         }
+    }
+
+    private fun sampleLink(binding: SessionBinding) {
+        transport?.readLink(binding.sessionId) { binding.updateLink(it) }
     }
 
     private fun expireNegotiation(binding: SessionBinding) {
@@ -962,6 +973,10 @@ class TunnelChatRuntime(
         var helloSent = false
         var closing = false
         var supportsImages = false
+        private val linkState = MutableStateFlow<TunnelChatLink?>(null)
+        val link = linkState.asStateFlow()
+        fun updateLink(value: TunnelChatLink?) { linkState.value = value }
+
         val images = TunnelImageTransfer(
             { frame -> transport?.sendJson(sessionId, frame) == true },
             { message, source -> receiveImage(this, message, source) },

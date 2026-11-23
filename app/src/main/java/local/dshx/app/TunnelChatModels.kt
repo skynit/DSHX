@@ -1,5 +1,6 @@
 package local.dshx.app
 
+import kotlinx.coroutines.flow.StateFlow
 import android.content.Context
 import android.content.SharedPreferences
 import org.json.JSONArray
@@ -242,7 +243,12 @@ data class TunnelChatConversationSnapshot(
     val canSendImage: Boolean = false,
     val sendingImage: Boolean = false,
     val imageDelivery: TunnelImageDelivery? = null,
+    val link: StateFlow<TunnelChatLink?>? = null,
 )
+
+data class TunnelChatLink(val path: Path?, val roundTripMs: Long?) {
+    enum class Path { DIRECT, RELAY }
+}
 
 data class TunnelImageDelivery(val messageId: String, val delivered: Boolean)
 

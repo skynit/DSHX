@@ -5,6 +5,7 @@ import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -38,6 +39,7 @@ import androidx.compose.foundation.text.input.TextFieldState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
@@ -53,7 +55,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.luminance
@@ -69,12 +73,18 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntRect
+import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Popup
+import androidx.compose.ui.window.PopupPositionProvider
 import androidx.compose.ui.window.PopupProperties
 import com.composables.icons.lucide.ArrowUp
 import com.composables.icons.lucide.ChevronLeft
+import com.composables.icons.lucide.CircleHelp
+import com.composables.icons.lucide.Cloud
 import com.composables.icons.lucide.Compass
 import com.composables.icons.lucide.Ellipsis
 import com.composables.icons.lucide.ImagePlus
@@ -86,6 +96,7 @@ import com.composables.icons.lucide.Send
 import com.composables.icons.lucide.Settings2
 import com.composables.icons.lucide.UserRound
 import com.composables.icons.lucide.X
+import com.composables.icons.lucide.Zap
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -521,15 +532,95 @@ private fun TunnelConversationHeader(
                     fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
                 Spacer(Modifier.size(7.dp).background(tint, CircleShape))
             }
-            Text(listOfNotNull(conversation.remoteEndpointId.takeLast(8), conversation.connectionLabel, conversation.receptionLabel)
-                .joinToString(" · "), fontSize = 12.sp, lineHeight = 17.sp, color = colors.onSurfaceVariantSummary,
-                textAlign = TextAlign.Center)
+            if (conversation.connected) {
+                TunnelLinkBadge(conversation)
+            } else {
+                Text(listOfNotNull(conversation.remoteEndpointId.takeLast(8), conversation.connectionLabel, conversation.receptionLabel)
+                    .joinToString(" · "), fontSize = 12.sp, lineHeight = 17.sp, color = colors.onSurfaceVariantSummary,
+                    textAlign = TextAlign.Center)
+            }
         }
         Box {
             LibraryIcon(Lucide.Ellipsis, "会话操作", onMenu)
             menu()
         }
     }
+}
+
+@Composable
+private fun TunnelLinkBadge(conversation: TunnelChatConversationSnapshot) {
+    val colors = MiuixTheme.colorScheme
+    val link = conversation.link?.collectAsState()?.value
+    val path = link?.path
+    val (label, icon) = when (path) {
+        TunnelChatLink.Path.DIRECT -> "直连" to Lucide.Zap
+        TunnelChatLink.Path.RELAY -> "中继" to Lucide.Cloud
+        null -> "路径待确认" to Lucide.CircleHelp
+    }
+    val latency = tunnelRoundTripLabel(link?.roundTripMs)
+    var expanded by remember(conversation.conversationId) { mutableStateOf(false) }
+    var focused by remember { mutableStateOf(false) }
+    Box(Modifier.heightIn(min = 48.dp).widthIn(min = 48.dp).clip(CircleShape)
+        .onFocusChanged { focused = it.isFocused }
+        .clickable(role = Role.Button, onClickLabel = "查看连接详情", interactionSource = null,
+            indication = remember(colors.onSurface) { MiuixIndication(colors.onSurface) }, onClick = { expanded = true }),
+        contentAlignment = Alignment.Center) {
+        Box {
+            val ring = if (focused) Modifier.border(2.dp, colors.primary, CircleShape) else Modifier
+            Row(Modifier.background(colors.secondary, CircleShape).then(ring).padding(horizontal = 10.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                Icon(icon, contentDescription = null, modifier = Modifier.size(15.dp), tint = colors.onSurface)
+                Text("$label · ${if (link?.roundTripMs == null) "延迟待测" else latency}", fontSize = 13.sp,
+                    lineHeight = 18.sp, color = colors.onSurface)
+            }
+            if (expanded) {
+                val endpoint = conversation.remoteEndpointId.let { if (it.length > 8) "…${it.takeLast(8)}" else it }
+                TunnelLinkDetails(endpoint, if (path == TunnelChatLink.Path.DIRECT) "P2P 直连" else label,
+                    latency, conversation.receptionLabel, onDismiss = { expanded = false })
+            }
+        }
+    }
+}
+
+@Composable
+private fun TunnelLinkDetails(endpoint: String, path: String, latency: String, reception: String?, onDismiss: () -> Unit) {
+    val colors = MiuixTheme.colorScheme
+    val shape = RoundedCornerShape(8.dp)
+    Popup(TunnelLinkPopupPosition, onDismissRequest = onDismiss, properties = PopupProperties(focusable = true)) {
+        Column(Modifier.padding(top = 4.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Canvas(Modifier.size(width = 14.dp, height = 7.dp)) {
+                val tip = Offset(size.width / 2, 0f)
+                drawPath(Path().apply {
+                    moveTo(0f, size.height)
+                    lineTo(tip.x, tip.y)
+                    lineTo(size.width, size.height)
+                    close()
+                }, colors.surfaceContainerHigh)
+                drawLine(colors.outline, Offset(0f, size.height), tip, 1.dp.toPx())
+                drawLine(colors.outline, tip, Offset(size.width, size.height), 1.dp.toPx())
+            }
+            Column(Modifier.background(colors.surfaceContainerHigh, shape).border(1.dp, colors.outline, shape)
+                .padding(horizontal = 14.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                listOfNotNull("端点 ID：$endpoint", "链路类型：$path", "往返延迟：$latency", reception).forEach { line ->
+                    Text(line, fontSize = 13.sp, lineHeight = 18.sp, color = colors.onSurface)
+                }
+            }
+        }
+    }
+}
+
+private object TunnelLinkPopupPosition : PopupPositionProvider {
+    override fun calculatePosition(anchorBounds: IntRect, windowSize: IntSize, layoutDirection: LayoutDirection,
+        popupContentSize: IntSize): IntOffset {
+        val left = anchorBounds.center.x - popupContentSize.width / 2
+        return IntOffset(left.coerceIn(0, (windowSize.width - popupContentSize.width).coerceAtLeast(0)), anchorBounds.bottom)
+    }
+}
+
+internal fun tunnelRoundTripLabel(milliseconds: Long?): String = when (milliseconds) {
+    null -> "待测"
+    0L -> "< 1 ms"
+    else -> "$milliseconds ms"
 }
 
 private val ChatMessage.timelineKey: String get() = "$senderEndpointId/$messageId"
