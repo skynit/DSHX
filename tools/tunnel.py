@@ -31,11 +31,13 @@ def build():
         subprocess.run(["npm", "ci", "--omit=optional", "--ignore-scripts", "--no-audit", "--no-fund"],
                        cwd=stage, check=True)
         shutil.copy2(core / "tunnel-platform.mjs", stage)
+        shutil.copy2(core / "web-access.mjs", stage)
+        shutil.copytree(core / "web", stage / "web")
         shutil.copy2(ROOT / "LICENSE", stage)
         subprocess.run(["node", "--input-type=module", "-e", "import './tunnel-platform.mjs'"], cwd=stage, check=True)
         packaged = stage / archive.name
         with tarfile.open(packaged, "w:gz") as output:
-            for name in ("tunnel-platform.mjs", "LICENSE", "node_modules/ws"):
+            for name in ("tunnel-platform.mjs", "web-access.mjs", "web", "LICENSE", "node_modules/ws"):
                 output.add(stage / name, arcname=f"{NAME}/{name}")
         packaged.replace(archive)
     print(archive)

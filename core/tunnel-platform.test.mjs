@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { createHash, generateKeyPairSync, randomUUID, sign } from 'node:crypto';
 import { once } from 'node:events';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { createServer as httpsServer } from 'node:https';
+import os from 'node:os';
+import path from 'node:path';
 import { test } from 'node:test';
 import { WebSocket } from 'ws';
 import { createTunnelPlatform } from './tunnel-platform.mjs';
@@ -66,7 +71,14 @@ async function fixture(t, options = {}) {
     checkServers(ack.payload.ice_servers);
     return channel;
   };
-  return { request, registration, publish, socket, connect };
+  const browser = () => {
+    const channel = new WebSocket(`${base.replace('http:', 'ws:')}/api/v1/dshx/web/signaling`, {
+      origin: 'https://web.example.test', headers: { Host: 'web.example.test' },
+    });
+    clients.push(channel);
+    return channel;
+  };
+  return { request, registration, publish, socket, connect, browser, server };
 }
 
 function send(socket, type, payload, extra) {
@@ -83,6 +95,179 @@ async function receive(socket) {
 function target(peer, session = randomUUID()) {
   return { session_id: session, destination: { kind: 'endpoint', id: peer.profile.endpointId } };
 }
+
+test('browser guests only signal supported public web shares and never enter the chat directory', { timeout: 8000 }, async t => {
+  const platform = await fixture(t, { webOrigin: 'https://web.example.test', appDomain: 'apps.example.test' });
+  const publisher = identity('网页发布端');
+  const old = identity('旧版本');
+  const row = await platform.publish(publisher);
+  const older = await platform.publish(old);
+  const [destination] = await Promise.all([platform.connect(publisher, row.registrationToken), platform.connect(old, older.registrationToken)]);
+  const guest = platform.browser();
+  const welcome = await receive(guest);
+  const visitor = { profile: { endpointId: welcome.destination.id } };
+  assert.equal(welcome.type, 'web_ready');
+  assert.deepEqual(welcome.payload.ice_servers, [{ urls: ['stun:test.invalid:3478'] }]);
+  const offer = { description: { type: 'offer', sdp: 'offer' } };
+  send(guest, 'offer', offer, target(publisher));
+  assert.equal((await receive(guest)).error.code, 'invalid_signal');
+  send(guest, 'web_offer', offer, target(old));
+  assert.equal((await receive(guest)).error.code, 'unavailable');
+  send(guest, 'web_offer', offer, target(publisher));
+  assert.equal((await receive(guest)).error.code, 'unavailable');
+  // 以同一个信令连接上的响应为同步点，确认状态已更新且没有重新注册。
+  async function publishWebStatus(enabled) {
+    send(destination, 'web_status', { enabled });
+    send(destination, 'web_close', {}, target(visitor));
+    assert.equal((await receive(destination)).error.code, 'unknown_session');
+  }
+  await publishWebStatus(true);
+  const request = target(publisher);
+  send(guest, 'web_offer', offer, request);
+  const routed = await receive(destination);
+  assert.equal(routed.type, 'web_offer');
+  assert.equal(routed.source.id, visitor.profile.endpointId);
+  const answer = { description: { type: 'answer', sdp: 'answer' }, proof: 'cHVibGlj.c2lnbmF0dXJl' };
+  send(destination, 'answer', answer, target(visitor, request.session_id));
+  assert.equal((await receive(destination)).error.code, 'unknown_session');
+  send(destination, 'web_answer', answer, target(visitor, request.session_id));
+  assert.deepEqual((await receive(guest)).payload, answer);
+  send(guest, 'web_candidate', { candidate: 'candidate:1 1 udp 2122260223 192.0.2.6 4000 typ relay', sdp_mid: '0', sdp_mline_index: 0 }, request);
+  assert.equal((await receive(guest)).error.code, 'invalid_signal');
+  const { items } = await (await platform.request(directory)).json();
+  assert.equal(items.length, 2);
+  assert.deepEqual(items.find(item => item.endpointId === publisher.profile.endpointId).capabilities, ['text', 'web-share']);
+  await publishWebStatus(false);
+  send(guest, 'web_offer', offer, target(publisher));
+  assert.equal((await receive(guest)).error.code, 'unavailable');
+  const { items: updated } = await (await platform.request(directory)).json();
+  assert.deepEqual(updated.find(item => item.endpointId === publisher.profile.endpointId).capabilities, ['text']);
+});
+
+test('real Chromium loads and writes a shared app through Service Worker and a verified direct channel', {
+  skip: !process.env.DSHX_PLAYWRIGHT_MODULE, timeout: 45_000,
+}, async t => {
+  const certDir = mkdtempSync(path.join(os.tmpdir(), 'dshx-web-test-'));
+  t.after(() => rmSync(certDir, { recursive: true, force: true }));
+  execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', '/CN=portal.test',
+    '-keyout', path.join(certDir, 'key.pem'), '-out', path.join(certDir, 'cert.pem')], { stdio: 'ignore' });
+  const tls = httpsServer({ key: readFileSync(path.join(certDir, 'key.pem')), cert: readFileSync(path.join(certDir, 'cert.pem')) });
+  tls.listen(0, '127.0.0.1');
+  await once(tls, 'listening');
+  const origin = `https://portal.test:${tls.address().port}`;
+  const platform = await fixture(t, { webOrigin: origin, appDomain: 'apps.test', iceServers: [] });
+  tls.on('request', (req, res) => platform.server.emit('request', req, res));
+  tls.on('upgrade', (...args) => platform.server.emit('upgrade', ...args));
+  t.after(() => { tls.closeAllConnections(); tls.close(); });
+  const publisher = identity('真实浏览器测试');
+  const registration = await platform.publish(publisher, { webShare: true });
+  const publisherSocket = await platform.connect(publisher, registration.registrationToken, servers => assert.deepEqual(servers, []));
+  const { chromium } = await import(process.env.DSHX_PLAYWRIGHT_MODULE);
+  const browser = await chromium.launch({ executablePath: process.env.DSHX_CHROME_PATH, headless: true, args: [
+    '--ignore-certificate-errors', '--disable-features=WebRtcHideLocalIpsWithMdns', '--no-proxy-server',
+    '--host-resolver-rules=MAP portal.test 127.0.0.1, MAP *.apps.test 127.0.0.1',
+  ] });
+  t.after(() => browser.close());
+  const context = await browser.newContext({ acceptDownloads: true });
+  const publishing = await context.newPage();
+  await publishing.goto('about:blank');
+  const share = randomUUID();
+  await publishing.evaluate(({ share }) => {
+    const encoder = new TextEncoder();
+    const peer = new RTCPeerConnection({ iceServers: [] });
+    const channel = peer.createDataChannel('dshx-web/1', { negotiated: true, id: 0, ordered: true, protocol: 'dshx-web/1' });
+    channel.binaryType = 'arraybuffer';
+    const requests = new Map();
+    const reply = value => channel.send(encoder.encode(JSON.stringify(value)));
+    const report = (request, status, headers, body) => {
+      reply({ type: 'headers', id: request.id, status, headers });
+      if (body == null) { reply({ type: 'done', id: request.id }); requests.delete(request.id); }
+      else reply({ type: 'chunk', id: request.id, bytes: btoa(body) });
+    };
+    channel.onmessage = ({ data }) => {
+      const request = JSON.parse(new TextDecoder().decode(data));
+      const pending = requests.get(request.id);
+      switch (request.type) {
+        case 'list': reply({ type: 'list', items: [{ id: share, name: '测试网站', path: '/' }] }); break;
+        case 'open':
+          requests.set(request.id, { ...request, body: '' });
+          if (request.share !== share) { reply({ type: 'error', id: request.id }); return; }
+          if (request.upload) reply({ type: 'upload-ready', id: request.id });
+          else if (request.path === '/data') report(request, 200, [['Content-Type', 'text/plain']], 'fixtures work');
+          else if (request.path === '/redirect') report(request, 302, [['Location', '/data']], null);
+          else if (request.path === '/file') report(request, 200, [['Content-Type', 'text/plain'],
+            ['Content-Disposition', 'attachment; filename="fixture.txt"']], 'download');
+          else if (request.path === '/range') report(request, 206, [['Content-Type', 'text/plain'], ['Content-Range', 'bytes 1-3/4']], 'BCD');
+          else report(request, 200, [['Content-Type', 'text/html']],
+            '<!doctype html><h1>Shared application</h1><a href="/file">Download</a><a href="/redirect">Redirect</a>');
+          break;
+        case 'upload': pending.body += atob(request.bytes); reply({ type: 'upload-ack', id: request.id }); break;
+        case 'upload-done': report(request, 200, [['Content-Type', 'text/plain']], pending.body); break;
+        case 'socket': reply({ type: 'socket-ready', id: request.id, protocol: 'echo' }); break;
+        case 'socket-send': reply({ type: 'socket-message', id: request.id, text: request.text }); break;
+        case 'socket-close': reply({ type: 'socket-close', id: request.id, code: 1000 }); break;
+        case 'ack': if (pending) { reply({ type: 'done', id: request.id }); requests.delete(request.id); } break;
+      }
+    };
+    window.publisher = { peer };
+  }, { share });
+  let incoming = Promise.resolve();
+  publisherSocket.on('message', raw => {
+    incoming = incoming.then(async () => {
+      const frame = JSON.parse(raw);
+      const recipient = { session_id: frame.session_id, destination: frame.source };
+      if (frame.type === 'web_offer') {
+        const answer = await publishing.evaluate(async offer => {
+          const { peer } = window.publisher;
+          await peer.setRemoteDescription({ type: 'offer', sdp: offer });
+          await peer.setLocalDescription(await peer.createAnswer());
+          if (peer.iceGatheringState !== 'complete') await new Promise(resolve => {
+            const changed = () => {
+              if (peer.iceGatheringState !== 'complete') return;
+              peer.removeEventListener('icegatheringstatechange', changed);
+              resolve();
+            };
+            peer.addEventListener('icegatheringstatechange', changed);
+          });
+          return peer.localDescription.toJSON();
+        }, frame.payload.description.sdp);
+        const text = `dshx-web/1\n${frame.session_id}\n${frame.source.id}\n${publisher.profile.endpointId}\n${frame.payload.description.sdp}\n${answer.sdp}`;
+        const proof = `${Buffer.from(publisher.profile.publicKey, 'base64').toString('base64url')}.${sign('sha256', Buffer.from(text), publisher.privateKey).toString('base64url')}`;
+        send(publisherSocket, 'web_answer', { description: answer, proof }, recipient);
+      }
+      if (frame.type === 'web_candidate') await publishing.evaluate(candidate => window.publisher.peer.addIceCandidate(candidate), {
+        candidate: frame.payload.candidate, sdpMid: frame.payload.sdp_mid, sdpMLineIndex: frame.payload.sdp_mline_index,
+      });
+    }).catch(error => t.diagnostic(error.stack));
+  });
+  const visitor = await context.newPage();
+  visitor.on('pageerror', error => t.diagnostic(error.stack));
+  await visitor.goto(`${origin}/web/?endpoint=${publisher.profile.endpointId}&share=${share}`);
+  const app = visitor.frameLocator('#viewer > iframe').frameLocator('iframe');
+  try { await app.getByRole('heading', { name: 'Shared application' }).waitFor({ timeout: 30_000 }); }
+  catch (error) { t.diagnostic(`访客状态：${await visitor.locator('#status').textContent()}`); throw error; }
+  const result = await app.locator('body').evaluate(async () => {
+    const plain = await fetch('/data').then(r => r.text());
+    const upload = await fetch('/submit', { method: 'POST', body: 'x'.repeat(20_000) }).then(r => r.text());
+    const range = await fetch('/range', { headers: { Range: 'bytes=1-3' } });
+    const echo = await new Promise((resolve, reject) => {
+      const ws = new WebSocket('/echo', 'echo');
+      ws.onerror = () => reject(Error('WebSocket failed'));
+      ws.onopen = () => ws.send('ping');
+      ws.onmessage = event => { resolve(event.data); ws.close(); };
+      setTimeout(() => reject(Error('WebSocket timed out')), 5000);
+    });
+    return { plain, upload: upload.length, echo, range: range.status, portion: await range.text() };
+  });
+  assert.deepEqual(result, { plain: 'fixtures work', upload: 20_000, echo: 'ping', range: 206, portion: 'BCD' });
+  const download = visitor.waitForEvent('download', { timeout: 5000 });
+  await app.getByRole('link', { name: 'Download' }).click();
+  assert.equal((await download).suggestedFilename(), 'fixture.txt');
+  await app.getByRole('link', { name: 'Redirect' }).click();
+  await app.getByText('fixtures work').waitFor({ timeout: 5000 });
+  publisherSocket.close();
+  await visitor.getByText('端点已停止网页访问').waitFor({ timeout: 5000 });
+});
 
 test('tunnel platform rejects tampering, replay and routing as another endpoint', { timeout: 8000 }, async t => {
   const platform = await fixture(t);

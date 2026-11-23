@@ -1,8 +1,10 @@
 import { createHash, createHmac, createPublicKey, randomBytes, randomUUID, verify } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
+import { isIP } from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { WebSocket, WebSocketServer } from 'ws';
+import { createWebAccess, webSignaling } from './web-access.mjs';
 
 const directory = '/api/v1/dshx/chat/endpoints';
 const register = `${directory}/register`;
@@ -40,7 +42,8 @@ function verifyProfile(raw, challenge, proof) {
   if (!routeId.test(body.endpointId) || !validText(body.publicKey, 128) ||
       !validText(body.displayName, 80) || !validText(body.publicIntroduction, 2000) ||
       !['published', 'hidden'].includes(body.publication) || !['accepting', 'paused'].includes(body.acceptance) ||
-      !Number.isInteger(body.maxAiReplies) || body.maxAiReplies < 0 || body.maxAiReplies > 1000) return null;
+      !Number.isInteger(body.maxAiReplies) || body.maxAiReplies < 0 || body.maxAiReplies > 1000 ||
+      (body.webShare !== undefined && typeof body.webShare !== 'boolean')) return null;
   const der = Buffer.from(body.publicKey, 'base64');
   const key = createPublicKey({ key: der, format: 'der', type: 'spki' });
   if (key.asymmetricKeyType !== 'ec' || key.asymmetricKeyDetails.namedCurve !== 'prime256v1' ||
@@ -53,11 +56,14 @@ function verifyProfile(raw, challenge, proof) {
   const signed = Buffer.concat([Buffer.from(`dshx-platform-register/1\n${challenge}\n`), raw]);
   if (id !== body.endpointId || !verify('sha256', signed, key, Buffer.from(proof, 'base64url'))) return null;
   const { displayName, publicIntroduction, publication, acceptance } = body;
-  return { endpointId: id, displayName, publicIntroduction, publication, acceptance, capabilities: ['text'] };
+  const capabilities = body.webShare && publication === 'published' ? ['text', 'web-share'] : ['text'];
+  return { endpointId: id, displayName, publicIntroduction, publication, acceptance, capabilities };
 }
 
 /** 只保存端点状态和信令路由；从不接收或中转聊天正文。 */
-export function createTunnelPlatform({ iceServers = [], turn } = {}) {
+export function createTunnelPlatform({ iceServers = [], turn, webOrigin, appDomain, visitorIpHeader } = {}) {
+  const web = createWebAccess(webOrigin, appDomain);
+  if (visitorIpHeader && !/^x-[a-z0-9-]+$/.test(visitorIpHeader)) throw new Error('访客来源头名称无效。');
   if (turn) {
     const { urls, secret, ttlSeconds = 3600 } = turn;
     if (!Array.isArray(urls) || !urls.length || urls.some(url => typeof url !== 'string' || !/^turns?:[^\s]+$/.test(url)) ||
@@ -67,11 +73,17 @@ export function createTunnelPlatform({ iceServers = [], turn } = {}) {
     turn = { urls, secret, ttlSeconds };
   }
   const profiles = new Map();
+  const guests = new Map();
+  const guestCounts = new Map();
   const challenges = new Map();
   const tokens = new Map();
   const sessions = new Map();
   let registrationOrder = 0;
   const sockets = new WebSocketServer({ noServer: true, maxPayload: maxSignal, perMessageDeflate: false });
+  const directServers = iceServers.flatMap(server => {
+    const urls = [server?.urls].flat().filter(url => typeof url === 'string' && /^stuns?:[^\s]+$/i.test(url));
+    return urls.length ? [{ urls }] : [];
+  });
   const issueIceServers = profile => {
     if (!turn) return iceServers;
     profile.turnExpiresAtSeconds = Math.floor(Date.now() / 1000) + turn.ttlSeconds;
@@ -97,6 +109,7 @@ export function createTunnelPlatform({ iceServers = [], turn } = {}) {
 
   async function handleRequest(req, res) {
     const url = new URL(req.url, 'http://localhost');
+    if (web?.serve(req, res, url)) return;
     if (req.method === 'POST' && url.pathname === `${register}/challenge`) {
       if (challenges.size >= 4096) return error(res, 429, 'busy');
       const challenge = nonce();
@@ -111,6 +124,7 @@ export function createTunnelPlatform({ iceServers = [], turn } = {}) {
       challenges.delete(challenge);
       const info = verifyProfile(await readBody(req), challenge, proof);
       if (!info || pending.expires <= Date.now()) return error(res, 401, 'invalid_proof');
+      if (!web) info.capabilities = ['text'];
       const old = profiles.get(info.endpointId);
       if (old && old.order > pending.order) return error(res, 409, 'stale_registration');
       if (!old && profiles.size >= 4096) return error(res, 429, 'directory_full');
@@ -119,7 +133,8 @@ export function createTunnelPlatform({ iceServers = [], turn } = {}) {
       profiles.set(info.endpointId, profile);
       tokens.set(profile.token, profile);
       // 客户端从 HTTPS 平台地址派生同源 WSS 地址，不信任反代传入的 Host。
-      return reply(res, 200, { endpoint: describe(profile), registrationToken: profile.token, iceServers: issueIceServers(profile) });
+      return reply(res, 200, { endpoint: describe(profile), registrationToken: profile.token, iceServers: issueIceServers(profile),
+        ...(web && { webAvailable: true }) });
     }
     if (req.method === 'GET' && url.pathname === directory) {
       const query = (url.searchParams.get('query') ?? '').slice(0, 80).toLowerCase();
@@ -171,11 +186,11 @@ export function createTunnelPlatform({ iceServers = [], turn } = {}) {
     profile.socket = undefined;
     profile.updated = Date.now();
     for (const id of profile.sessions) {
-      const { from, to, answered } = sessions.get(id);
+      const { from, to, answered, web } = sessions.get(id);
       const peer = from === profile ? to : from;
       removeSession(id);
       // 信令掉线不应主动切断已协商的数据通道。未完成的连接由信令通知或客户端超时清理。
-      if (!answered) send(peer.socket, { protocol, version: 1, type: 'session_close', message_id: randomUUID(), session_id: id,
+      if (!answered || web) send(peer.socket, { protocol, version: 1, type: web ? 'web_close' : 'session_close', message_id: randomUUID(), session_id: id,
         source: endpoint(profile.info.endpointId), destination: endpoint(peer.info.endpointId), payload: {} });
     }
   }
@@ -192,39 +207,48 @@ export function createTunnelPlatform({ iceServers = [], turn } = {}) {
     const id = message.session_id;
     const payload = message.payload;
     const target = message.destination?.id;
-    const type = message.type;
+    const wireType = message.type;
+    const webLink = ['web_offer', 'web_answer', 'web_candidate', 'web_close'].includes(wireType);
+    const type = webLink ? (wireType === 'web_close' ? 'session_close' : wireType.slice(4)) : wireType;
     const reject = code => send(profile.socket, platformFrame(profile, 'error', message, { error: { code } }));
     if (!sessionId.test(id) || message.destination?.kind !== 'endpoint' || !routeId.test(target) ||
         profile.info.endpointId === target || (message.source && (message.source.kind !== 'endpoint' || message.source.id !== profile.info.endpointId)) ||
-        !isObject(payload)) return reject('invalid_signal');
-    const peer = profiles.get(target);
+        !isObject(payload) || (profile.guest && !webLink)) return reject('invalid_signal');
+    const peer = profiles.get(target) ?? (webLink ? guests.get(target) : undefined);
     const bound = sessions.get(id);
     if (type === 'offer') {
       if (!validText(payload.description?.sdp, 60 * 1024) || payload.description.type !== 'offer' || !payload.description.sdp) return reject('invalid_signal');
+      if (webLink && (!web || !profile.guest || hasRelay(payload.description.sdp))) return reject('invalid_signal');
+      if (webLink && !peer?.info.capabilities?.includes('web-share')) return reject('unavailable');
       if (payload.conversation_id !== undefined && (typeof payload.conversation_id !== 'string' || !sessionId.test(payload.conversation_id))) return reject('invalid_signal');
       if (peer?.info.publication !== 'published' || peer.socket?.readyState !== WebSocket.OPEN) return reject('unavailable');
       // 暂停接收还要允许客户端识别并放行旧会话重连，所以接收策略由端点裁决。
-      if (bound || profile.sessions.size >= 64 || peer.sessions.size >= 64) return reject('busy');
-      sessions.set(id, { from: profile, to: peer });
+      const count = owner => [...owner.sessions].filter(sid => sessions.get(sid)?.web === webLink).length;
+      if (bound || count(profile) >= (webLink ? 1 : 64) || count(peer) >= (webLink ? 12 : 64)) return reject('busy');
+      sessions.set(id, { from: profile, to: peer, web: webLink });
       profile.sessions.add(id);
       peer.sessions.add(id);
     } else {
       if (!bound || !(bound.from === profile && bound.to === peer || bound.to === profile && bound.from === peer)) return reject('unknown_session');
+      if (bound.web !== webLink) return reject('invalid_signal');
       if (type === 'answer') {
         if (bound.to !== profile || bound.answered || payload.description?.type !== 'answer' ||
-            !validText(payload.description.sdp, 60 * 1024) || !payload.description.sdp) return reject('invalid_signal');
+            !validText(payload.description.sdp, 60 * 1024) || !payload.description.sdp || (webLink &&
+              (!validText(payload.proof, 320) || !/^[\w-]+\.[\w-]+$/.test(payload.proof) || hasRelay(payload.description.sdp)))) return reject('invalid_signal');
         bound.answered = true;
       } else if (type === 'candidate') {
         if (!validText(payload.candidate, 4096) || !payload.candidate ||
             (payload.sdp_mid != null && !validText(payload.sdp_mid, 256)) ||
-            !Number.isInteger(payload.sdp_mline_index) || payload.sdp_mline_index < 0) return reject('invalid_signal');
+            !Number.isInteger(payload.sdp_mline_index) || payload.sdp_mline_index < 0 ||
+            (webLink && !directCandidate(payload.candidate))) return reject('invalid_signal');
       } else if (type === 'session_close') removeSession(id);
       else return reject('invalid_signal');
     }
     const clean = type === 'offer' || type === 'answer' ? { description: { type, sdp: payload.description.sdp },
-      ...(type === 'offer' && payload.conversation_id !== undefined ? { conversation_id: payload.conversation_id } : {}) } :
+      ...(!webLink && type === 'offer' && payload.conversation_id !== undefined ? { conversation_id: payload.conversation_id } : {}),
+      ...(webLink && type === 'answer' ? { proof: payload.proof } : {}) } :
       type === 'candidate' ? { candidate: payload.candidate, sdp_mid: payload.sdp_mid, sdp_mline_index: payload.sdp_mline_index } : {};
-    if (!send(peer.socket, { protocol, version: 1, type, message_id: message.message_id, session_id: id,
+    if (!send(peer.socket, { protocol, version: 1, type: wireType, message_id: message.message_id, session_id: id,
       source: endpoint(profile.info.endpointId), destination: endpoint(target), payload: clean })) {
       removeSession(id);
       reject('unavailable');
@@ -232,6 +256,15 @@ export function createTunnelPlatform({ iceServers = [], turn } = {}) {
   }
 
   service.on('upgrade', (req, socket, head) => {
+    if (req.url === webSignaling && web?.visitorRequest(req)) {
+      // 仅在反代明确负责覆盖该头时才使用它；不接受客户端任意提供的转发链。
+      const forwarded = visitorIpHeader && req.headers[visitorIpHeader];
+      const address = typeof forwarded === 'string' && isIP(forwarded) ? forwarded : socket.remoteAddress;
+      if (guests.size >= 256 || (guestCounts.get(address) ?? 0) >= 16) {
+        socket.end('HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n');
+      } else sockets.handleUpgrade(req, socket, head, ws => acceptGuest(ws, address));
+      return;
+    }
     const profile = tokens.get(bearer(req));
     if (req.url !== signaling || !profile || !activeToken(profile) || profile.pending || profile.socket) {
       socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
@@ -242,6 +275,45 @@ export function createTunnelPlatform({ iceServers = [], turn } = {}) {
       acceptSocket(profile, ws);
     });
   });
+
+  function acceptGuest(ws, address) {
+    const uuid = randomUUID();
+    const id = `${uuid.slice(0, 14)}8${uuid.slice(15)}`;
+    const profile = { info: { endpointId: id }, guest: true, socket: ws, sessions: new Set() };
+    guests.set(id, profile);
+    guestCounts.set(address, (guestCounts.get(address) ?? 0) + 1);
+    let emptySince = Date.now();
+    const expires = Date.now() + 30 * 60_000;
+    let alive = true;
+    let count = 0;
+    const pulse = setInterval(() => {
+      const now = Date.now();
+      if ([...profile.sessions].some(id => sessions.get(id)?.answered)) emptySince = now;
+      if (!alive || now >= expires || now - emptySince >= 30_000) return ws.terminate();
+      alive = false;
+      count = 0;
+      ws.ping();
+    }, 10_000);
+    ws.on('pong', () => { alive = true; });
+    ws.on('error', () => ws.terminate());
+    ws.on('close', () => {
+      clearInterval(pulse);
+      guests.delete(id);
+      const remaining = guestCounts.get(address) - 1;
+      if (remaining) guestCounts.set(address, remaining);
+      else guestCounts.delete(address);
+      disconnect(profile, ws);
+    });
+    ws.on('message', (raw, binary) => {
+      try {
+        if (binary || ++count > 128) return ws.terminate();
+        const frame = JSON.parse(raw);
+        if (frame.protocol !== protocol || frame.version !== 1 || !validText(frame.message_id, 128) || !frame.message_id) return ws.terminate();
+        route(profile, frame);
+      } catch { ws.terminate(); }
+    });
+    send(ws, { protocol, version: 1, type: 'web_ready', destination: endpoint(id), payload: { ice_servers: directServers } });
+  }
 
   function acceptSocket(profile, ws) {
     const timer = setTimeout(() => ws.terminate(), 5000);
@@ -273,7 +345,13 @@ export function createTunnelPlatform({ iceServers = [], turn } = {}) {
         if (binary || ++count > 512 || tokens.get(profile.token) !== profile) return ws.terminate();
         const frame = JSON.parse(raw);
         if (frame.protocol !== protocol || frame.version !== 1 || !validText(frame.message_id, 128) || !frame.message_id) return ws.terminate();
-        if (profile.socket === ws) return route(profile, frame);
+        if (profile.socket === ws) {
+          if (web && frame.type === 'web_status' && typeof frame.payload?.enabled === 'boolean') {
+            profile.info.capabilities = frame.payload.enabled && profile.info.publication === 'published' ? ['text', 'web-share'] : ['text'];
+            return;
+          }
+          return route(profile, frame);
+        }
         const routes = frame.payload?.routes;
         if (frame.type !== 'register' || !Array.isArray(routes) || routes.length !== 1 || routes[0]?.id !== profile.info.endpointId) return ws.terminate();
         clearTimeout(timer);
@@ -303,5 +381,15 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const turn = turnUrls ? { urls: JSON.parse(turnUrls), secret: readFileSync(secretFile, 'utf8').trim(),
     ttlSeconds: Number(process.env.DSHX_TUNNEL_TURN_TTL_SECONDS ?? 3600) } : undefined;
   const port = Number(process.env.DSHX_TUNNEL_PORT ?? 9082);
-  createTunnelPlatform({ iceServers, turn }).listen(port, '127.0.0.1', () => console.log(`DSHX 穿透平台监听 127.0.0.1:${port}`));
+  createTunnelPlatform({ iceServers, turn, webOrigin: process.env.DSHX_WEB_ORIGIN, appDomain: process.env.DSHX_WEB_APP_DOMAIN,
+    visitorIpHeader: process.env.DSHX_WEB_VISITOR_IP_HEADER })
+    .listen(port, '127.0.0.1', () => console.log(`DSHX 穿透平台监听 127.0.0.1:${port}`));
+}
+
+function directCandidate(candidate) {
+  return /^candidate:\S+\s+\d+\s+\S+\s+\d+\s+\S+\s+\d+\s+typ\s+(?:host|srflx|prflx)(?:\s|$)/i.test(candidate);
+}
+
+function hasRelay(sdp) {
+  return sdp.split(/\r?\n/).some(line => /^a=candidate:/i.test(line) && !directCandidate(line.slice(2)));
 }

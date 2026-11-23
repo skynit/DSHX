@@ -221,6 +221,7 @@ private fun TunnelDirectory(
     runtime: TunnelChatRuntime, settings: TunnelChatSettings, visible: Boolean, onSettings: () -> Unit, onOpen: (String) -> Unit,
 ) {
     val scope = rememberCoroutineScope()
+    val context = LocalContext.current
     val query = rememberTextFieldState()
     var submittedQuery by remember { mutableStateOf("") }
     var directory by remember { mutableStateOf<TunnelDirectoryPage?>(null) }
@@ -284,6 +285,12 @@ private fun TunnelDirectory(
                         else -> "离线"
                     })
                     if (endpoint.publicIntroduction.isNotBlank()) Note(endpoint.publicIntroduction)
+                    if ("web-share" in endpoint.capabilities) {
+                        Action("查看网页", {
+                            runCatching { openWebShare(context, settings.platformOrigin, endpoint.endpointId) }
+                                .onFailure { error = "网页入口无法打开。" }
+                        }, enabled = endpoint.online)
+                    }
                     if (!isSelf) Action(if (opening == endpoint.endpointId) "正在发起…" else "发起聊天", {
                         if (opening != null) return@Action
                         opening = endpoint.endpointId

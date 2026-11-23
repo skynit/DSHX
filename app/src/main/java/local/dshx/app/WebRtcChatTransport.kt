@@ -31,6 +31,7 @@ sealed class WebRtcChatEvent {
 /** WebRTC 负责选路和传递数据报；QUIC 在通道上独立处理重传和流。 */
 class WebRtcChatTransport(
     context: Context,
+    private val webShare: Boolean = false,
     private val onEvent: (WebRtcChatEvent) -> Unit,
 ) : AutoCloseable {
     private val factory = WebRtcFactory.get(context.applicationContext)
@@ -94,7 +95,11 @@ class WebRtcChatTransport(
 
     private fun createSession(sessionId: String, remoteEndpointId: String, iceServers: List<TunnelIceServer>, relayOnly: Boolean, initiator: Boolean): Session {
         require(sessions[sessionId] == null) { "WebRTC 会话编号已存在。" }
-        val config = PeerConnection.RTCConfiguration(iceServers.map { server ->
+        val servers = if (webShare) iceServers.mapNotNull { server ->
+            server.urls.filter { it.startsWith("stun:", true) || it.startsWith("stuns:", true) }
+                .takeIf { it.isNotEmpty() }?.let { TunnelIceServer(it) }
+        } else iceServers
+        val config = PeerConnection.RTCConfiguration(servers.map { server ->
             PeerConnection.IceServer.builder(server.urls).apply {
                 server.username?.let(::setUsername)
                 server.credential?.let(::setPassword)
@@ -158,13 +163,13 @@ class WebRtcChatTransport(
 
         fun send(value: ByteArray): Boolean = synchronized(channelLock) {
             val openChannel = channel ?: return false
-            if (!active() || value.size !in 1..Chatquic.MaxDatagram || openChannel.state() != DataChannel.State.OPEN ||
+            if (!active() || value.size !in 1..maxFrame() || openChannel.state() != DataChannel.State.OPEN ||
                 openChannel.bufferedAmount() >= MAX_BUFFERED) return false
             openChannel.send(DataChannel.Buffer(ByteBuffer.wrap(value), true))
         }
 
         fun localCandidate(candidate: IceCandidate) = synchronized(localCandidates) {
-            if (!active()) return@synchronized
+            if (!active() || webShare && !directWebCandidate(candidate.sdp)) return@synchronized
             if (descriptionPublished) onEvent(WebRtcChatEvent.LocalCandidate(sessionId, remoteEndpointId, candidate))
             else if (localCandidates.size < 128) localCandidates += candidate
         }
@@ -174,13 +179,13 @@ class WebRtcChatTransport(
             val init = DataChannel.Init().apply {
                 negotiated = true
                 id = 0
-                ordered = false
-                maxRetransmits = 0
-                protocol = CHANNEL_LABEL
+                ordered = webShare
+                if (!webShare) maxRetransmits = 0
+                protocol = if (webShare) WEB_CHANNEL_LABEL else CHANNEL_LABEL
             }
             synchronized(channelLock) {
                 check(active()) { "WebRTC 会话已关闭。" }
-                val created = peer.createDataChannel(CHANNEL_LABEL, init) ?: error("无法创建聊天数据通道。")
+                val created = peer.createDataChannel(init.protocol, init) ?: error("无法创建 WebRTC 数据通道。")
                 channel = created
                 bindChannel(created)
             }
@@ -197,7 +202,7 @@ class WebRtcChatTransport(
                     }
                 }
                 override fun onMessage(buffer: DataChannel.Buffer) {
-                    if (!active() || !buffer.binary || buffer.data.remaining() !in 1..Chatquic.MaxDatagram) return
+                    if (!active() || !buffer.binary || buffer.data.remaining() !in 1..maxFrame()) return
                     val bytes = ByteArray(buffer.data.remaining()).also { buffer.data.get(it) }
                     onEvent(WebRtcChatEvent.Frame(sessionId, bytes))
                 }
@@ -223,6 +228,7 @@ class WebRtcChatTransport(
         }
 
         fun addCandidate(candidate: IceCandidate) = synchronized(pendingCandidates) {
+            if (webShare && !directWebCandidate(candidate.sdp)) return@synchronized
             if (remoteDescriptionSet) peer.addIceCandidate(candidate)
             else if (pendingCandidates.size < 128) pendingCandidates += candidate
             Unit
@@ -277,9 +283,15 @@ class WebRtcChatTransport(
 
     private companion object {
         const val CHANNEL_LABEL = "dshx-h3/1"
+        const val WEB_CHANNEL_LABEL = "dshx-web/1"
         const val MAX_BUFFERED = 64 * 1024L
     }
+
+    private fun maxFrame() = if (webShare) 32 * 1024 else Chatquic.MaxDatagram
 }
+
+private val directCandidateType = Regex("^(?:a=)?candidate:\\S+\\s+\\d+\\s+\\S+\\s+\\d+\\s+\\S+\\s+\\d+\\s+typ\\s+(host|srflx|prflx)(?:\\s|$)", RegexOption.IGNORE_CASE)
+internal fun directWebCandidate(candidate: String) = directCandidateType.containsMatchIn(candidate)
 
 internal fun selectedChatLink(stats: Map<String, RTCStats>): TunnelChatLink? {
     val pairId = stats.values.firstNotNullOfOrNull { entry ->

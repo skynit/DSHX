@@ -52,6 +52,7 @@ data class TunnelPlatformRegistration(
     val registrationToken: String?,
     val connectionId: String?,
     val iceServers: List<TunnelIceServer>,
+    val webAvailable: Boolean = false,
 )
 
 class TunnelPlatformException(val code: String, message: String, val retryable: Boolean = false) : Exception(message)
@@ -170,7 +171,7 @@ class TunnelPlatformClient(
         }
     }
 
-    fun registerEndpoint(settings: TunnelChatSettings, identity: TunnelEndpointIdentity): TunnelPlatformRegistration {
+    fun registerEndpoint(settings: TunnelChatSettings, identity: TunnelEndpointIdentity, webShare: Boolean = false): TunnelPlatformRegistration {
         val clean = settings.validate()
         require(identity.endpointId == clean.endpointId) { "端点身份与设置不匹配。" }
         val body = JSONObject()
@@ -181,6 +182,7 @@ class TunnelPlatformClient(
             .put("publication", clean.publication.name.lowercase())
             .put("acceptance", clean.acceptance.name.lowercase())
             .put("maxAiReplies", clean.maxAiReplies)
+            .apply { if (webShare) put("webShare", true) }
             .toString()
         val challengeRequest = Request.Builder().url(origin.newBuilder()
             .encodedPath("${TunnelChatProtocol.REGISTER_PATH}/challenge").build())
@@ -281,6 +283,7 @@ class TunnelPlatformClient(
             registrationToken = value.optString("registrationToken").takeIf { it.isNotBlank() },
             connectionId = value.optString("connectionId").takeIf { it.isNotBlank() },
             iceServers = servers,
+            webAvailable = value.optBoolean("webAvailable"),
         )
     }
 }
@@ -324,6 +327,20 @@ class TunnelSignalingClient(
     )
 
     fun closeSession(sessionId: String, targetEndpointId: String): Boolean = sendSignal("session_close", sessionId, targetEndpointId, JSONObject())
+
+    internal fun answerWeb(session: String, visitor: String, sdp: String, proof: String): Boolean =
+        sendSignal("web_answer", session, visitor, JSONObject()
+            .put("description", JSONObject().put("type", "answer").put("sdp", sdp)).put("proof", proof))
+
+    internal fun candidateWeb(session: String, visitor: String, candidate: org.webrtc.IceCandidate): Boolean =
+        sendSignal("web_candidate", session, visitor, JSONObject().put("candidate", candidate.sdp)
+            .put("sdp_mid", candidate.sdpMid ?: JSONObject.NULL).put("sdp_mline_index", candidate.sdpMLineIndex))
+
+    internal fun closeWeb(session: String, visitor: String): Boolean = sendSignal("web_close", session, visitor, JSONObject())
+
+    internal fun publishWebStatus(enabled: Boolean): Boolean = socket?.send(
+        envelope("web_status", null, null, JSONObject().put("enabled", enabled)).toString(),
+    ) == true
 
     override fun close() {
         socket?.close(1000, "client_closed")
@@ -410,7 +427,7 @@ class TunnelSignalingClient(
                     } ?: emptyList()
                     listener(TunnelSignalingEvent.Registered(payload.optString("connection_id").takeIf { it.isNotBlank() }, payload.optString("registration_token").takeIf { it.isNotBlank() }, servers))
                 }
-                "offer", "answer" -> {
+                "offer", "answer", "web_offer", "web_answer" -> {
                     val description = payload.optJSONObject("description") ?: return
                     val normalized = JSONObject(payload.toString()).put("sdp", description.optString("sdp"))
                     listener(TunnelSignalingEvent.Message(type, value.optString("session_id").takeIf { it.isNotBlank() }, source?.optString("id"), normalized))

@@ -1,5 +1,6 @@
 package local.dshx.app
 
+import org.json.JSONArray
 import org.json.JSONObject
 import android.content.ClipData
 import android.content.Intent
@@ -68,6 +69,62 @@ import kotlinx.coroutines.withTimeout
 @Config(sdk = [34])
 class CoreTest {
     @get:Rule val folder = TemporaryFolder()
+
+    @Test fun webShareTargetsStayOnTheRegisteredService() {
+        val context = RuntimeEnvironment.getApplication()
+        val shares = WebShares(context) { it == 8913 }
+        val worker = Executors.newSingleThreadExecutor()
+        val output = java.util.concurrent.LinkedBlockingQueue<JSONObject>()
+        MockWebServer().use { server ->
+            server.start(java.net.InetAddress.getByName("127.0.0.1"), 0)
+            val share = shares.save(null, "测试网页", "http://127.0.0.1:${server.port}/", true)
+            assertThrows(IllegalArgumentException::class.java) { webShareUrl("http://example.test:80/") }
+            assertThrows(IllegalArgumentException::class.java) { shares.save(null, "管理", "http://127.0.0.1:8913/", true) }
+            assertTrue(privateIpv4("192.168.2.112"))
+            assertFalse(privateIpv4("169.254.1.2"))
+            WebShareProxy(shares, output::add, worker).use { proxy ->
+                fun receive(type: String): JSONObject = checkNotNull(output.poll(3, TimeUnit.SECONDS)).also {
+                    assertEquals(type, it.getString("type"))
+                }
+                fun frame(type: String, id: String) = JSONObject().put("type", type).put("id", id)
+                fun open(id: String, path: String, method: String = "GET", body: Boolean = false) {
+                    val headers = JSONArray().put(JSONArray().put("origin").put("https://visitor.example"))
+                    proxy.receive(frame("open", id).put("share", share.id).put("path", path)
+                        .put("method", method).put("upload", body).put("headers", headers))
+                }
+                proxy.receive(JSONObject().put("type", "list"))
+                assertEquals(share.id, receive("list").getJSONArray("items").getJSONObject(0).getString("id"))
+                assertTrue(receive("list").getBoolean("done"))
+                val id = java.util.UUID.randomUUID().toString()
+                open(id, "//127.0.0.1:7/web")
+                receive("error")
+                assertEquals(0, server.requestCount)
+                server.enqueue(MockResponse().setHeader("Set-Cookie", "session=fixture; Path=/").setBody("fixture"))
+                open(id, "/submit", "POST", true)
+                receive("upload-ready")
+                proxy.receive(frame("upload", id).put("bytes", "aGVsbG8="))
+                receive("upload-ack")
+                proxy.receive(frame("upload-done", id))
+                assertEquals(200, receive("headers").getInt("status"))
+                assertEquals("Zml4dHVyZQ==", receive("chunk").getString("bytes"))
+                proxy.receive(frame("ack", id))
+                receive("done")
+                val upload = checkNotNull(server.takeRequest(3, TimeUnit.SECONDS))
+                assertEquals("hello", upload.body.readUtf8())
+                assertEquals("https://dshx-web.invalid", upload.getHeader("Origin"))
+                val next = java.util.UUID.randomUUID().toString()
+                server.enqueue(MockResponse().setResponseCode(302).setHeader("Location", "http://127.0.0.1:7/leak"))
+                open(next, "/next")
+                receive("error")
+                assertEquals("session=fixture", server.takeRequest(3, TimeUnit.SECONDS)?.getHeader("Cookie"))
+                shares.save(share.id, share.name, share.url.toString(), false)
+                open(java.util.UUID.randomUUID().toString(), "/")
+                receive("error")
+                assertEquals(2, server.requestCount)
+            }
+        }
+        worker.shutdownNow()
+    }
 
     @Test fun tunnelChatLinkShowsTheSelectedPathAndItsRoundTripTime() {
         fun report(local: String, remote: String, selected: String? = "chosen", seconds: Double? = 0.0368): Map<String, RTCStats> {

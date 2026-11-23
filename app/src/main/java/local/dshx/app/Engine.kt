@@ -55,6 +55,7 @@ class Engine(private val context: Context, private val worker: Executor = Execut
     @Volatile private var knowledgeTransfer = KnowledgeStore.Transfer()
     private val tools = ToolPolicy { main.post { update(state) } }
     @Volatile private var bridge: PolicyBridge? = null
+    internal fun ownsLocalPort(port: Int): Boolean = bridge?.port == port || currentAddress() == "127.0.0.1:$port"
 
     fun observe(listener: (EngineState) -> Unit) { listeners.add(listener); listener(state) }
     fun remove(listener: (EngineState) -> Unit) { listeners.remove(listener) }

@@ -105,7 +105,7 @@ internal enum class AppPage(val title: String, val settings: Boolean = false) {
     Home("DSHX"), Chat("对话"), Settings("设置", true), Voice("语音聊天"), Logs("运行诊断"), Library("知识库"),
     Assistant("助手与资料", true), VoiceOptions("语音交互", true), Tasks("任务分工", true),
     Permissions("手机操作与权限", true), Hosting("实验体", true), HostingOptions("培养设置", true),
-    Apps("微应用", true), TunnelChat("聊天设置", true), Backup("备份与恢复", true), Update("应用更新", true),
+    Apps("微应用", true), TunnelChat("聊天设置", true), WebShares("网页共享", true), Backup("备份与恢复", true), Update("应用更新", true),
     TunnelInbox("聊天");
 
     val previous: AppPage get() = when {

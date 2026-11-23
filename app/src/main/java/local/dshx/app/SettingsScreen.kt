@@ -74,6 +74,8 @@ internal fun SettingsContent(
                 Divider()
                 LinkRow("聊天设置", tunnelChatState.message, { onPage(AppPage.TunnelChat) })
                 Divider()
+                LinkRow("网页共享", "本机和局域网服务", { onPage(AppPage.WebShares) })
+                Divider()
                 LinkRow("实验体", "触发日志与培养设置", { onPage(AppPage.Hosting) })
                 Divider()
                 LinkRow("微应用", "添加功能、配置与运行记录", { onPage(AppPage.Apps) })
@@ -101,6 +103,7 @@ internal fun SettingsContent(
         AppPage.Tasks -> SmallModelSettings(voice, state, action)
         AppPage.Permissions -> PhoneSettings(phone, phoneRevision, permission)
         AppPage.TunnelChat -> TunnelChatSettingsContent(tunnelChat, tunnelChatState)
+        AppPage.WebShares -> WebSharesSettings(tunnelChat, tunnelChatState)
         AppPage.Apps -> AppsSettings(engine.url != null, phoneRevision, onApps, onCreateApp, onHostingSession, permission,
             back = { onPage(AppPage.Settings) })
         AppPage.Backup -> BackupSettings(engine, backupPicking, onStop, onBackup)

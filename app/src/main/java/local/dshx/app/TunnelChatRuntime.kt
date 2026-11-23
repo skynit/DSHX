@@ -58,6 +58,8 @@ class TunnelChatRuntime(
     private val retryScheduler = Executors.newSingleThreadScheduledExecutor { task -> Thread(task, "dshx-tunnel-retry").apply { isDaemon = true } }
     @Volatile private var registration: TunnelPlatformRegistration? = null
     private val identity by lazy { AndroidTunnelEndpointIdentity() }
+    internal val webShares = WebShares(context) { port -> (context.applicationContext as? DshApp)?.engine?.ownsLocalPort(port) == true }
+    private var web: WebShareServer? = null
     private var generation = 0L
     @Volatile private var closed = false
     @Volatile private var engineReady = false
@@ -78,6 +80,7 @@ class TunnelChatRuntime(
     }
 
     init {
+        webShares.watchNetwork { onWorker { web?.checkTargets(); updateWebCapability() } }
         submit { synchronized(this) { attachmentFiles.trim(discardParts = true) } }
         if (withdrawals().isNotEmpty()) {
             state = state.copy(pendingWithdrawal = true)
@@ -91,6 +94,7 @@ class TunnelChatRuntime(
                     runCatching {
                         if (engineReady && System.currentTimeMillis() >= nextRegistrationAttempt) start()
                         if (state.status == Status.ONLINE) retryQueued()
+                        web?.checkTargets()
                         sessionBindings.values.forEach {
                             if (it.sessionId in authenticatedSessions && !it.closing) sampleLink(it)
                         }
@@ -114,6 +118,26 @@ class TunnelChatRuntime(
     }
 
     fun settings(): TunnelChatSettings = currentSettings
+
+    internal val webPlatformAvailable: Boolean get() = registration?.webAvailable == true
+
+    @Synchronized internal fun saveWebShare(id: String?, name: String, address: String, enabled: Boolean): WebShare {
+        val item = webShares.save(id, name, address, enabled)
+        if (id != null) web?.revoke(id)
+        updateWebCapability()
+        return item
+    }
+
+    @Synchronized internal fun deleteWebShare(id: String) {
+        webShares.delete(id)
+        web?.revoke(id)
+        updateWebCapability()
+    }
+
+    private fun updateWebCapability() {
+        if (!webPlatformAvailable || state.status != Status.ONLINE) return
+        signaling.publishWebStatus(webShares.publicList().isNotEmpty())
+    }
 
     @Synchronized fun saveSettings(settings: TunnelChatSettings): TunnelChatSettings {
         val clean = settings.validate()
@@ -194,7 +218,7 @@ class TunnelChatRuntime(
                     }
                 }
                 val platform = TunnelPlatformClient(clean.platformOrigin)
-                platform.registerEndpoint(clean, identity)
+                platform.registerEndpoint(clean, identity, webShare = webShares.publicList().isNotEmpty())
             }
             synchronized(this) {
                 if (!isCurrent(run)) return@submit
@@ -228,6 +252,8 @@ class TunnelChatRuntime(
         pendingReply = null
         acceptingSignals = false
         nextRegistrationAttempt = Long.MAX_VALUE
+        web?.close()
+        web = null
         signaling.close()
         sessionBindings.values.forEach { it.close() }
         sessionBindings.clear()
@@ -435,6 +461,7 @@ class TunnelChatRuntime(
     @Synchronized override fun close() {
         closed = true
         stop()
+        webShares.close()
         worker.shutdownNow()
         aiWorker.shutdownNow()
         retryScheduler.shutdownNow()
@@ -541,6 +568,7 @@ class TunnelChatRuntime(
                     else -> "公共端点已在线。"
                 }
                 update(TunnelChatRuntimeState(Status.ONLINE, message, currentSettings.descriptor(online = true)))
+                updateWebCapability()
             }
             is TunnelSignalingEvent.Message -> handleSignalingMessage(event)
             is TunnelSignalingEvent.Failed -> disconnectSignaling(
@@ -556,12 +584,25 @@ class TunnelChatRuntime(
         generation++
         registration = null
         nextRegistrationAttempt = if (retry) System.currentTimeMillis() + 15_000L else Long.MAX_VALUE
+        web?.stop()
         signaling.close()
         sessionBindings.values.filterNot { it.sessionId in authenticatedSessions }.forEach { disconnectSession(it.sessionId) }
         update(TunnelChatRuntimeState(if (retry) Status.OFFLINE else Status.FAILED, message, currentSettings.descriptor(false)))
     }
 
     private fun handleSignalingMessage(event: TunnelSignalingEvent.Message) {
+        if (event.type in setOf("web_offer", "web_candidate", "web_close")) {
+            val servers = registration?.iceServers.orEmpty()
+            val public = engineReady && currentSettings.enabled && currentSettings.publication == TunnelPublication.PUBLISHED
+            val runtime = web ?: if (event.type == "web_offer" && public && webShares.publicList().isNotEmpty()) {
+                WebShareServer(context, webShares, { identity }, signaling, retryScheduler, ::onWorker).also { web = it }
+            } else null
+            if (runtime != null) runtime.signal(event, servers, public)
+            else if (event.type == "web_offer" && event.sessionId != null && event.sourceEndpointId != null) {
+                signaling.closeWeb(event.sessionId, event.sourceEndpointId)
+            }
+            return
+        }
         if (event.type == "ack" || event.type == "error" || event.type == "session_connected") {
             val sessionId = event.sessionId
             if (event.type == "error") {
