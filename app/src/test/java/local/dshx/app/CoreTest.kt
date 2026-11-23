@@ -94,7 +94,7 @@ class CoreTest {
         assertNull(selectedChatLink(report("host", "host", selected = null)))
         assertEquals("37 ms", tunnelRoundTripLabel(37L))
         assertEquals("< 1 ms", tunnelRoundTripLabel(0L))
-        assertEquals("待测", tunnelRoundTripLabel(null))
+        assertEquals("暂无读数", tunnelRoundTripLabel(null))
     }
 
     @Test fun tunnelChatLatencyGradesChangeAt100And200Milliseconds() {

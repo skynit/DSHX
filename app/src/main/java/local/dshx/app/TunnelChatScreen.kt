@@ -91,6 +91,7 @@ import com.composables.icons.lucide.Cloud
 import com.composables.icons.lucide.Compass
 import com.composables.icons.lucide.Ellipsis
 import com.composables.icons.lucide.ImagePlus
+import com.composables.icons.lucide.Infinity
 import com.composables.icons.lucide.Lucide
 import com.composables.icons.lucide.MessagesSquare
 import com.composables.icons.lucide.Plus
@@ -553,8 +554,9 @@ private fun TunnelLinkBadge(conversation: TunnelChatConversationSnapshot) {
         TunnelChatLink.Path.RELAY -> "中继" to Lucide.Cloud
         null -> "路径待确认" to Lucide.CircleHelp
     }
-    val latency = tunnelRoundTripLabel(link?.roundTripMs)
-    val grade = tunnelLatencyGrade(link?.roundTripMs)
+    val roundTripMs = link?.roundTripMs
+    val latency = tunnelRoundTripLabel(roundTripMs)
+    val grade = tunnelLatencyGrade(roundTripMs)
     val tone = when (grade) {
         TunnelLatencyGrade.UNKNOWN -> colors.onSurfaceVariantSummary
         TunnelLatencyGrade.LOW -> LocalStatusColor.current
@@ -577,8 +579,11 @@ private fun TunnelLinkBadge(conversation: TunnelChatConversationSnapshot) {
                 .padding(horizontal = 8.dp, vertical = 3.dp), verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(4.dp, Alignment.CenterHorizontally)) {
                 Icon(icon, contentDescription = null, modifier = Modifier.size(14.dp), tint = foreground)
-                Text("$label · $latency", fontSize = 12.sp, lineHeight = 18.sp, color = foreground,
+                Text(if (roundTripMs == null) "$label ·" else "$label · $latency", fontSize = 12.sp, lineHeight = 18.sp, color = foreground,
                     maxLines = 1, overflow = TextOverflow.Ellipsis)
+                if (roundTripMs == null) {
+                    Icon(Lucide.Infinity, contentDescription = null, modifier = Modifier.size(14.dp), tint = foreground)
+                }
             }
             if (expanded) {
                 val endpoint = conversation.remoteEndpointId.let { if (it.length > 8) "…${it.takeLast(8)}" else it }
@@ -625,13 +630,13 @@ private object TunnelLinkPopupPosition : PopupPositionProvider {
 }
 
 internal fun tunnelRoundTripLabel(milliseconds: Long?): String = when (milliseconds) {
-    null -> "待测"
+    null -> "暂无读数"
     0L -> "< 1 ms"
     else -> "$milliseconds ms"
 }
 
 internal enum class TunnelLatencyGrade(val label: String) {
-    UNKNOWN("延迟待测"), LOW("低延迟"), ELEVATED("延迟偏高"), HIGH("高延迟"),
+    UNKNOWN("暂无延迟读数"), LOW("低延迟"), ELEVATED("延迟偏高"), HIGH("高延迟"),
 }
 
 internal fun tunnelLatencyGrade(milliseconds: Long?): TunnelLatencyGrade = when {
