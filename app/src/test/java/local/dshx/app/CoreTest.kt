@@ -219,6 +219,16 @@ class CoreTest {
         assertEquals("2025/12/31", label("2025-12-30T16:00:00Z"))
     }
 
+    @Test fun tunnelMessageGroupsStartOnTheFirstMessageAfterAPauseOrAtLocalMidnight() {
+        val zone = java.time.ZoneId.of("Asia/Shanghai")
+        val midnight = java.time.Instant.parse("2026-11-22T16:00:00Z").toEpochMilli()
+
+        assertTrue(tunnelMessageStartsGroup(null, midnight, zone))
+        assertFalse(tunnelMessageStartsGroup(midnight, midnight + 299_999, zone))
+        assertTrue(tunnelMessageStartsGroup(midnight, midnight + 300_000, zone))
+        assertTrue(tunnelMessageStartsGroup(midnight - 1, midnight, zone))
+    }
+
     @Test fun tunnelImageTransfersMultipleWindowsBeforeConfirmingDelivery() {
         val first = mutableListOf<JSONObject>()
         val second = mutableListOf<JSONObject>()

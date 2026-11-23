@@ -190,6 +190,7 @@ fun DshScreen(
     var tab by rememberSaveable { mutableIntStateOf(0) }
     var settingsPage by rememberSaveable { mutableStateOf(AppPage.Settings) }
     var tunnelSettings by rememberSaveable { mutableStateOf(false) }
+    var tunnelConversationId by rememberSaveable { mutableStateOf<String?>(null) }
     var logs by rememberSaveable { mutableStateOf(false) }
     var library by rememberSaveable { mutableStateOf(false) }
     var tabsShown by rememberSaveable { mutableStateOf(false) }
@@ -214,6 +215,8 @@ fun DshScreen(
         else -> page.previous
     }
     val showTabs = tabsShown || page == AppPage.TunnelInbox
+    val tunnelConversationOpen = page == AppPage.TunnelInbox &&
+        tunnelChatState.conversations.any { it.conversationId == tunnelConversationId }
     val visited = remember { mutableSetOf(page) }
     SideEffect { visited += page }
     val running = state.url != null
@@ -279,7 +282,7 @@ fun DshScreen(
             modifier = Modifier.clipToBounds(),
             contentWindowInsets = WindowInsets(0, 0, 0, 0),
             bottomBar = {
-                if (!library && !logs && !(keyboardOpen && (tab in 1..2 || tab == TUNNEL_TAB))) Column(
+                if (!library && !logs && !tunnelConversationOpen && !(keyboardOpen && (tab in 1..2 || tab == TUNNEL_TAB))) Column(
                     Modifier.backBar { if (showTabs) 1f else backGesture.backProgress }
                         .then(if (showTabs) Modifier else Modifier.clearAndSetSemantics {})
                         .background(MiuixTheme.colorScheme.surfaceVariant),
@@ -307,8 +310,8 @@ fun DshScreen(
             },
         ) { padding ->
             BackPages(page, previousPage, backGesture,
-                enabled = !library && !logs && (page != AppPage.Home || !tabsShown), onBack = ::goBack,
-                pages = if (page.settings && page != AppPage.Settings) emptyList() else
+                enabled = !library && !logs && !tunnelConversationOpen && (page != AppPage.Home || !tabsShown), onBack = ::goBack,
+                pages = if (tunnelConversationOpen || page.settings && page != AppPage.Settings) emptyList() else
                     listOf(AppPage.Home, AppPage.Chat, AppPage.Voice, AppPage.TunnelInbox, AppPage.Settings),
                 onPage = { selectTab(when (it) {
                     AppPage.Chat -> 1; AppPage.Voice -> 3; AppPage.TunnelInbox -> TUNNEL_TAB; AppPage.Settings -> 2; else -> 0
@@ -332,7 +335,8 @@ fun DshScreen(
                         VoiceChat(Modifier.fillMaxSize(), voice, voiceState, running, state.busy, onVoice, onStart,
                             onSettings = { selectTab(2); settingsPage = AppPage.VoiceOptions }, onChat = { selectTab(1) }, onBack = ::goBack)
                     } else if (shownPage == AppPage.TunnelInbox) {
-                        TunnelChatScreen(tunnelChat, tunnelChatState, visible = current, onSettings = {
+                        TunnelChatScreen(tunnelChat, tunnelChatState, visible = current,
+                            selectedConversationId = tunnelConversationId, onSelect = { tunnelConversationId = it }, onSettings = {
                             backGesture.reset()
                             tunnelSettings = true
                         })

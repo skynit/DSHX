@@ -23,6 +23,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -30,6 +31,10 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.input.TextFieldDecorator
+import androidx.compose.foundation.text.input.TextFieldLineLimits
+import androidx.compose.foundation.text.input.TextFieldState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -49,16 +54,29 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.error
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Popup
+import androidx.compose.ui.window.PopupProperties
+import com.composables.icons.lucide.ArrowUp
 import com.composables.icons.lucide.ChevronLeft
 import com.composables.icons.lucide.Compass
+import com.composables.icons.lucide.Ellipsis
 import com.composables.icons.lucide.ImagePlus
 import com.composables.icons.lucide.Lucide
 import com.composables.icons.lucide.MessagesSquare
@@ -74,7 +92,10 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.Icon
+import top.yukonga.miuix.kmp.basic.Button
+import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.theme.MiuixTheme
+import top.yukonga.miuix.kmp.utils.MiuixIndication
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
@@ -83,22 +104,31 @@ import java.util.Locale
 
 @Composable
 internal fun TunnelChatScreen(
-    runtime: TunnelChatRuntime, runtimeState: TunnelChatRuntimeState, visible: Boolean, onSettings: () -> Unit,
+    runtime: TunnelChatRuntime, runtimeState: TunnelChatRuntimeState, visible: Boolean,
+    selectedConversationId: String?, onSelect: (String?) -> Unit, onSettings: () -> Unit,
 ) {
     val settings = runtime.settings()
     var discover by rememberSaveable { mutableStateOf(false) }
-    var selectedConversationId by rememberSaveable { mutableStateOf<String?>(null) }
     val drafts = rememberSaveableStateHolder()
     val listState = key(settings.platformOrigin, settings.endpointId) { rememberLazyListState() }
     val conversations = runtimeState.conversations
     val selected = conversations.firstOrNull { it.conversationId == selectedConversationId }
     val closeDiscovery = { discover = false }
-    BackHandler(visible && discover, onBack = closeDiscovery)
+    val closeConversation = { onSelect(null) }
+    BackHandler(visible && (discover || selected != null), onBack = if (discover) closeDiscovery else closeConversation)
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val gutter = if (maxWidth >= 600.dp) 32.dp else 16.dp
         Column(Modifier.align(Alignment.TopCenter).widthIn(max = 680.dp).fillMaxSize().padding(horizontal = gutter)) {
+            if (!discover && selected != null) {
+                key(settings.platformOrigin, settings.endpointId) {
+                    drafts.SaveableStateProvider(selected.conversationId) {
+                        TunnelConversationPanel(runtime, selected, closeConversation, onSettings)
+                    }
+                }
+                return@Column
+            }
             TunnelChatHeader(runtimeState, onSettings, onBack = closeDiscovery.takeIf { discover })
-            if (!discover && selected == null) {
+            if (!discover) {
                 if (conversations.isEmpty()) {
                     Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState())) {
                         LibraryEmpty(Lucide.MessagesSquare, "暂无会话",
@@ -113,7 +143,7 @@ internal fun TunnelChatScreen(
                     LazyColumn(Modifier.weight(1f).fillMaxWidth(), state = listState,
                         contentPadding = PaddingValues(vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         items(conversations, key = { it.conversationId }) { conversation ->
-                            TunnelConversationRow(conversation, zone, today) { selectedConversationId = conversation.conversationId }
+                            TunnelConversationRow(conversation, zone, today) { onSelect(conversation.conversationId) }
                         }
                     }
                 }
@@ -121,22 +151,12 @@ internal fun TunnelChatScreen(
                     VoiceButton("发现端点", Lucide.Plus, { discover = true }, size = 56)
                 }
             } else {
-                key(discover, settings.platformOrigin, selected?.conversationId.takeUnless { discover }) {
+                key(settings.platformOrigin) {
                     Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()).padding(vertical = 16.dp),
                         verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                        if (discover) {
-                            TunnelDirectory(runtime, settings, visible, onSettings) { conversationId ->
-                                selectedConversationId = conversationId
-                                discover = false
-                            }
-                        } else if (selected != null) {
-                            Action("所有会话", { selectedConversationId = null })
-                            Panel {
-                                Text("${selected.peerLabel} · ${selected.remoteEndpointId}", fontSize = 16.sp, fontWeight = FontWeight.Medium)
-                                Note(listOfNotNull(selected.connectionLabel, selected.receptionLabel, selected.preview()?.text).joinToString(" · "))
-                                Spacer(Modifier.height(12.dp))
-                                drafts.SaveableStateProvider(selected.conversationId) { TunnelConversationPanel(runtime, selected) }
-                            }
+                        TunnelDirectory(runtime, settings, visible, onSettings) { conversationId ->
+                            onSelect(conversationId)
+                            discover = false
                         }
                     }
                 }
@@ -367,11 +387,14 @@ internal fun conversationTime(createdAt: Long, zone: ZoneId, today: LocalDate): 
 private fun TunnelConversationPanel(
     runtime: TunnelChatRuntime,
     conversation: TunnelChatConversationSnapshot,
+    onBack: () -> Unit,
+    onSettings: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
     val draft = rememberTextFieldState()
     var busy by remember { mutableStateOf(false) }
     var failure by remember { mutableStateOf<String?>(null) }
+    var menu by remember { mutableStateOf(false) }
     var confirmEnd by remember { mutableStateOf(false) }
     var selectedImage by rememberSaveable { mutableStateOf<Uri?>(null) }
     var submittedImage by rememberSaveable { mutableStateOf<String?>(null) }
@@ -403,59 +426,57 @@ private fun TunnelConversationPanel(
             }
         }
     }
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        conversation.messages.takeLast(40).forEach { message ->
-            val text = message.payload.optString("text").ifBlank {
-                message.payload.optJSONObject("attachment")?.optString("name")?.let { "附件：$it" } ?: message.kind.wireName
-            }
-            val role = when (message.kind) {
-                ChatMessageKind.AI_SUGGESTION -> "AI 内部建议"
-                ChatMessageKind.AI_FORMAL -> "AI"
-                ChatMessageKind.HUMAN_FORMAL -> "人工"
-                ChatMessageKind.TEXT -> if (conversation.outgoing) "我" else "访客"
-                ChatMessageKind.IMAGE -> if ((message.senderRole == ChatSenderRole.VISITOR) == conversation.outgoing) "我" else "对方"
-                ChatMessageKind.CONVERSATION_EVENT -> "会话状态"
-                else -> "对方"
-            }
-            Column(Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
-                Text(role, fontSize = 12.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
-                if (message.kind == ChatMessageKind.IMAGE) {
-                    key(message.senderEndpointId, message.messageId) { TunnelImage(runtime, message) }
-                } else Text(text, fontSize = 14.sp, lineHeight = 21.sp)
-            }
-        }
-        if (conversation.closed) return@Column
-        AssistantField("发送消息", draft, 4_000, busy, 4, "输入文本")
-        failure?.let { Text(it, fontSize = 13.sp, color = MiuixTheme.colorScheme.error) }
-        if (selectedImage != null) {
-            Note(when {
-                conversation.sendingImage -> "正在发送图片…"
-                delivery?.delivered == false -> "图片未确认送达，可重试。"
-                !conversation.connected -> "连接后可发送图片。"
-                else -> "已选择图片"
-            })
-        }
-        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            if (!conversation.connected) {
-                Action(if (conversation.connecting) "正在连接…" else "重连",
-                    { run({ runtime.reconnectConversation(conversation.conversationId) }) },
-                    enabled = !busy && !conversation.connecting, icon = Lucide.RotateCcw)
-            }
-            Action(if (conversation.connected) "发送" else "排队发送", {
-                val text = draft.text.toString().trim()
-                if (text.isNotBlank()) run({
-                    if (conversation.outgoing) runtime.sendText(conversation.conversationId, text)
-                    else runtime.sendHumanFormalText(conversation.conversationId, text)
-                }, { draft.setTextAndPlaceCursorAtEnd("") })
-            }, enabled = !busy && draft.text.isNotBlank(), primary = true, icon = Lucide.Send)
-            if (conversation.canSendImage || selectedImage != null) {
-                val uri = selectedImage
-                if (uri == null) Action("选图", {
-                    try { picker.launch(tunnelImageTypes) } catch (_: android.content.ActivityNotFoundException) {
-                        failure = "无法打开图片选择器。"
+    Column(Modifier.fillMaxSize()) {
+        TunnelConversationHeader(conversation, onBack, onMenu = { menu = true }) {
+            if (menu) {
+                val colors = MiuixTheme.colorScheme
+                val offset = with(LocalDensity.current) { IntOffset(0, 52.dp.roundToPx()) }
+                Popup(alignment = Alignment.TopEnd, offset = offset, properties = PopupProperties(focusable = true),
+                    onDismissRequest = { menu = false; confirmEnd = false }) {
+                    val shape = RoundedCornerShape(10.dp)
+                    Column(Modifier.width(184.dp).background(colors.surfaceContainerHigh, shape)
+                        .border(1.dp, colors.outline, shape).padding(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        if (confirmEnd && !conversation.closed) {
+                            Action("确认结束", {
+                                menu = false
+                                confirmEnd = false
+                                run({ runtime.endConversation(conversation.conversationId) })
+                            }, Modifier.fillMaxWidth(), enabled = !busy, danger = true)
+                            Action("取消", { confirmEnd = false }, Modifier.fillMaxWidth())
+                        } else {
+                            if (!conversation.closed) {
+                                if (!conversation.connected) Action(if (conversation.connecting) "连接中…" else "重新连接", {
+                                    menu = false
+                                    run({ runtime.reconnectConversation(conversation.conversationId) })
+                                }, Modifier.fillMaxWidth(), enabled = !busy && !conversation.connecting, icon = Lucide.RotateCcw)
+                                if (!conversation.outgoing && conversation.mode == ConversationMode.HUMAN_HANDOVER) {
+                                    Action("恢复 AI 接待", {
+                                        menu = false
+                                        run({ runtime.resumeAi(conversation.conversationId) })
+                                    }, Modifier.fillMaxWidth(), enabled = !busy)
+                                }
+                                Action("结束聊天", { confirmEnd = true }, Modifier.fillMaxWidth(), enabled = !busy, danger = true)
+                            }
+                            Action("聊天设置", { menu = false; onSettings() }, Modifier.fillMaxWidth(), icon = Lucide.Settings2)
+                        }
                     }
-                }, enabled = !busy && !conversation.sendingImage, icon = Lucide.ImagePlus)
-                else {
+                }
+            }
+        }
+        Divider()
+        TunnelTimeline(runtime, conversation, Modifier.weight(1f))
+        failure?.let { Text(it, Modifier.padding(bottom = 8.dp), fontSize = 13.sp, color = MiuixTheme.colorScheme.error) }
+        if (!conversation.closed) Column(Modifier.fillMaxWidth().padding(bottom = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            val uri = selectedImage
+            if (uri != null) {
+                Note(when {
+                    conversation.sendingImage -> "正在发送图片…"
+                    delivery?.delivered == false -> "图片未确认送达，可重试。"
+                    !conversation.connected -> "连接后可发送图片。"
+                    else -> "已选择图片"
+                })
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Action("发送图片", {
                         var id: String? = null
                         run({ id = runtime.sendImage(conversation.conversationId, uri, delivery?.takeUnless { it.delivered }?.messageId) },
@@ -465,17 +486,200 @@ private fun TunnelConversationPanel(
                         enabled = !busy && !conversation.sendingImage, icon = Lucide.X)
                 }
             }
-            if (!conversation.outgoing && conversation.mode == ConversationMode.HUMAN_HANDOVER) {
-                Action("恢复 AI", { run({ runtime.resumeAi(conversation.conversationId) }) }, enabled = !busy)
-            }
-            if (confirmEnd) {
-                Action("确认结束", { run({ runtime.endConversation(conversation.conversationId) }) }, enabled = !busy, icon = Lucide.X)
-                Action("取消", { confirmEnd = false }, enabled = !busy)
-            } else {
-                Action("结束聊天", { confirmEnd = true }, enabled = !busy, icon = Lucide.X)
+            val pickImage: (() -> Unit)? = if (conversation.canSendImage && uri == null) ({
+                try { picker.launch(tunnelImageTypes) } catch (_: android.content.ActivityNotFoundException) {
+                    failure = "无法打开图片选择器。"
+                }
+            }) else null
+            TunnelComposer(draft, busy, conversation.connected, pickImage, canPickImage = !conversation.sendingImage) {
+                val text = draft.text.toString().trim()
+                if (text.isNotBlank() && text.length <= tunnelDraftLimit) run({
+                    if (conversation.outgoing) runtime.sendText(conversation.conversationId, text)
+                    else runtime.sendHumanFormalText(conversation.conversationId, text)
+                }, { draft.setTextAndPlaceCursorAtEnd("") })
             }
         }
     }
+}
+
+@Composable
+private fun TunnelConversationHeader(
+    conversation: TunnelChatConversationSnapshot, onBack: () -> Unit, onMenu: () -> Unit,
+    menu: @Composable () -> Unit,
+) {
+    val colors = MiuixTheme.colorScheme
+    val tint = when {
+        conversation.connected -> LocalStatusColor.current
+        conversation.connecting -> colors.primary
+        else -> colors.onSurfaceVariantSummary
+    }
+    Row(Modifier.fillMaxWidth().heightIn(min = 64.dp).padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+        LibraryIcon(Lucide.ChevronLeft, "返回会话", onBack)
+        Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(if (conversation.outgoing) "公开端点" else "访客", Modifier.semantics { heading() },
+                    fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+                Spacer(Modifier.size(7.dp).background(tint, CircleShape))
+            }
+            Text(listOfNotNull(conversation.remoteEndpointId.takeLast(8), conversation.connectionLabel, conversation.receptionLabel)
+                .joinToString(" · "), fontSize = 12.sp, lineHeight = 17.sp, color = colors.onSurfaceVariantSummary,
+                textAlign = TextAlign.Center)
+        }
+        Box {
+            LibraryIcon(Lucide.Ellipsis, "会话操作", onMenu)
+            menu()
+        }
+    }
+}
+
+private val ChatMessage.timelineKey: String get() = "$senderEndpointId/$messageId"
+
+internal fun tunnelMessageStartsGroup(previous: Long?, current: Long, zone: ZoneId): Boolean {
+    if (previous == null || current - previous >= 5 * 60_000L) return true
+    return Instant.ofEpochMilli(previous).atZone(zone).toLocalDate() != Instant.ofEpochMilli(current).atZone(zone).toLocalDate()
+}
+
+@Composable
+private fun TunnelTimeline(runtime: TunnelChatRuntime, conversation: TunnelChatConversationSnapshot, modifier: Modifier) {
+    val messages = remember(conversation.messages) { conversation.messages.takeLast(40).asReversed() }
+    val state = rememberLazyListState()
+    val latest = messages.firstOrNull()?.timelineKey
+    LaunchedEffect(latest) {
+        // 列表在插入消息后可能暂时保留上一条为首项；读历史时不拉回到底部。
+        if (latest != null && state.firstVisibleItemIndex <= 1 && state.firstVisibleItemScrollOffset == 0) state.scrollToItem(0)
+    }
+    val zone = ZoneId.systemDefault()
+    val today = LocalDate.now(zone)
+    BoxWithConstraints(modifier.fillMaxWidth()) {
+        val bubbleWidth = minOf(maxWidth * 0.78f, 440.dp)
+        LazyColumn(Modifier.fillMaxSize(), state = state, reverseLayout = true,
+            contentPadding = PaddingValues(top = 24.dp, bottom = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp, Alignment.Top)) {
+            items(messages.size, key = { messages[it].timelineKey }) { index ->
+                val message = messages[index]
+                val time = conversationTime(message.createdAt, zone, today)
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (tunnelMessageStartsGroup(messages.getOrNull(index + 1)?.createdAt, message.createdAt, zone)) {
+                        TunnelTimelineNote(time)
+                    }
+                    TunnelMessageBubble(runtime, message, own = message.senderEndpointId != conversation.remoteEndpointId,
+                        time = time, maxWidth = bubbleWidth)
+                }
+            }
+            item(key = "status") {
+                TunnelTimelineNote(when {
+                    conversation.connected && conversation.outgoing -> "已连接至公开端点"
+                    conversation.connected -> "已连接访客"
+                    else -> conversation.connectionLabel
+                }, pill = true)
+            }
+        }
+    }
+}
+
+@Composable
+private fun TunnelTimelineNote(text: String, pill: Boolean = false) {
+    val colors = MiuixTheme.colorScheme
+    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+        Text(text, modifier = if (pill) Modifier.border(1.dp, colors.outline, CircleShape)
+            .padding(horizontal = 12.dp, vertical = 5.dp) else Modifier,
+            fontSize = 12.sp, lineHeight = 17.sp, color = colors.onSurfaceVariantSummary, textAlign = TextAlign.Center)
+    }
+}
+
+@Composable
+private fun TunnelMessageBubble(runtime: TunnelChatRuntime, message: ChatMessage, own: Boolean, time: String,
+    maxWidth: Dp,
+) {
+    val colors = MiuixTheme.colorScheme
+    val text = message.payload.optString("text").ifBlank {
+        message.payload.optJSONObject("attachment")?.optString("name")?.let { "附件：$it" } ?: message.kind.wireName
+    }
+    if (message.kind == ChatMessageKind.CONVERSATION_EVENT) {
+        TunnelTimelineNote(text, pill = true)
+        return
+    }
+    val suggestion = message.kind == ChatMessageKind.AI_SUGGESTION
+    val sent = own && !suggestion
+    val dark = colors.background.luminance() < 0.5f
+    val fill = when {
+        suggestion -> colors.secondary
+        sent && dark -> colors.secondary
+        sent -> colors.onSurface
+        else -> colors.surfaceVariant
+    }
+    val shape = RoundedCornerShape(14.dp)
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp, if (sent) Alignment.End else Alignment.Start)) {
+        if (!sent) Box(Modifier.size(32.dp).background(colors.secondary, CircleShape), contentAlignment = Alignment.Center) {
+            if (message.senderRole == ChatSenderRole.AI) Text("AI", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+            else Icon(Lucide.UserRound, contentDescription = if (message.senderRole == ChatSenderRole.VISITOR) "访客" else "人工",
+                modifier = Modifier.size(16.dp), tint = colors.onSurfaceVariantSummary)
+        }
+        Column(Modifier.widthIn(max = maxWidth), horizontalAlignment = if (sent) Alignment.End else Alignment.Start) {
+            Column(Modifier.background(fill, shape)
+                .then(if (!sent || dark) Modifier.border(1.dp, colors.outline, shape) else Modifier)
+                .padding(horizontal = 12.dp, vertical = 10.dp)) {
+                if (suggestion) Text("AI 内部建议", fontSize = 12.sp, color = colors.onSurfaceVariantSummary)
+                if (message.kind == ChatMessageKind.IMAGE) TunnelImage(runtime, message)
+                else Text(text, fontSize = 15.sp, lineHeight = 22.sp,
+                    color = if (sent && !dark) colors.background else colors.onSurface)
+            }
+            if (sent) Text(if (message.senderRole == ChatSenderRole.AI) "AI · $time" else time,
+                Modifier.padding(top = 4.dp), fontSize = 12.sp, color = colors.onSurfaceVariantSummary)
+        }
+    }
+}
+
+private const val tunnelDraftLimit = 4_000
+
+@Composable
+private fun TunnelComposer(draft: TextFieldState, busy: Boolean, connected: Boolean,
+    pickImage: (() -> Unit)?, canPickImage: Boolean, onSend: () -> Unit,
+) {
+    val colors = MiuixTheme.colorScheme
+    val shape = RoundedCornerShape(28.dp)
+    val text = draft.text.trim()
+    val tooLong = text.length > tunnelDraftLimit
+    val enabled = !busy && text.isNotEmpty() && !tooLong
+    var focused by remember { mutableStateOf(false) }
+    val hint = if (connected) "发送消息" else "离线 · 排队发送"
+    val issue = "消息不能超过 $tunnelDraftLimit 个字符。"
+    Row(Modifier.fillMaxWidth().background(colors.surfaceContainerHigh, shape)
+        .border(if (focused || tooLong) 2.dp else 1.dp, when {
+            tooLong -> colors.error
+            focused -> colors.primary
+            else -> colors.outline
+        }, shape).padding(horizontal = 4.dp, vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+        if (pickImage != null) LibraryIcon(Lucide.ImagePlus, "选择图片", pickImage, enabled = canPickImage && !busy, iconSize = 18)
+        val style = TextStyle(fontSize = 15.sp, lineHeight = 22.sp, color = colors.onSurface)
+        BasicTextField(state = draft, readOnly = busy, textStyle = style, cursorBrush = SolidColor(colors.primary),
+            modifier = Modifier.weight(1f).heightIn(min = 48.dp)
+                .onFocusChanged { focused = it.isFocused }.semantics {
+                    contentDescription = "消息"
+                    if (tooLong) error(issue)
+                }, lineLimits = TextFieldLineLimits.MultiLine(maxHeightInLines = 4),
+            decorator = TextFieldDecorator { inner ->
+                Box(Modifier.padding(start = if (pickImage == null) 12.dp else 2.dp, end = 4.dp, top = 9.dp, bottom = 9.dp),
+                    contentAlignment = Alignment.CenterStart) {
+                    if (draft.text.isEmpty()) Text(hint, fontSize = style.fontSize, lineHeight = style.lineHeight,
+                        color = colors.onSurfaceVariantSummary)
+                    inner()
+                }
+            })
+        var buttonFocused by remember { mutableStateOf(false) }
+        val tint = if (enabled) colors.background else colors.onSurfaceVariantSummary
+        Button(onClick = onSend, enabled = enabled, modifier = Modifier.size(48.dp).onFocusChanged { buttonFocused = it.isFocused }
+            .border(2.dp, if (buttonFocused) colors.primary else Color.Transparent, CircleShape),
+            minWidth = 48.dp, minHeight = 48.dp, cornerRadius = 24.dp, insideMargin = PaddingValues(0.dp),
+            indication = remember(tint) { MiuixIndication(tint) }, colors = ButtonDefaults.buttonColors(
+                color = Color.Transparent, disabledColor = Color.Transparent)) {
+            Box(Modifier.size(36.dp).background(if (enabled) colors.onSurface else colors.secondary, CircleShape),
+                contentAlignment = Alignment.Center) {
+                Icon(Lucide.ArrowUp, if (connected) "发送消息" else "排队发送", modifier = Modifier.size(20.dp), tint = tint)
+            }
+        }
+    }
+    if (tooLong) Text(issue, Modifier.padding(start = 12.dp), fontSize = 12.sp, color = colors.error)
 }
 
 @Composable
