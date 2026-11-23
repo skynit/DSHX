@@ -15,7 +15,7 @@
 
 ## 开发环境与命令
 
-需要 JDK 17、Android SDK 36、NDK `28.2.13676358`、CMake `3.22.1`、Python 3.11+、Node/npm、curl、dpkg-deb、readelf 和 Node N-API 头文件（构建脚本使用 `/usr/include/node/node_api.h`）。Gradle Wrapper、Android 构建插件及 Kotlin 版本由仓库配置固定；可通过 `ANDROID_NDK_HOME` 指定运行包编译所用 NDK。
+需要 JDK 17、Android SDK 36、NDK `28.2.13676358`、CMake `3.22.1`、Go 1.26+、Python 3.11+、Node/npm、curl、dpkg-deb、readelf 和 Node N-API 头文件（构建脚本使用 `/usr/include/node/node_api.h`）。Gradle Wrapper、Android 构建插件及 Kotlin 版本由仓库配置固定；可通过 `ANDROID_NDK_HOME` 指定运行包编译所用 NDK。Android 构建会用锁定的 Go Mobile 工具打包聊天 QUIC 库，安装应用不需要 Go。
 
 在仓库根目录执行：
 

@@ -267,76 +267,6 @@ class CoreTest {
         assertTrue(tunnelMessageStartsGroup(midnight - 1, midnight, zone))
     }
 
-    @Test fun tunnelImageTransfersMultipleWindowsBeforeConfirmingDelivery() {
-        val first = mutableListOf<JSONObject>()
-        val second = mutableListOf<JSONObject>()
-        // 标准 Base64 会把这一段编码成斜杠，JSON 转义仍不能让帧越过限制。
-        val bytes = ByteArray(233_001) { if (it < 12_000) -1 else (it % 251).toByte() }
-        val attachment = ChatAttachment("photo", "photo.png", "image/png", bytes.size.toLong(),
-            java.security.MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) })
-        val message = ChatMessage("photo", "chat", 1, ChatSenderRole.VISITOR, "visitor", ChatMessageKind.IMAGE,
-            1_700_000_000_000, payload = JSONObject().put("attachment", attachment.toJson()))
-        val root = java.nio.file.Files.createTempDirectory("tunnel-image").toFile()
-        try {
-            val source = File(root, "source").apply { writeBytes(bytes) }
-            val target = File(root, "target")
-            val delivered = mutableListOf<Boolean>()
-            val sender = TunnelImageTransfer({ first.add(it) }, { _, _ -> false }, { _, success -> delivered.add(success) })
-            val receiver = TunnelImageTransfer({ second.add(it) }, { _, file ->
-                assertArrayEquals(bytes, file.readBytes())
-                true
-            }, { _, _ -> error("接收方不应收到发送结果") })
-            sender.start(message, source)
-            receiver.accept(ChatMessage.fromJson(first.removeAt(0)), target)
-            assertTrue(delivered.isEmpty())
-            var windows = 0
-            while (second.isNotEmpty()) {
-                sender.handle(second.removeAt(0))
-                if (first.isNotEmpty()) windows++
-                while (first.isNotEmpty()) {
-                    val chunk = first.removeAt(0)
-                    assertTrue(chunk.toString().toByteArray().size <= 16 * 1024)
-                    receiver.handle(chunk)
-                }
-            }
-            assertTrue(windows > 1)
-            assertEquals(listOf(true), delivered)
-        } finally {
-            root.deleteRecursively()
-        }
-    }
-
-    @Test fun tunnelImageRejectsCorruptContentAndClearsPartialFilesOnClose() {
-        val source = folder.newFile().apply { writeBytes(byteArrayOf(1, 2, 3)) }
-        val chat = TunnelConversation("chat", "https://test.invalid", "host", "visitor", visitor = false, verified = true)
-        val att = ChatAttachment("photo", "photo.png", "image/png", 3,
-            "039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81")
-        val message = ChatMessage("photo", chat.id, 1, ChatSenderRole.VISITOR, "visitor", ChatMessageKind.IMAGE,
-            1_700_000_000_000, payload = JSONObject().put("attachment", att.toJson()))
-        val images = TunnelImageFiles(folder.newFolder())
-        val outgoing = mutableListOf<JSONObject>()
-        val incoming = mutableListOf<JSONObject>()
-        val delivered = mutableListOf<Boolean>()
-        val sender = TunnelImageTransfer({ outgoing.add(it) }, { _, _ -> false }, { _, ok -> delivered.add(ok) })
-        val receiver = TunnelImageTransfer({ incoming.add(it) }, { _, _ -> fail("摘要不符不能进入接收历史"); false }, { _, _ -> })
-        sender.start(message, source)
-        val partial = images.reserve(chat, message)
-        receiver.accept(ChatMessage.fromJson(outgoing.removeAt(0)), partial)
-        sender.handle(incoming.removeAt(0))
-        receiver.handle(outgoing.removeAt(0).put("data", "BAUG"))
-        sender.handle(incoming.removeAt(0))
-        assertEquals(listOf(false), delivered)
-        assertFalse(partial.exists())
-
-        sender.start(message, source)
-        val interrupted = images.reserve(chat, message)
-        receiver.accept(ChatMessage.fromJson(outgoing.removeAt(0)), interrupted)
-        receiver.close()
-        sender.close()
-        assertFalse(interrupted.exists())
-        assertEquals(listOf(false, false), delivered)
-    }
-
     @GraphicsMode(GraphicsMode.Mode.NATIVE)
     @Test fun tunnelImageReadsRealPngAndKeepsItOutOfAiReception() {
         val files = TunnelImageFiles(folder.newFolder())
@@ -347,6 +277,9 @@ class CoreTest {
         }
         val (source, attachment) = files.prepare(output.toByteArray().inputStream(), "photo")
         assertEquals("image/png", attachment.mimeType)
+        assertTrue(TunnelImageFiles.matches(source, attachment))
+        assertFalse(TunnelImageFiles.matches(source, attachment.copy(sha256 = "0".repeat(64))))
+        assertFalse(TunnelImageFiles.matches(source, attachment.copy(mimeType = "image/webp")))
         assertThrows(IllegalStateException::class.java) { files.prepare(byteArrayOf(1, 2, 3).inputStream(), "invalid") }
         val chat = TunnelConversation("chat", "https://test.invalid", "host", "visitor", visitor = false, verified = true)
         val message = ChatMessage("photo", chat.id, 1, ChatSenderRole.VISITOR, "visitor", ChatMessageKind.IMAGE,
@@ -372,47 +305,41 @@ class CoreTest {
         assertEquals(ChatMessageKind.IMAGE, record.inbox.single().message?.kind)
     }
 
-    @Test fun tunnelImageRetryCanConfirmWithoutResendingBytesAndHistorySurvivesRestart() {
-        val frames = mutableListOf<JSONObject>()
-        val results = mutableListOf<Boolean>()
+    @Test fun tunnelImageConfirmationPreservesHistoryAndEntersHandover() {
         val settings = TunnelChatSettings(endpointId = "host")
         val chat = TunnelConversation("chat", settings.platformOrigin, "host", "visitor", visitor = false, verified = true)
         val path = folder.newFolder().resolve("queue")
         val cipher = FixedTunnelChatQueueCipher(ByteArray(32))
         val queue = TunnelChatQueueStore(path, cipher) { settings }
         queue.save(chat)
-        val source = folder.newFile().apply { writeBytes(byteArrayOf(1, 2, 3)) }
-        val att = ChatAttachment("photo", "photo.png", "image/png", 3, "a".repeat(64))
+        val attachment = ChatAttachment("photo", "photo.png", "image/png", 3, "a".repeat(64))
         val message = ChatMessage("photo", chat.id, 1, ChatSenderRole.ENDPOINT_USER, "host", ChatMessageKind.IMAGE,
-            System.currentTimeMillis(), payload = JSONObject().put("attachment", att.toJson()))
-        val sender = TunnelImageTransfer({ frames.add(it) }, { _, _ -> false }, { image, delivered ->
-            results.add(delivered)
-            if (delivered) queue.confirmSentImage(chat, image)
-        })
-        val receiver = TunnelImageTransfer({ sender.handle(it) }, { _, _ -> false }, { _, _ -> })
-        sender.start(message, source)
-        val first = ChatMessage.fromJson(frames.removeAt(0))
-        sender.expire(System.nanoTime() + TimeUnit.MINUTES.toNanos(1))
+            System.currentTimeMillis(), payload = JSONObject().put("attachment", attachment.toJson()))
         assertEquals(ConversationMode.AI, queue.conversation(chat.id, chat.platformOrigin, chat.localEndpointId)?.mode)
-        sender.start(message, source)
-        val retry = ChatMessage.fromJson(frames.removeAt(0))
-        assertEquals(first.messageId, retry.messageId)
-        receiver.confirm(retry)
-        assertTrue(frames.isEmpty())
-        assertEquals(listOf(false, true), results)
-
+        queue.confirmSentImage(chat, message)
         val reopened = TunnelChatQueueStore(path, cipher) { settings }
         val saved = checkNotNull(reopened.conversation(chat.id, chat.platformOrigin, chat.localEndpointId))
         assertEquals(ConversationMode.HUMAN_HANDOVER, saved.mode)
         assertEquals(message.messageId, saved.sentImages.single().messageId)
     }
 
-    @Test fun tunnelChatProofMatchesOnlyTheExpectedPeerAndNegotiation() {
+    @Test fun tunnelImageReservesDiskQuotaBeforeReceivingBytes() {
+        val files = TunnelImageFiles(folder.newFolder())
+        val chat = TunnelConversation("chat", "https://test.invalid", "host", "visitor", visitor = false, verified = true)
+        val max = TunnelChatProtocol.MAX_IMAGE_BYTES
+        val reserved = List(10) { files.reserve(chat, max) }
+        assertTrue(reserved.all { it.length() == max })
+        assertThrows(IllegalStateException::class.java) { files.reserve(chat, 1) }
+        assertTrue(reserved.first().delete())
+        assertEquals(1, files.reserve(chat, 1).length())
+    }
+
+    @Test fun tunnelChatTokenMatchesOnlyTheExpectedPeerRoleAndConnection() {
         fun identity(): TunnelEndpointIdentity {
             val pair = java.security.KeyPairGenerator.getInstance("EC").apply { initialize(256) }.generateKeyPair()
             return object : TunnelEndpointIdentity {
                 override val publicKey = pair.public.encoded
-                override val endpointId = TunnelPeerHandshake.endpointId(publicKey)
+                override val endpointId = tunnelEndpointId(publicKey)
                 override fun sign(value: ByteArray): ByteArray = java.security.Signature.getInstance("SHA256withECDSA").run {
                     initSign(pair.private); update(value); sign()
                 }
@@ -420,21 +347,19 @@ class CoreTest {
         }
         val alice = identity()
         val bob = identity()
-        fun handshake(remote: TunnelEndpointIdentity, outgoing: Boolean, sdp: String = "answer") =
-            TunnelPeerHandshake(remote.endpointId, "conversation", outgoing).apply { offer = "offer"; answer = sdp }
-        val sender = handshake(bob, true)
-        val receiver = handshake(alice, false)
-        val outbound = checkNotNull(sender.prove(receiver.hello(), alice))
-        val inbound = checkNotNull(receiver.prove(sender.hello(), bob))
-        assertTrue(sender.verify(inbound, alice))
-        assertTrue(receiver.verify(outbound, bob))
-        receiver.answer = "changed-sdp"
-        assertFalse(receiver.verify(outbound, bob))
-        receiver.answer = "answer"
-        assertFalse(receiver.verify(outbound, identity()))
-        val nextConnection = handshake(alice, false)
-        nextConnection.prove(sender.hello(), bob)
-        assertFalse(nextConnection.verify(outbound, bob))
+        val sender = TunnelPeerToken(alice, bob.endpointId, "session", "chat", true)
+        val receiver = TunnelPeerToken(bob, alice.endpointId, "session", "chat", false)
+        val binding = ByteArray(32) { 42 }
+        val outbound = sender.sign(binding)
+        val inbound = receiver.sign(binding)
+        assertTrue(sender.verify(binding, inbound))
+        assertTrue(receiver.verify(binding, outbound))
+        assertFalse(receiver.verify(ByteArray(32) { 43 }, outbound))
+        assertFalse(receiver.verify(binding, inbound))
+        assertFalse(receiver.verify(binding, outbound + ".extra"))
+        assertFalse(TunnelPeerToken(bob, alice.endpointId, "other-session", "chat", false).verify(binding, outbound))
+        assertFalse(TunnelPeerToken(bob, alice.endpointId, "session", "other-chat", false).verify(binding, outbound))
+        assertFalse(TunnelPeerToken(bob, identity().endpointId, "session", "chat", false).verify(binding, outbound))
     }
 
     @Test fun tunnelSignalingRegisterSendsNoEndpointEnvelopeAndChecksRouteReceipt() {

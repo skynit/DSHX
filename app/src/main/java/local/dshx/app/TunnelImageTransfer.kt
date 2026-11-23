@@ -5,12 +5,9 @@ import android.graphics.BitmapFactory
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
-import java.io.IOException
 import java.io.InputStream
 import java.io.RandomAccessFile
 import java.security.MessageDigest
-import java.util.Base64
-import java.util.concurrent.TimeUnit
 
 internal val tunnelImageTypes = arrayOf("image/jpeg", "image/png", "image/webp")
 
@@ -21,150 +18,6 @@ internal fun ChatMessage.imageAttachment(): ChatAttachment = ChatAttachment.from
 private fun ByteArray.hex() = joinToString("") { "%02x".format(it) }
 private fun String.fileKey() = MessageDigest.getInstance("SHA-256").digest(toByteArray(Charsets.UTF_8)).hex()
 
-/** 每条已验签连接双向各一张；接收方每写完一组才请求下一组。 */
-internal class TunnelImageTransfer(
-    private val send: (JSONObject) -> Boolean,
-    private val received: (ChatMessage, File) -> Boolean,
-    private val sent: (ChatMessage, Boolean) -> Unit,
-) {
-    private class Incoming(val message: ChatMessage, val file: File, val size: Long) {
-        val hash: MessageDigest = MessageDigest.getInstance("SHA-256")
-        var offset = 0L
-        var touched = System.nanoTime()
-    }
-
-    private class Outgoing(val message: ChatMessage, val file: File, val size: Long) {
-        var offset = 0L
-        var touched = System.nanoTime()
-    }
-
-    private var incoming: Incoming? = null
-    private var outgoing: Outgoing? = null
-    val sending: Boolean get() = outgoing != null
-    val receiving: Boolean get() = incoming != null
-
-    fun start(message: ChatMessage, source: File) {
-        check(!sending) { "上一张图片还在发送。" }
-        val size = message.imageAttachment().size
-        require(source.length() == size) { "图片内容不可用。" }
-        outgoing = Outgoing(message, source, size)
-        if (!transmit(message.toJson())) finishSend(false)
-    }
-
-    fun accept(message: ChatMessage, target: File) {
-        check(!receiving)
-        val size = message.imageAttachment().size
-        incoming = Incoming(message, target, size)
-        if (!transmit(frame("image_next", message).put("offset", 0L))) discardIncoming()
-    }
-
-    fun reject(message: ChatMessage) { transmit(frame("image_failed", message)) }
-
-    fun confirm(message: ChatMessage) { transmit(frame("image_done", message)) }
-
-    fun handle(value: JSONObject): Boolean {
-        val id = value.optString("messageId")
-        when (TunnelChatProtocol.frameType(value)) {
-            "image_chunk" -> incoming?.takeIf { it.message.messageId == id }?.let { writeChunk(it, value) }
-            "image_next" -> outgoing?.takeIf { it.message.messageId == id }?.let { writeWindow(it, value.optLong("offset", -1)) }
-            "image_failed" -> if (outgoing?.message?.messageId == id) finishSend(false)
-            "image_done" -> if (outgoing?.message?.messageId == id) finishSend(true)
-            else -> return false
-        }
-        return true
-    }
-
-    fun expire(now: Long = System.nanoTime()) {
-        incoming?.takeIf { now - it.touched >= TIMEOUT }?.let { failIncoming(it.message) }
-        outgoing?.takeIf { now - it.touched >= TIMEOUT }?.let { finishSend(false) }
-    }
-
-    fun close() {
-        discardIncoming()
-        finishSend(false)
-    }
-
-    private fun writeWindow(transfer: Outgoing, offset: Long) {
-        if (offset != transfer.offset || offset >= transfer.size) return
-        transfer.touched = System.nanoTime()
-        try {
-            RandomAccessFile(transfer.file, "r").use { input ->
-                input.seek(offset)
-                repeat(WINDOW_CHUNKS) {
-                    val size = minOf(transfer.size - transfer.offset, CHUNK_BYTES.toLong()).toInt()
-                    if (size == 0) return
-                    val bytes = ByteArray(size).also { input.readFully(it) }
-                    if (!transmit(frame("image_chunk", transfer.message).put("offset", transfer.offset)
-                            .put("data", Base64.getUrlEncoder().encodeToString(bytes)))) {
-                        finishSend(false)
-                        return
-                    }
-                    transfer.offset += size
-                }
-            }
-        } catch (_: IOException) { finishSend(false) }
-    }
-
-    private fun writeChunk(transfer: Incoming, value: JSONObject) {
-        val message = transfer.message
-        val success = runCatching {
-            val data = value.getString("data")
-            val size = minOf(transfer.size - transfer.offset, CHUNK_BYTES.toLong()).toInt()
-            require(value.getLong("offset") == transfer.offset && data.length == (size + 2) / 3 * 4)
-            val bytes = Base64.getUrlDecoder().decode(data)
-            require(bytes.size == size)
-            RandomAccessFile(transfer.file, "rw").use { output ->
-                output.seek(transfer.offset)
-                output.write(bytes)
-                if (transfer.offset + size == transfer.size) output.fd.sync()
-            }
-            transfer.hash.update(bytes)
-            transfer.offset += size
-            transfer.touched = System.nanoTime()
-            when {
-                transfer.offset == transfer.size -> {
-                    check(transfer.hash.digest().hex() == message.imageAttachment().sha256 && received(message, transfer.file))
-                    discardIncoming()
-                    confirm(message)
-                }
-                transfer.offset % (CHUNK_BYTES * WINDOW_CHUNKS) == 0L ->
-                    check(transmit(frame("image_next", message).put("offset", transfer.offset)))
-                else -> Unit
-            }
-        }.isSuccess
-        if (!success) failIncoming(message)
-    }
-
-    private fun failIncoming(message: ChatMessage) {
-        discardIncoming()
-        reject(message)
-    }
-
-    private fun discardIncoming() {
-        incoming?.file?.delete()
-        incoming = null
-    }
-
-    private fun finishSend(success: Boolean) {
-        val message = outgoing?.message ?: return
-        outgoing = null
-        sent(message, success)
-    }
-
-    private fun frame(type: String, message: ChatMessage) = JSONObject()
-        .put("protocol", TunnelChatProtocol.CHAT).put("type", type).put("messageId", message.messageId)
-
-    private fun transmit(frame: JSONObject): Boolean = try { send(frame) } catch (_: RuntimeException) { false }
-
-    private companion object {
-        // Base64 和 JSON 字段计入帧长度，仍低于 16 KiB。
-        const val CHUNK_BYTES = 11 * 1024
-        const val WINDOW_CHUNKS = 12
-        val TIMEOUT: Long = TimeUnit.SECONDS.toNanos(30)
-    }
-}
-
-/** 只用本地会话和消息的摘要作路径，不使用对端提供的文件名。 */
 internal class TunnelImageFiles(private val root: File) {
     private fun folder(chat: TunnelConversation) = File(root,
         JSONArray(listOf(chat.platformOrigin, chat.localEndpointId, chat.remoteEndpointId, chat.id)).toString().fileKey())
@@ -201,9 +54,16 @@ internal class TunnelImageFiles(private val root: File) {
         }
     }
 
-    fun reserve(chat: TunnelConversation, message: ChatMessage): File {
+    fun store(chat: TunnelConversation, message: ChatMessage, source: File): File {
+        return move(source, file(chat, message))
+    }
+
+    fun stage(chat: TunnelConversation, message: ChatMessage, source: File): File {
+        return move(source, staged(chat, message))
+    }
+
+    fun reserve(chat: TunnelConversation, size: Long): File {
         val parent = folder(chat)
-        val size = message.imageAttachment().size
         checkSpace(parent, size)
         val part = File.createTempFile("receive-", ".part", parent.apply { mkdirs() })
         return try {
@@ -213,14 +73,6 @@ internal class TunnelImageFiles(private val root: File) {
             part.delete()
             throw error
         }
-    }
-
-    fun store(chat: TunnelConversation, message: ChatMessage, source: File): File {
-        return move(source, file(chat, message))
-    }
-
-    fun stage(chat: TunnelConversation, message: ChatMessage, source: File): File {
-        return move(source, staged(chat, message))
     }
 
     private fun move(source: File, target: File): File {
@@ -250,6 +102,20 @@ internal class TunnelImageFiles(private val root: File) {
 
     companion object {
         const val MAX_AGE = 7L * 24 * 60 * 60 * 1000
+
+        fun matches(file: File, attachment: ChatAttachment): Boolean {
+            if (file.length() != attachment.size) return false
+            val hash = MessageDigest.getInstance("SHA-256")
+            file.inputStream().use { input ->
+                val buffer = ByteArray(32 * 1024)
+                while (true) {
+                    val count = input.read(buffer)
+                    if (count < 0) break
+                    hash.update(buffer, 0, count)
+                }
+            }
+            return hash.digest().hex() == attachment.sha256 && imageMime(file) == attachment.mimeType
+        }
 
         fun imageMime(file: File): String? {
             val bounds = bounds(file)

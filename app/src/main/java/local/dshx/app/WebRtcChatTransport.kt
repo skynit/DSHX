@@ -1,6 +1,7 @@
 package local.dshx.app
 
 import android.content.Context
+import chatquic.Chatquic
 import org.webrtc.DataChannel
 import org.webrtc.IceCandidate
 import org.webrtc.MediaConstraints
@@ -23,14 +24,11 @@ sealed class WebRtcChatEvent {
     data class LocalAnswer(val sessionId: String, val remoteEndpointId: String, val sdp: String) : WebRtcChatEvent()
     data class LocalCandidate(val sessionId: String, val remoteEndpointId: String, val candidate: IceCandidate) : WebRtcChatEvent()
     data class StateChanged(val info: WebRtcChatSessionInfo) : WebRtcChatEvent()
-    data class Frame(val sessionId: String, val remoteEndpointId: String, val bytes: ByteArray, val binary: Boolean) : WebRtcChatEvent()
+    data class Frame(val sessionId: String, val bytes: ByteArray) : WebRtcChatEvent()
     data class Failed(val sessionId: String, val remoteEndpointId: String, val error: Throwable) : WebRtcChatEvent()
 }
 
-/**
- * WebRTC 只负责建立加密 DataChannel；上层必须继续使用 dshx-chat/1 JSON，
- * 不把平台信令消息或普通透明 HTTP 数据直接暴露给聊天层。
- */
+/** WebRTC 负责选路和传递数据报；QUIC 在通道上独立处理重传和流。 */
 class WebRtcChatTransport(
     context: Context,
     private val onEvent: (WebRtcChatEvent) -> Unit,
@@ -41,12 +39,6 @@ class WebRtcChatTransport(
     fun createOutgoing(sessionId: String, remoteEndpointId: String, iceServers: List<TunnelIceServer>, relayOnly: Boolean = false): WebRtcChatSessionInfo {
         require(sessionId.isNotBlank() && remoteEndpointId.isNotBlank()) { "WebRTC 会话和远端端点不能为空。" }
         val session = createSession(sessionId, remoteEndpointId, iceServers, relayOnly, initiator = true)
-        val init = DataChannel.Init().apply {
-            ordered = true
-            protocol = TunnelChatProtocol.CHAT
-        }
-        session.channel = session.peer.createDataChannel(TunnelChatProtocol.CHAT, init)
-        session.bindChannel(session.channel!!)
         session.peer.createOffer(session.sdpObserver("offer") { description ->
             session.peer.setLocalDescription(session.setObserver("set_local_offer") {
                 onEvent(WebRtcChatEvent.LocalOffer(sessionId, remoteEndpointId, description.description))
@@ -77,14 +69,7 @@ class WebRtcChatTransport(
         session.addCandidate(IceCandidate(sdpMid, sdpMLineIndex, candidate))
     }
 
-    fun send(sessionId: String, value: ByteArray, binary: Boolean = false): Boolean {
-        require(value.size <= TunnelChatProtocol.MAX_MESSAGE_BYTES) { "聊天帧过大。" }
-        val channel = sessions[sessionId]?.channel ?: return false
-        if (channel.state() != DataChannel.State.OPEN) return false
-        return channel.send(DataChannel.Buffer(ByteBuffer.wrap(value), binary))
-    }
-
-    fun sendJson(sessionId: String, value: org.json.JSONObject): Boolean = send(sessionId, value.toString().toByteArray(Charsets.UTF_8))
+    fun send(sessionId: String, value: ByteArray): Boolean = sessions[sessionId]?.send(value) == true
 
     internal fun readLink(sessionId: String, onResult: (TunnelChatLink?) -> Unit) {
         val session = sessions[sessionId] ?: return
@@ -130,12 +115,7 @@ class WebRtcChatTransport(
             override fun onIceCandidatesRemoved(candidates: Array<IceCandidate>) = Unit
             override fun onAddStream(stream: org.webrtc.MediaStream) = Unit
             override fun onRemoveStream(stream: org.webrtc.MediaStream) = Unit
-            override fun onDataChannel(channel: DataChannel) {
-                if (session.active() && channel.label() == TunnelChatProtocol.CHAT && session.channel == null) {
-                    session.channel = channel
-                    session.bindChannel(channel)
-                } else channel.dispose()
-            }
+            override fun onDataChannel(channel: DataChannel) = channel.dispose()
             override fun onRenegotiationNeeded() = Unit
             override fun onConnectionChange(state: PeerConnection.PeerConnectionState) {
                 when (state) {
@@ -148,6 +128,12 @@ class WebRtcChatTransport(
         val peer = factory.createPeerConnection(config, observer) ?: error("无法创建 WebRTC 对等连接。")
         session = Session(sessionId, remoteEndpointId, peer, initiator)
         check(sessions.putIfAbsent(sessionId, session) == null) { "WebRTC 会话编号已存在。" }
+        try {
+            session.openChannel()
+        } catch (error: Throwable) {
+            discardSession(sessionId)
+            throw error
+        }
         return session
     }
 
@@ -157,7 +143,8 @@ class WebRtcChatTransport(
         val peer: PeerConnection,
         val initiator: Boolean,
     ) {
-        @Volatile var channel: DataChannel? = null
+        private var channel: DataChannel? = null
+        private val channelLock = Any()
         private val disposed = AtomicBoolean()
         private var remoteDescriptionSet = false
         private val pendingCandidates = mutableListOf<IceCandidate>()
@@ -169,13 +156,37 @@ class WebRtcChatTransport(
 
         fun active() = !disposed.get() && sessions[sessionId] === this
 
+        fun send(value: ByteArray): Boolean = synchronized(channelLock) {
+            val openChannel = channel ?: return false
+            if (!active() || value.size !in 1..Chatquic.MaxDatagram || openChannel.state() != DataChannel.State.OPEN ||
+                openChannel.bufferedAmount() >= MAX_BUFFERED) return false
+            openChannel.send(DataChannel.Buffer(ByteBuffer.wrap(value), true))
+        }
+
         fun localCandidate(candidate: IceCandidate) = synchronized(localCandidates) {
             if (!active()) return@synchronized
             if (descriptionPublished) onEvent(WebRtcChatEvent.LocalCandidate(sessionId, remoteEndpointId, candidate))
             else if (localCandidates.size < 128) localCandidates += candidate
         }
 
-        fun bindChannel(channel: DataChannel) {
+        fun openChannel() {
+            // 双方提前约定通道编号，各自设置发送语义，不接受对端另开的通道。
+            val init = DataChannel.Init().apply {
+                negotiated = true
+                id = 0
+                ordered = false
+                maxRetransmits = 0
+                protocol = CHANNEL_LABEL
+            }
+            synchronized(channelLock) {
+                check(active()) { "WebRTC 会话已关闭。" }
+                val created = peer.createDataChannel(CHANNEL_LABEL, init) ?: error("无法创建聊天数据通道。")
+                channel = created
+                bindChannel(created)
+            }
+        }
+
+        private fun bindChannel(channel: DataChannel) {
             channel.registerObserver(object : DataChannel.Observer {
                 override fun onBufferedAmountChange(previousAmount: Long) = Unit
                 override fun onStateChange() {
@@ -186,13 +197,9 @@ class WebRtcChatTransport(
                     }
                 }
                 override fun onMessage(buffer: DataChannel.Buffer) {
-                    if (!active()) return
-                    if (buffer.data.remaining() > TunnelChatProtocol.MAX_MESSAGE_BYTES) {
-                        fail(IllegalArgumentException("入站聊天帧过大。"))
-                        return
-                    }
+                    if (!active() || !buffer.binary || buffer.data.remaining() !in 1..Chatquic.MaxDatagram) return
                     val bytes = ByteArray(buffer.data.remaining()).also { buffer.data.get(it) }
-                    onEvent(WebRtcChatEvent.Frame(sessionId, remoteEndpointId, bytes, buffer.binary))
+                    onEvent(WebRtcChatEvent.Frame(sessionId, bytes))
                 }
             })
             if (channel.state() == DataChannel.State.OPEN) emitState(WebRtcChatSessionInfo.State.CONNECTED)
@@ -258,13 +265,19 @@ class WebRtcChatTransport(
 
         fun disposeSilently() {
             if (!disposed.compareAndSet(false, true)) return
-            channel?.unregisterObserver()
-            channel?.close()
-            channel?.dispose()
+            val current = synchronized(channelLock) { channel.also { channel = null } }
+            current?.unregisterObserver()
+            current?.close()
+            current?.dispose()
             peer.close()
             peer.dispose()
             state = WebRtcChatSessionInfo.State.CLOSED
         }
+    }
+
+    private companion object {
+        const val CHANNEL_LABEL = "dshx-h3/1"
+        const val MAX_BUFFERED = 64 * 1024L
     }
 }
 

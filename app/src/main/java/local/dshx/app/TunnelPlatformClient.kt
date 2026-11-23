@@ -18,7 +18,6 @@ import java.security.KeyPairGenerator
 import java.security.KeyFactory
 import java.security.KeyStore
 import java.security.MessageDigest
-import java.security.SecureRandom
 import java.security.Signature
 import java.security.spec.ECGenParameterSpec
 import java.security.spec.X509EncodedKeySpec
@@ -86,7 +85,7 @@ class AndroidTunnelEndpointIdentity : TunnelEndpointIdentity {
     }
 
     override val publicKey: ByteArray get() = entry.certificate.publicKey.encoded
-    override val endpointId: String by lazy { TunnelPeerHandshake.endpointId(publicKey) }
+    override val endpointId: String by lazy { tunnelEndpointId(publicKey) }
 
     override fun sign(value: ByteArray): ByteArray = Signature.getInstance("SHA256withECDSA").run {
         initSign(entry.privateKey)
@@ -95,64 +94,50 @@ class AndroidTunnelEndpointIdentity : TunnelEndpointIdentity {
     }
 }
 
-/** DSHX 聊天身份独立于 CWNAS 信令路由。端点编号由公钥派生，签名绑定双方挑战及本次 SDP。 */
-internal class TunnelPeerHandshake(private val remoteId: String, private val session: String, private val initiator: Boolean,
-    private val conversation: String = session) {
-    private val nonce = encode(ByteArray(32).also(SecureRandom()::nextBytes))
-    private var remoteNonce: String? = null
-    var offer: String? = null
-    var answer: String? = null
+internal fun tunnelEndpointId(key: ByteArray): String {
+    val bytes = MessageDigest.getInstance("SHA-256").digest(key)
+    bytes[6] = ((bytes[6].toInt() and 0x0f) or 0x80).toByte()
+    bytes[8] = ((bytes[8].toInt() and 0x3f) or 0x80).toByte()
+    val buffer = ByteBuffer.wrap(bytes)
+    return UUID(buffer.long, buffer.long).toString()
+}
 
-    fun hello(): JSONObject = JSONObject().put("protocol", TunnelChatProtocol.CHAT).put("type", "hello").put("nonce", nonce)
-
-    fun prove(frame: JSONObject, identity: TunnelEndpointIdentity): JSONObject? {
-        val challenge = frame.optString("nonce")
-        if (remoteNonce != null || !challenge.matches(Regex("[A-Za-z0-9_-]{43}")) || decode(challenge).size != 32) return null
-        remoteNonce = challenge
-        val transcript = transcript(identity.endpointId, sending = true) ?: return null
-        return JSONObject().put("protocol", TunnelChatProtocol.CHAT).put("type", "proof")
-            .put("publicKey", encode(identity.publicKey)).put("signature", encode(identity.sign(transcript)))
+/** HTTP token 只携带公钥和签名；认证参数由双方从信令和当前 QUIC 连接独立取得。 */
+internal class TunnelPeerToken(
+    private val identity: TunnelEndpointIdentity,
+    private val remoteId: String,
+    private val sessionId: String,
+    private val conversationId: String,
+    private val initiator: Boolean,
+) {
+    fun sign(binding: ByteArray): String {
+        require(binding.size == 32)
+        return encode(identity.publicKey) + "." + encode(identity.sign(transcript(binding, initiator)))
     }
 
-    fun verify(frame: JSONObject, identity: TunnelEndpointIdentity): Boolean = runCatching {
-        val key = frame.getString("publicKey")
-        val signature = frame.getString("signature")
-        if (key.length !in 1..180 || signature.length !in 1..110) return false
-        val bytes = decode(key)
-        if (endpointId(bytes) != remoteId) return false
-        val transcript = transcript(identity.endpointId, sending = false) ?: return false
+    fun verify(binding: ByteArray, token: String): Boolean = runCatching {
+        if (binding.size != 32 || token.length !in 1..291) return false
+        val parts = token.split('.', limit = 3)
+        if (parts.size != 2 || parts[0].length !in 1..180 || parts[1].length !in 1..110) return false
+        val key = Base64.getUrlDecoder().decode(parts[0])
+        if (tunnelEndpointId(key) != remoteId) return false
+        val publicKey = KeyFactory.getInstance("EC").generatePublic(X509EncodedKeySpec(key)) as? java.security.interfaces.ECPublicKey
+            ?: return false
+        if (publicKey.params?.curve?.field?.fieldSize != 256) return false
         Signature.getInstance("SHA256withECDSA").run {
-            initVerify(KeyFactory.getInstance("EC").generatePublic(X509EncodedKeySpec(bytes)))
-            update(transcript)
-            verify(decode(signature))
+            initVerify(publicKey)
+            update(transcript(binding, !initiator))
+            verify(Base64.getUrlDecoder().decode(parts[1]))
         }
     }.getOrDefault(false)
 
-    private fun transcript(localId: String, sending: Boolean): ByteArray? {
-        val challenge = remoteNonce ?: return null
-        val offer = offer ?: return null
-        val answer = answer ?: return null
-        val signerIsInitiator = initiator == sending
-        return JSONArray(listOf(
-            "dshx-chat/1 proof", session, if (initiator) localId else remoteId, if (initiator) remoteId else localId,
-            if (initiator) nonce else challenge, if (initiator) challenge else nonce,
-            encode(hash(offer.toByteArray(Charsets.UTF_8))), encode(hash(answer.toByteArray(Charsets.UTF_8))), signerIsInitiator,
-        )).apply { if (conversation != session) put(conversation) }.toString().toByteArray(Charsets.UTF_8)
+    private fun transcript(binding: ByteArray, signerInitiator: Boolean): ByteArray {
+        val (client, server) = if (initiator) identity.endpointId to remoteId else remoteId to identity.endpointId
+        return JSONArray(listOf("dshx-h3/1 token", sessionId, conversationId, client, server, signerInitiator, encode(binding)))
+            .toString().toByteArray(Charsets.UTF_8)
     }
 
-    companion object {
-        private fun hash(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes)
-        private fun encode(bytes: ByteArray) = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
-        private fun decode(value: String) = Base64.getUrlDecoder().decode(value)
-
-        fun endpointId(key: ByteArray): String {
-            val bytes = hash(key)
-            bytes[6] = ((bytes[6].toInt() and 0x0f) or 0x80).toByte()
-            bytes[8] = ((bytes[8].toInt() and 0x3f) or 0x80).toByte()
-            val buffer = ByteBuffer.wrap(bytes)
-            return UUID(buffer.long, buffer.long).toString()
-        }
-    }
+    private fun encode(value: ByteArray) = Base64.getUrlEncoder().withoutPadding().encodeToString(value)
 }
 
 /**

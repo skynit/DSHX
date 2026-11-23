@@ -1,3 +1,4 @@
+import java.io.File
 import java.security.MessageDigest
 
 plugins {
@@ -9,6 +10,10 @@ plugins {
 val updateUrl = providers.gradleProperty("dshxUpdateUrl").orElse("http://47.119.120.17/dshx/latest.json")
 val buildCommit = providers.exec { commandLine("git", "rev-parse", "HEAD") }.standardOutput.asText.map { it.trim() }
 val buildDirty = providers.exec { commandLine("git", "status", "--porcelain") }.standardOutput.asText.map { it.isNotBlank() }
+val chatQuicDir = rootProject.layout.projectDirectory.dir("native/chatquic")
+val chatQuicTools = layout.buildDirectory.dir("chatQuic/tools")
+val chatQuicAar = layout.buildDirectory.file("chatQuic/chatquic.aar")
+val goVersion = providers.exec { commandLine("go", "version") }.standardOutput.asText
 
 android {
     ndkVersion = "28.2.13676358"
@@ -18,6 +23,7 @@ android {
         applicationId = "local.dshx.app"
         minSdk = 26
         targetSdk = 28
+        testInstrumentationRunner = "local.dshx.app.ChatQuicInstrumentation"
         versionCode = providers.gradleProperty("dshxVersionCode").orElse("9").get().toInt()
         versionName = providers.gradleProperty("dshxVersionName").orElse("0.3.2").get()
         resValue("string", "update_url", updateUrl.get())
@@ -64,7 +70,37 @@ tasks.matching { it.name == "preBuild" }.configureEach { dependsOn(prepareReleas
 
 kotlin { compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17) } }
 
+val buildChatQuicTools by tasks.registering(Exec::class) {
+    workingDir(chatQuicDir)
+    inputs.files(chatQuicDir.file("go.mod"), chatQuicDir.file("go.sum"))
+    inputs.property("goVersion", goVersion)
+    outputs.dir(chatQuicTools)
+    environment("GOBIN", chatQuicTools.get().asFile.absolutePath)
+    commandLine("go", "install", "golang.org/x/mobile/cmd/gobind", "golang.org/x/mobile/cmd/gomobile")
+}
+
+val buildChatQuic by tasks.registering(Exec::class) {
+    dependsOn(buildChatQuicTools)
+    workingDir(chatQuicDir)
+    inputs.files(fileTree(chatQuicDir) { include("*.go", "go.mod", "go.sum"); exclude("*_test.go") })
+    inputs.dir(chatQuicTools)
+    inputs.property("goVersion", goVersion)
+    outputs.file(chatQuicAar)
+    val tools = chatQuicTools.get().asFile
+    val sdk = androidComponents.sdkComponents.sdkDirectory.get().asFile
+    val ndk = sdk.resolve("ndk/${android.ndkVersion}")
+    inputs.file(ndk.resolve("source.properties"))
+    environment("ANDROID_HOME", sdk.absolutePath)
+    environment("ANDROID_NDK_HOME", ndk.absolutePath)
+    environment("PATH", tools.absolutePath + File.pathSeparator + System.getenv("PATH"))
+    commandLine(tools.resolve("gomobile"), "bind", "-target=android/arm64,android/amd64",
+        "-androidapi=26", "-trimpath", "-o", chatQuicAar.get().asFile, ".")
+}
+
+val chatQuicLibrary = files(chatQuicAar).builtBy(buildChatQuic)
+
 dependencies {
+    implementation(chatQuicLibrary)
     implementation("io.github.reandroid:ARSCLib:1.4.0")
     implementation("com.android.tools.build:apksig:8.5.2")
     implementation(files("libs/sherpa-onnx-1.13.2.aar"))
