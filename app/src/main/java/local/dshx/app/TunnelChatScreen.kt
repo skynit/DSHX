@@ -38,6 +38,7 @@ import androidx.compose.foundation.text.input.TextFieldLineLimits
 import androidx.compose.foundation.text.input.TextFieldState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -63,7 +64,9 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.compositeOver
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.error
@@ -90,7 +93,8 @@ import com.composables.icons.lucide.CircleHelp
 import com.composables.icons.lucide.Cloud
 import com.composables.icons.lucide.Compass
 import com.composables.icons.lucide.Ellipsis
-import com.composables.icons.lucide.ImagePlus
+import com.composables.icons.lucide.Download
+import com.composables.icons.lucide.Paperclip
 import com.composables.icons.lucide.Infinity
 import com.composables.icons.lucide.Lucide
 import com.composables.icons.lucide.MessagesSquare
@@ -407,24 +411,38 @@ private fun TunnelConversationPanel(
 ) {
     val scope = rememberCoroutineScope()
     val draft = rememberTextFieldState()
+    val view = LocalView.current
+    val transferring = conversation.sendingAttachment || conversation.receivingAttachment
+    DisposableEffect(view, transferring) {
+        val previous = view.keepScreenOn
+        if (transferring) view.keepScreenOn = true
+        onDispose { if (transferring) view.keepScreenOn = previous }
+    }
     var busy by remember { mutableStateOf(false) }
     var failure by remember { mutableStateOf<String?>(null) }
     var menu by remember { mutableStateOf(false) }
     var confirmEnd by remember { mutableStateOf(false) }
-    var selectedImage by rememberSaveable { mutableStateOf<Uri?>(null) }
-    var submittedImage by rememberSaveable { mutableStateOf<String?>(null) }
+    var selectedAttachment by rememberSaveable { mutableStateOf<Uri?>(null) }
+    var submittedAttachment by rememberSaveable { mutableStateOf<String?>(null) }
+    var exportMessage by rememberSaveable { mutableStateOf<String?>(null) }
+    var exportSender by rememberSaveable { mutableStateOf<String?>(null) }
+    val resolver = LocalContext.current.contentResolver
+    val selectedName by produceState<String?>(null, selectedAttachment, resolver) {
+        val uri = selectedAttachment
+        value = if (uri == null) null else withContext(Dispatchers.IO) { runCatching { resolver.attachmentName(uri) }.getOrNull() }
+    }
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) {
-            selectedImage = uri
-            submittedImage = null
+            selectedAttachment = uri
+            submittedAttachment = null
             failure = null
         }
     }
-    val delivery = conversation.imageDelivery?.takeIf { it.messageId == submittedImage }
+    val delivery = conversation.attachmentDelivery?.takeIf { it.messageId == submittedAttachment }
     LaunchedEffect(delivery) {
         if (delivery?.delivered == true) {
-            selectedImage = null
-            submittedImage = null
+            selectedAttachment = null
+            submittedAttachment = null
         }
     }
     fun run(action: () -> Unit, onSuccess: () -> Unit = {}) {
@@ -439,6 +457,15 @@ private fun TunnelConversationPanel(
             } finally {
                 busy = false
             }
+        }
+    }
+    val exportPicker = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
+        val id = exportMessage
+        val sender = exportSender
+        exportMessage = null
+        exportSender = null
+        if (uri != null && id != null && sender != null) {
+            run({ runtime.exportAttachment(conversation.conversationId, id, sender, uri) })
         }
     }
     Column(Modifier.fillMaxSize()) {
@@ -479,34 +506,50 @@ private fun TunnelConversationPanel(
             }
         }
         Divider()
-        TunnelTimeline(runtime, conversation, Modifier.weight(1f))
+        TunnelTimeline(runtime, conversation, Modifier.weight(1f), canExport = !busy && exportMessage == null) { message ->
+            val attachment = runCatching { message.attachment() }.getOrNull() ?: return@TunnelTimeline
+            try {
+                exportMessage = message.messageId
+                exportSender = message.senderEndpointId
+                exportPicker.launch(attachment.name)
+            } catch (_: android.content.ActivityNotFoundException) {
+                exportMessage = null
+                exportSender = null
+                failure = "无法打开文件保存选择器。"
+            }
+        }
         failure?.let { Text(it, Modifier.padding(bottom = 8.dp), fontSize = 13.sp, color = MiuixTheme.colorScheme.error) }
         if (!conversation.closed) Column(Modifier.fillMaxWidth().padding(bottom = 12.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            val uri = selectedImage
+            val uri = selectedAttachment
             if (uri != null) {
-                Note(when {
-                    conversation.sendingImage -> "正在发送图片…"
-                    delivery?.delivered == false -> "图片未确认送达，可重试。"
-                    !conversation.connected -> "连接后可发送图片。"
-                    else -> "已选择图片"
-                })
+                selectedName?.let { name ->
+                    Text(name, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+                val attachmentStatus = when {
+                    conversation.sendingAttachment -> "正在发送附件…"
+                    delivery?.delivered == false -> "附件未确认送达，可重试。"
+                    !conversation.connected -> "连接后可发送附件。"
+                    selectedName == null -> "已选择附件"
+                    else -> null
+                }
+                attachmentStatus?.let { Note(it) }
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Action("发送图片", {
+                    Action(if (delivery?.delivered == false) "重试发送" else "发送附件", {
                         var id: String? = null
-                        run({ id = runtime.sendImage(conversation.conversationId, uri, delivery?.takeUnless { it.delivered }?.messageId) },
-                            { submittedImage = id })
-                    }, enabled = !busy && conversation.canSendImage && !conversation.sendingImage, icon = Lucide.ImagePlus)
-                    Action("移除图片", { selectedImage = null; submittedImage = null; failure = null },
-                        enabled = !busy && !conversation.sendingImage, icon = Lucide.X)
+                        run({ id = runtime.sendAttachment(conversation.conversationId, uri, delivery?.takeUnless { it.delivered }?.messageId) },
+                            { submittedAttachment = id })
+                    }, enabled = !busy && conversation.canSendAttachment && !conversation.sendingAttachment, icon = Lucide.Paperclip)
+                    Action("移除附件", { selectedAttachment = null; submittedAttachment = null; failure = null },
+                        enabled = !busy && !conversation.sendingAttachment, icon = Lucide.X)
                 }
             }
-            val pickImage: (() -> Unit)? = if (conversation.canSendImage && uri == null) ({
-                try { picker.launch(tunnelImageTypes) } catch (_: android.content.ActivityNotFoundException) {
-                    failure = "无法打开图片选择器。"
+            val pickAttachment: (() -> Unit)? = if (conversation.canSendAttachment && uri == null) ({
+                try { picker.launch(tunnelAttachmentTypes) } catch (_: android.content.ActivityNotFoundException) {
+                    failure = "无法打开附件选择器。"
                 }
             }) else null
-            TunnelComposer(draft, busy, conversation.connected, pickImage, canPickImage = !conversation.sendingImage) {
+            TunnelComposer(draft, busy, conversation.connected, pickAttachment, canPickAttachment = !conversation.sendingAttachment) {
                 val text = draft.text.toString().trim()
                 if (text.isNotBlank() && text.length <= tunnelDraftLimit) run({
                     if (conversation.outgoing) runtime.sendText(conversation.conversationId, text)
@@ -654,7 +697,9 @@ internal fun tunnelMessageStartsGroup(previous: Long?, current: Long, zone: Zone
 }
 
 @Composable
-private fun TunnelTimeline(runtime: TunnelChatRuntime, conversation: TunnelChatConversationSnapshot, modifier: Modifier) {
+private fun TunnelTimeline(runtime: TunnelChatRuntime, conversation: TunnelChatConversationSnapshot, modifier: Modifier,
+    canExport: Boolean, onExport: (ChatMessage) -> Unit,
+) {
     val messages = remember(conversation.messages) { conversation.messages.takeLast(40).asReversed() }
     val state = rememberLazyListState()
     val latest = messages.firstOrNull()?.timelineKey
@@ -677,7 +722,7 @@ private fun TunnelTimeline(runtime: TunnelChatRuntime, conversation: TunnelChatC
                         TunnelTimelineNote(time)
                     }
                     TunnelMessageBubble(runtime, message, own = message.senderEndpointId != conversation.remoteEndpointId,
-                        time = time, maxWidth = bubbleWidth)
+                        time = time, maxWidth = bubbleWidth, canExport = canExport, onExport = { onExport(message) })
                 }
             }
             item(key = "status") {
@@ -703,7 +748,7 @@ private fun TunnelTimelineNote(text: String, pill: Boolean = false) {
 
 @Composable
 private fun TunnelMessageBubble(runtime: TunnelChatRuntime, message: ChatMessage, own: Boolean, time: String,
-    maxWidth: Dp,
+    maxWidth: Dp, canExport: Boolean, onExport: () -> Unit,
 ) {
     val colors = MiuixTheme.colorScheme
     val text = message.payload.optString("text").ifBlank {
@@ -734,9 +779,15 @@ private fun TunnelMessageBubble(runtime: TunnelChatRuntime, message: ChatMessage
                 .then(if (!sent || dark) Modifier.border(1.dp, colors.outline, shape) else Modifier)
                 .padding(horizontal = 12.dp, vertical = 10.dp)) {
                 if (suggestion) Text("AI 内部建议", fontSize = 12.sp, color = colors.onSurfaceVariantSummary)
-                if (message.kind == ChatMessageKind.IMAGE) TunnelImage(runtime, message)
-                else Text(text, fontSize = 15.sp, lineHeight = 22.sp,
-                    color = if (sent && !dark) colors.background else colors.onSurface)
+                val tint = if (sent && !dark) colors.background else colors.onSurface
+                when (message.kind) {
+                    ChatMessageKind.IMAGE -> TunnelImage(runtime, message)
+                    ChatMessageKind.FILE -> {
+                        Text(text, fontSize = 15.sp, lineHeight = 22.sp, color = tint, maxLines = 3, overflow = TextOverflow.Ellipsis)
+                        Action("保存文件", onExport, Modifier.padding(top = 8.dp), enabled = canExport, icon = Lucide.Download)
+                    }
+                    else -> Text(text, fontSize = 15.sp, lineHeight = 22.sp, color = tint)
+                }
             }
             if (sent) Text(if (message.senderRole == ChatSenderRole.AI) "AI · $time" else time,
                 Modifier.padding(top = 4.dp), fontSize = 12.sp, color = colors.onSurfaceVariantSummary)
@@ -748,7 +799,7 @@ private const val tunnelDraftLimit = 4_000
 
 @Composable
 private fun TunnelComposer(draft: TextFieldState, busy: Boolean, connected: Boolean,
-    pickImage: (() -> Unit)?, canPickImage: Boolean, onSend: () -> Unit,
+    pickAttachment: (() -> Unit)?, canPickAttachment: Boolean, onSend: () -> Unit,
 ) {
     val colors = MiuixTheme.colorScheme
     val shape = RoundedCornerShape(28.dp)
@@ -764,7 +815,7 @@ private fun TunnelComposer(draft: TextFieldState, busy: Boolean, connected: Bool
             focused -> colors.primary
             else -> colors.outline
         }, shape).padding(horizontal = 4.dp, vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
-        if (pickImage != null) LibraryIcon(Lucide.ImagePlus, "选择图片", pickImage, enabled = canPickImage && !busy, iconSize = 18)
+        if (pickAttachment != null) LibraryIcon(Lucide.Paperclip, "选择附件", pickAttachment, enabled = canPickAttachment && !busy, iconSize = 18)
         val style = TextStyle(fontSize = 15.sp, lineHeight = 22.sp, color = colors.onSurface)
         BasicTextField(state = draft, readOnly = busy, textStyle = style, cursorBrush = SolidColor(colors.primary),
             modifier = Modifier.weight(1f).heightIn(min = 48.dp)
@@ -773,7 +824,7 @@ private fun TunnelComposer(draft: TextFieldState, busy: Boolean, connected: Bool
                     if (tooLong) error(issue)
                 }, lineLimits = TextFieldLineLimits.MultiLine(maxHeightInLines = 4),
             decorator = TextFieldDecorator { inner ->
-                Box(Modifier.padding(start = if (pickImage == null) 12.dp else 2.dp, end = 4.dp, top = 9.dp, bottom = 9.dp),
+                Box(Modifier.padding(start = if (pickAttachment == null) 12.dp else 2.dp, end = 4.dp, top = 9.dp, bottom = 9.dp),
                     contentAlignment = Alignment.CenterStart) {
                     if (draft.text.isEmpty()) Text(hint, fontSize = style.fontSize, lineHeight = style.lineHeight,
                         color = colors.onSurfaceVariantSummary)

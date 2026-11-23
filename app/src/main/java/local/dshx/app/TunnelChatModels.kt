@@ -54,6 +54,8 @@ enum class ChatMessageKind {
     }
 }
 
+internal fun ChatMessageKind.isAttachment() = this == ChatMessageKind.IMAGE || this == ChatMessageKind.FILE
+
 enum class ConversationMode { AI, HUMAN_HANDOVER }
 
 /** 交给端点 AI 的请求；文本来自外部端点，只能作为不可信用户输入。 */
@@ -240,9 +242,10 @@ data class TunnelChatConversationSnapshot(
     val mode: ConversationMode,
     val aiRepliesSent: Int,
     val messages: List<ChatMessage>,
-    val canSendImage: Boolean = false,
-    val sendingImage: Boolean = false,
-    val imageDelivery: TunnelImageDelivery? = null,
+    val canSendAttachment: Boolean = false,
+    val sendingAttachment: Boolean = false,
+    val receivingAttachment: Boolean = false,
+    val attachmentDelivery: TunnelAttachmentDelivery? = null,
     val link: StateFlow<TunnelChatLink?>? = null,
 )
 
@@ -250,7 +253,7 @@ data class TunnelChatLink(val path: Path?, val roundTripMs: Long?) {
     enum class Path { DIRECT, RELAY }
 }
 
-data class TunnelImageDelivery(val messageId: String, val delivered: Boolean)
+data class TunnelAttachmentDelivery(val messageId: String, val delivered: Boolean)
 
 internal fun ChatMessage.isEnd() = kind == ChatMessageKind.CONVERSATION_EVENT && payload.optString("event") == "ended"
 
@@ -262,21 +265,19 @@ data class ChatAttachment(
     val sha256: String,
 ) {
     fun validate(): ChatAttachment {
+        val displayName = name.trim()
+        val type = mimeType.lowercase()
         require(attachmentId.matches(Regex("[A-Za-z0-9][A-Za-z0-9._:-]{0,127}"))) { "附件编号无效。" }
-        require(name.isNotBlank() && name.length <= 240 && !name.contains('\u0000') &&
-            !name.contains('/') && !name.contains('\\') && name != "." && name != "..") { "附件名称无效。" }
+        require(displayName.isNotEmpty() && name.length <= 240 && name.none { it.isISOControl() } &&
+            '/' !in name && '\\' !in name && displayName != "." && displayName != "..") { "附件名称无效。" }
         require(size >= 0) { "附件大小不能为负数。" }
         require(sha256.matches(Regex("[0-9a-fA-F]{64}"))) { "附件摘要无效。" }
-        val image = mimeType.lowercase() in tunnelImageTypes
-        val document = mimeType.lowercase() in setOf(
-            "application/pdf", "text/plain", "text/markdown",
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        )
-        require(image || document) { "附件类型不在聊天允许范围内。" }
+        val image = type in tunnelImageTypes
+        require(image || type in tunnelDocumentTypes) { "附件类型不在聊天允许范围内。" }
         require(size <= if (image) TunnelChatProtocol.MAX_IMAGE_BYTES else TunnelChatProtocol.MAX_DOCUMENT_BYTES) {
             "附件超过聊天大小限制。"
         }
-        return copy(name = name.trim(), mimeType = mimeType.lowercase(), sha256 = sha256.lowercase())
+        return copy(name = displayName, mimeType = type, sha256 = sha256.lowercase())
     }
 
     fun toJson(): JSONObject = JSONObject()
@@ -318,8 +319,7 @@ data class ChatMessage(
         when (kind) {
             ChatMessageKind.TEXT, ChatMessageKind.AI_FORMAL, ChatMessageKind.HUMAN_FORMAL, ChatMessageKind.AI_SUGGESTION ->
                 require(payload.optString("text").isNotEmpty()) { "文本消息不能为空。" }
-            ChatMessageKind.IMAGE -> imageAttachment()
-            ChatMessageKind.FILE -> ChatAttachment.fromJson(payload.getJSONObject("attachment"))
+            ChatMessageKind.IMAGE, ChatMessageKind.FILE -> attachment()
             else -> Unit
         }
     }

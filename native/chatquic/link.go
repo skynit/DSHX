@@ -41,31 +41,32 @@ type Peer interface {
 	Ready()
 	Frame(value string)
 	StillPending(id string) bool
-	ReserveImage(id string, metadata string, size int64) string
-	Image(id string, metadata string, path string) bool
-	ImageSent(id string, delivered bool)
+	ReserveAttachment(id string, metadata string, size int64) string
+	Attachment(id string, metadata string, path string) bool
+	AttachmentReceiveFinished(id string)
+	AttachmentSent(id string, delivered bool)
 	Finished(reason string)
 }
 
 type event struct {
-	Frame     json.RawMessage `json:"frame,omitempty"`
-	Image     *imageOffer     `json:"image,omitempty"`
-	pendingID string
+	Frame      json.RawMessage  `json:"frame,omitempty"`
+	Attachment *attachmentOffer `json:"attachment,omitempty"`
+	pendingID  string
 }
 
 // Link 持有一条 HTTP/3 连接。创建数据通道的一方发起请求，另一方通过 /events 发送消息。
 type Link struct {
-	initiator bool
-	peer      Peer
-	packets   *packetConn
-	ctx       context.Context
-	cancel    context.CancelFunc
-	start     sync.Once
-	closed    atomic.Bool
-	ready     atomic.Bool
-	out       chan event
-	images    imageTransfers
-	client    atomic.Pointer[http3.ClientConn]
+	initiator   bool
+	peer        Peer
+	packets     *packetConn
+	ctx         context.Context
+	cancel      context.CancelFunc
+	start       sync.Once
+	closed      atomic.Bool
+	ready       atomic.Bool
+	out         chan event
+	attachments attachmentTransfers
+	client      atomic.Pointer[http3.ClientConn]
 }
 
 func NewLink(initiator bool, peer Peer) *Link {
@@ -211,11 +212,11 @@ func (l *Link) runClient(conn *quic.Conn) error {
 			return errors.New("invalid HTTP/3 chat event")
 		}
 		switch {
-		case len(incoming.Frame) > 0 && len(incoming.Frame) <= maxFrame && incoming.Image == nil:
+		case len(incoming.Frame) > 0 && len(incoming.Frame) <= maxFrame && incoming.Attachment == nil:
 			l.peer.Frame(string(incoming.Frame))
-		case len(incoming.Frame) == 0 && incoming.Image != nil:
-			if incoming.Image.valid() && validTicket(incoming.Image.Ticket) {
-				l.download(client, *incoming.Image)
+		case len(incoming.Frame) == 0 && incoming.Attachment != nil:
+			if incoming.Attachment.valid() && validTicket(incoming.Attachment.Ticket) {
+				l.download(client, *incoming.Attachment)
 			}
 		default:
 			return errors.New("invalid HTTP/3 chat event")
@@ -338,9 +339,9 @@ func (l *Link) runServer(conn *quic.Conn) error {
 			handler(w, r)
 		}
 	}
-	mux.HandleFunc("POST /images/{id}", protected(l.receiveUpload))
-	mux.HandleFunc("GET /images/{id}", protected(l.serveDownload))
-	mux.HandleFunc("POST /images/{id}/receipt", protected(l.receiveReceipt))
+	mux.HandleFunc("POST /attachments/{id}", protected(l.receiveUpload))
+	mux.HandleFunc("GET /attachments/{id}", protected(l.serveDownload))
+	mux.HandleFunc("POST /attachments/{id}/receipt", protected(l.receiveReceipt))
 	server := &http3.Server{Handler: mux, MaxHeaderBytes: maxHeaders}
 	return server.ServeQUICConn(conn)
 }

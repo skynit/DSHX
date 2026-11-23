@@ -42,7 +42,7 @@ class ChatQuicInstrumentation : Instrumentation() {
         val identities = List(2) { testIdentity() }
         val ready = List(2) { LinkedBlockingQueue<Boolean>() }
         val frames = List(2) { LinkedBlockingQueue<String>() }
-        val images = List(2) { LinkedBlockingQueue<Pair<String, ByteArray>>() }
+        val attachments = List(2) { LinkedBlockingQueue<Pair<String, ByteArray>>() }
         val sent = List(2) { LinkedBlockingQueue<Pair<String, Boolean>>() }
         val routes = List(2) { LinkedBlockingQueue<TunnelChatLink.Path>() }
         val drop = AtomicInteger()
@@ -53,7 +53,9 @@ class ChatQuicInstrumentation : Instrumentation() {
         fun transport(i: Int) = checkNotNull(transports[i])
         fun link(i: Int) = checkNotNull(links[i])
         val files = File(targetContext.cacheDir, "quic-instrumentation").apply { mkdirs() }
-        val upload = File(files, "upload").apply { writeBytes(ByteArray(8 * 1024 * 1024) { it.toByte() }) }
+        val uploadBytes = options.getString("uploadBytes")?.toIntOrNull() ?: 8 * 1024 * 1024
+        require(uploadBytes in 1024 * 1024..20 * 1024 * 1024)
+        val upload = File(files, "upload").apply { writeBytes(ByteArray(uploadBytes) { it.toByte() }) }
         val download = File(files, "download").apply { writeBytes(ByteArray(388_042) { (it * 23).toByte() }) }
         val chat = TunnelConversation("chat", "https://test.invalid", identities[1].endpointId, identities[0].endpointId,
             visitor = false, verified = true)
@@ -68,7 +70,7 @@ class ChatQuicInstrumentation : Instrumentation() {
                 val tokens = TunnelPeerToken(identities[i], identities[1 - i].endpointId, session, "chat", i == 0)
                 links[i] = Chatquic.newLink(i == 0, object : Peer {
                     override fun sendPacket(data: ByteArray): Boolean {
-                        // 文字请求尚未发出。跳过前两个满长包，再丢掉图片上传的数据包。
+                        // 文字请求尚未发出。跳过前两个满长包，再丢掉附件上传的数据包。
                         if (i == 0 && data.size.toLong() == Chatquic.MaxDatagram && drop.getAndUpdate { if (it > 0) it - 1 else 0 } == 1) {
                             dropped.add(true)
                             return false
@@ -92,20 +94,21 @@ class ChatQuicInstrumentation : Instrumentation() {
                         }.onFailure { failures.add(it) }
                     }
                     override fun stillPending(id: String) = true
-                    override fun reserveImage(id: String, metadata: String, size: Long): String = runCatching {
+                    override fun reserveAttachment(id: String, metadata: String, size: Long): String = runCatching {
                         val file = File.createTempFile("receive-", ".part", files)
                         RandomAccessFile(file, "rw").use { it.setLength(size) }
                         file.absolutePath
                     }.getOrDefault("")
-                    override fun image(id: String, metadata: String, path: String): Boolean {
+                    override fun attachment(id: String, metadata: String, path: String): Boolean {
                         if (id != metadata) return false
-                        images[i].add(id to digest(File(path)))
+                        attachments[i].add(id to digest(File(path)))
                         return true
                     }
-                    override fun imageSent(id: String, delivered: Boolean) {
-                        if (i == 0) completions.add("image receipt")
+                    override fun attachmentSent(id: String, delivered: Boolean) {
+                        if (i == 0) completions.add("attachment receipt")
                         sent[i].add(id to delivered)
                     }
+                    override fun attachmentReceiveFinished(id: String) = Unit
                     override fun finished(reason: String) { failures.add(IllegalStateException(reason)) }
                 })
                 transports[i] = WebRtcChatTransport(targetContext) { event ->
@@ -128,8 +131,8 @@ class ChatQuicInstrumentation : Instrumentation() {
                 }
             }
             transport(0).createOutgoing(session, "server", ice, relayOnly = turn != null)
-            fun <T> await(queue: LinkedBlockingQueue<T>): T {
-                repeat(40) {
+            fun <T> await(queue: LinkedBlockingQueue<T>, seconds: Int = 20): T {
+                repeat(seconds * 2) {
                     failures.poll()?.let { throw it }
                     queue.poll(500, TimeUnit.MILLISECONDS)?.let { return it }
                 }
@@ -143,19 +146,19 @@ class ChatQuicInstrumentation : Instrumentation() {
             val expected = if (turn == null) TunnelChatLink.Path.DIRECT else TunnelChatLink.Path.RELAY
             routes.forEach { check(await(it) == expected) }
             drop.set(3)
-            check(link(0).sendImage("upload", "upload", upload.absolutePath))
+            check(link(0).sendAttachment("upload", "upload", upload.absolutePath))
             check(await(dropped))
             check(link(0).send(duringUpload.toJson().toString()))
-            check(await(completions) == "text ack") { "图片收件确认挡住了文字收件确认。" }
+            check(await(completions) == "text ack") { "附件收件确认挡住了文字收件确认。" }
             check(openQueue().conversation(chat.id, chat.platformOrigin, chat.localEndpointId)?.inbox?.single()?.messageId == duringUpload.messageId)
-            check(link(1).sendImage("download", "download", download.absolutePath))
-            val receivedUpload = await(images[1])
-            val receivedDownload = await(images[0])
+            check(link(1).sendAttachment("download", "download", download.absolutePath))
+            val receivedUpload = await(attachments[1], seconds = 90)
+            val receivedDownload = await(attachments[0], seconds = 90)
             check(receivedUpload.first == "upload" && receivedUpload.second.contentEquals(digest(upload)))
             check(receivedDownload.first == "download" && receivedDownload.second.contentEquals(digest(download)))
             check(await(sent[0]) == "upload" to true)
             check(await(sent[1]) == "download" to true)
-            return "QUIC v1 / HTTP/3：$expected，token 验签、双向文字和图片通过；丢包后文字确认先于图片确认。"
+            return "QUIC v1 / HTTP/3：$expected，token 验签、双向文字和附件通过；丢包后文字确认先于附件确认。"
         } finally {
             links.forEach { it?.close() }
             worker.submit { transports.forEach { it?.close() } }.get(5, TimeUnit.SECONDS)

@@ -269,7 +269,7 @@ class CoreTest {
 
     @GraphicsMode(GraphicsMode.Mode.NATIVE)
     @Test fun tunnelImageReadsRealPngAndKeepsItOutOfAiReception() {
-        val files = TunnelImageFiles(folder.newFolder())
+        val files = TunnelAttachmentFiles(folder.newFolder())
         val output = ByteArrayOutputStream()
         android.graphics.Bitmap.createBitmap(8, 6, android.graphics.Bitmap.Config.ARGB_8888).let { bitmap ->
             assertTrue(bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, output))
@@ -277,9 +277,9 @@ class CoreTest {
         }
         val (source, attachment) = files.prepare(output.toByteArray().inputStream(), "photo")
         assertEquals("image/png", attachment.mimeType)
-        assertTrue(TunnelImageFiles.matches(source, attachment))
-        assertFalse(TunnelImageFiles.matches(source, attachment.copy(sha256 = "0".repeat(64))))
-        assertFalse(TunnelImageFiles.matches(source, attachment.copy(mimeType = "image/webp")))
+        assertTrue(TunnelAttachmentFiles.matches(source, attachment))
+        assertFalse(TunnelAttachmentFiles.matches(source, attachment.copy(sha256 = "0".repeat(64))))
+        assertFalse(TunnelAttachmentFiles.matches(source, attachment.copy(mimeType = "image/webp")))
         assertThrows(IllegalStateException::class.java) { files.prepare(byteArrayOf(1, 2, 3).inputStream(), "invalid") }
         val chat = TunnelConversation("chat", "https://test.invalid", "host", "visitor", visitor = false, verified = true)
         val message = ChatMessage("photo", chat.id, 1, ChatSenderRole.VISITOR, "visitor", ChatMessageKind.IMAGE,
@@ -289,7 +289,7 @@ class CoreTest {
         val saved = files.store(chat, message, staged)
         assertFalse(staged.exists())
         assertArrayEquals(output.toByteArray(), saved.readBytes())
-        val preview = checkNotNull(TunnelImageFiles.preview(files.file(chat, message)))
+        val preview = checkNotNull(TunnelAttachmentFiles.preview(files.file(chat, message)))
         assertEquals(8, preview.width)
         assertEquals(6, preview.height)
         preview.recycle()
@@ -305,26 +305,54 @@ class CoreTest {
         assertEquals(ChatMessageKind.IMAGE, record.inbox.single().message?.kind)
     }
 
-    @Test fun tunnelImageConfirmationPreservesHistoryAndEntersHandover() {
+    @Test fun tunnelFileConfirmationPreservesHistoryAndEntersHandover() {
         val settings = TunnelChatSettings(endpointId = "host")
         val chat = TunnelConversation("chat", settings.platformOrigin, "host", "visitor", visitor = false, verified = true)
         val path = folder.newFolder().resolve("queue")
         val cipher = FixedTunnelChatQueueCipher(ByteArray(32))
         val queue = TunnelChatQueueStore(path, cipher) { settings }
         queue.save(chat)
-        val attachment = ChatAttachment("photo", "photo.png", "image/png", 3, "a".repeat(64))
-        val message = ChatMessage("photo", chat.id, 1, ChatSenderRole.ENDPOINT_USER, "host", ChatMessageKind.IMAGE,
+        val attachment = ChatAttachment("notes", "notes.md", "text/markdown", 3, "a".repeat(64))
+        val message = ChatMessage("notes", chat.id, 1, ChatSenderRole.ENDPOINT_USER, "host", ChatMessageKind.FILE,
             System.currentTimeMillis(), payload = JSONObject().put("attachment", attachment.toJson()))
         assertEquals(ConversationMode.AI, queue.conversation(chat.id, chat.platformOrigin, chat.localEndpointId)?.mode)
-        queue.confirmSentImage(chat, message)
+        queue.confirmSentAttachment(chat, message)
         val reopened = TunnelChatQueueStore(path, cipher) { settings }
         val saved = checkNotNull(reopened.conversation(chat.id, chat.platformOrigin, chat.localEndpointId))
         assertEquals(ConversationMode.HUMAN_HANDOVER, saved.mode)
-        assertEquals(message.messageId, saved.sentImages.single().messageId)
+        assertEquals(message.messageId, saved.sentAttachments.single().messageId)
+    }
+
+    @Test fun tunnelDocumentUsesPrivateStorageAndChecksMetadata() {
+        val files = TunnelAttachmentFiles(folder.newFolder())
+        val text = "私有文件\n".toByteArray()
+        val (source, attachment) = files.prepare(text.inputStream(), "notes", "会议纪要.txt", "text/plain")
+        val chat = TunnelConversation("chat", "https://test.invalid", "host", "visitor", visitor = false, verified = true)
+        val message = ChatMessage("notes", chat.id, 1, ChatSenderRole.VISITOR, "visitor", ChatMessageKind.FILE,
+            System.currentTimeMillis(), payload = JSONObject().put("attachment", attachment.toJson()))
+        assertEquals(attachment, message.attachment())
+        assertThrows(IllegalArgumentException::class.java) { message.copy(kind = ChatMessageKind.IMAGE).attachment() }
+        assertThrows(IllegalArgumentException::class.java) { attachment.copy(name = " ../notes.txt ").validate() }
+        assertThrows(IllegalArgumentException::class.java) { attachment.copy(name = " .. ").validate() }
+        assertThrows(IllegalArgumentException::class.java) { files.prepare(text.inputStream(), "notes", "file.zip", "application/zip") }
+        assertThrows(IllegalArgumentException::class.java) { files.prepare(byteArrayOf().inputStream(), "notes", "empty.txt", "text/plain") }
+        val saved = files.store(chat, message, source)
+        assertNotEquals(attachment.name, saved.name)
+        assertTrue(TunnelAttachmentFiles.matches(saved, attachment))
+        saved.writeBytes(ByteArray(text.size))
+        assertFalse(TunnelAttachmentFiles.matches(saved, attachment))
+
+        val queue = TunnelChatQueueStore(folder.newFolder().resolve("queue"), FixedTunnelChatQueueCipher(ByteArray(32))) {
+            TunnelChatSettings(platformOrigin = chat.platformOrigin, endpointId = chat.localEndpointId)
+        }
+        queue.save(chat)
+        assertEquals(ChatAck.Status.RECEIVED, queue.receive(chat, message))
+        assertEquals(ChatAck.Status.DUPLICATE, queue.receive(chat, message))
+        assertFalse(checkNotNull(queue.conversation(chat.id, chat.platformOrigin, chat.localEndpointId)).inbox.single().pending)
     }
 
     @Test fun tunnelImageReservesDiskQuotaBeforeReceivingBytes() {
-        val files = TunnelImageFiles(folder.newFolder())
+        val files = TunnelAttachmentFiles(folder.newFolder())
         val chat = TunnelConversation("chat", "https://test.invalid", "host", "visitor", visitor = false, verified = true)
         val max = TunnelChatProtocol.MAX_IMAGE_BYTES
         val reserved = List(10) { files.reserve(chat, max) }

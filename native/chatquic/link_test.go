@@ -11,15 +11,16 @@ import (
 )
 
 type testPeer struct {
-	other    *Link
-	key      ed25519.PrivateKey
-	remote   ed25519.PublicKey
-	ready    chan bool
-	frames   chan string
-	finished chan string
-	images   chan string
-	receipts chan bool
-	dir      string
+	other       *Link
+	key         ed25519.PrivateKey
+	remote      ed25519.PublicKey
+	ready       chan bool
+	frames      chan string
+	finished    chan string
+	attachments chan string
+	receiveDone chan string
+	receipts    chan bool
+	dir         string
 }
 
 func (p *testPeer) SendPacket(data []byte) bool { p.other.Push(data); return true }
@@ -34,8 +35,8 @@ func (p *testPeer) Ready()                      { p.ready <- true }
 func (p *testPeer) Frame(value string)          { p.frames <- value }
 func (p *testPeer) Finished(reason string)      { p.finished <- reason }
 func (p *testPeer) StillPending(id string) bool { return id != "removed" }
-func (p *testPeer) ReserveImage(_, _ string, size int64) string {
-	file, err := os.CreateTemp(p.dir, "image-*.part")
+func (p *testPeer) ReserveAttachment(_, _ string, size int64) string {
+	file, err := os.CreateTemp(p.dir, "attachment-*.part")
 	if err != nil {
 		return ""
 	}
@@ -47,7 +48,7 @@ func (p *testPeer) ReserveImage(_, _ string, size int64) string {
 	}
 	return file.Name()
 }
-func (p *testPeer) Image(_, metadata, path string) bool {
+func (p *testPeer) Attachment(_, metadata, path string) bool {
 	if metadata == "reject" {
 		return false
 	}
@@ -55,10 +56,11 @@ func (p *testPeer) Image(_, metadata, path string) bool {
 	if err != nil {
 		return false
 	}
-	p.images <- metadata + ":" + string(data)
+	p.attachments <- metadata + ":" + string(data)
 	return true
 }
-func (p *testPeer) ImageSent(_ string, delivered bool) { p.receipts <- delivered }
+func (p *testPeer) AttachmentSent(_ string, delivered bool) { p.receipts <- delivered }
+func (p *testPeer) AttachmentReceiveFinished(id string)     { p.receiveDone <- id }
 
 func newTestLinks(t *testing.T, mismatched bool) (*Link, *Link, *testPeer, *testPeer) {
 	t.Helper()
@@ -68,7 +70,7 @@ func newTestLinks(t *testing.T, mismatched bool) (*Link, *Link, *testPeer, *test
 			t.Fatal(err)
 		}
 		return &testPeer{key: key, ready: make(chan bool, 1), frames: make(chan string, 4), finished: make(chan string, 1),
-			images: make(chan string, 2), receipts: make(chan bool, 2), dir: t.TempDir()}
+			attachments: make(chan string, 2), receiveDone: make(chan string, 2), receipts: make(chan bool, 2), dir: t.TempDir()}
 	}
 	client, server := newPeer(), newPeer()
 	client.remote = server.key.Public().(ed25519.PublicKey)
@@ -126,35 +128,38 @@ func TestUntrustedResponderCannotStartChat(t *testing.T) {
 	}
 }
 
-func TestImagesUseIndependentRequestsAndRequireDeliveryReceipt(t *testing.T) {
+func TestAttachmentsUseIndependentRequestsAndRequireDeliveryReceipt(t *testing.T) {
 	c, s, client, server := newTestLinks(t, false)
 	await(t, client.ready, true)
 	await(t, server.ready, true)
-	file := filepath.Join(t.TempDir(), "image")
+	file := filepath.Join(t.TempDir(), "attachment")
 	data := strings.Repeat("raw\x00data", 32768)
 	if err := os.WriteFile(file, []byte(data), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if !c.SendImage("upload", "visitor", file) || !s.SendImage("download", "endpoint", file) {
-		t.Fatal("failed to send images in both directions")
+	if !c.SendAttachment("upload", "visitor", file) || !s.SendAttachment("download", "endpoint", file) {
+		t.Fatal("failed to send attachments in both directions")
 	}
 	if !c.Send(`{"text":"still here"}`) || !s.Send(`{"ack":true}`) {
-		t.Fatal("chat frames refused during image transfer")
+		t.Fatal("chat frames refused during attachment transfer")
 	}
 	await(t, server.frames, `{"text":"still here"}`)
 	await(t, client.frames, `{"ack":true}`)
-	await(t, server.images, "visitor:"+data)
-	await(t, client.images, "endpoint:"+data)
+	await(t, server.attachments, "visitor:"+data)
+	await(t, client.attachments, "endpoint:"+data)
+	await(t, server.receiveDone, "upload")
+	await(t, client.receiveDone, "download")
 	await(t, client.receipts, true)
 	await(t, server.receipts, true)
 
 	// 手动重试可以沿用业务编号，但新传输的失败不能被前一次成功覆盖。
-	if !s.SendImage("download", "reject", file) {
+	if !s.SendAttachment("download", "reject", file) {
 		t.Fatal("failed to retry the download with the same message ID")
 	}
+	await(t, client.receiveDone, "download")
 	await(t, server.receipts, false)
-	if !s.Send(`{"text":"after a rejected image"}`) {
-		t.Fatal("rejecting an image closed chat")
+	if !s.Send(`{"text":"after a rejected attachment"}`) {
+		t.Fatal("rejecting an attachment closed chat")
 	}
-	await(t, client.frames, `{"text":"after a rejected image"}`)
+	await(t, client.frames, `{"text":"after a rejected attachment"}`)
 }

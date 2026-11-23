@@ -120,7 +120,7 @@ data class TunnelConversation(
     val inbox: List<TunnelReceipt> = emptyList(),
     val peerEndId: String? = null,
     val closedAt: Long = 0,
-    val sentImages: List<ChatMessage> = emptyList(),
+    val sentAttachments: List<ChatMessage> = emptyList(),
 ) {
     fun toJson() = JSONObject().put("id", id).put("origin", platformOrigin).put("local", localEndpointId)
         .put("remote", remoteEndpointId).put("visitor", visitor).put("verified", verified)
@@ -129,7 +129,7 @@ data class TunnelConversation(
         .put("receptionVersion", receptionVersion).put("inbox", JSONArray(inbox.map { it.toJson() }))
         .put("peerEndId", peerEndId)
         .put("closedAt", closedAt)
-        .apply { if (sentImages.isNotEmpty()) put("sentImages", JSONArray(sentImages.map { it.toJson() })) }
+        .apply { if (sentAttachments.isNotEmpty()) put("sentAttachments", JSONArray(sentAttachments.map { it.toJson() })) }
 
     fun canReply(limit: Int) = verified && !visitor && !closed && mode == ConversationMode.AI && aiRepliesSent < limit
 
@@ -163,7 +163,7 @@ data class TunnelConversation(
             row.optJSONArray("inbox")?.let { array -> (0 until array.length()).map { TunnelReceipt.fromJson(array.getJSONObject(it)) } }.orEmpty(),
             row.optString("peerEndId").takeIf { it.isNotEmpty() },
             row.optLong("closedAt"),
-            row.optJSONArray("sentImages")?.let { array -> (0 until array.length()).map { ChatMessage.fromJson(array.getJSONObject(it)) } }.orEmpty(),
+            row.optJSONArray("sentAttachments")?.let { array -> (0 until array.length()).map { ChatMessage.fromJson(array.getJSONObject(it)) } }.orEmpty(),
         )
     }
 }
@@ -241,7 +241,7 @@ class TunnelChatQueueStore(
             closed = live.closed || ending,
             peerEndId = if (ending) message.messageId else live.peerEndId,
             mode = if (live.visitor && message.senderRole == ChatSenderRole.ENDPOINT_USER &&
-                message.kind in setOf(ChatMessageKind.HUMAN_FORMAL, ChatMessageKind.IMAGE)) ConversationMode.HUMAN_HANDOVER else live.mode,
+                (message.kind == ChatMessageKind.HUMAN_FORMAL || message.kind.isAttachment())) ConversationMode.HUMAN_HANDOVER else live.mode,
             inbox = (live.inbox + receipt).let { rows ->
                 rows.dropLast(MAX_HISTORY_PER_CHAT).map { if (!it.pending && it.message != null) it.copy(message = null) else it } +
                     rows.takeLast(MAX_HISTORY_PER_CHAT)
@@ -328,13 +328,13 @@ class TunnelChatQueueStore(
         writeData(data.withConversation(conversation.closeReception(now)).withoutClosedMessages(conversation))
     }
 
-    fun confirmSentImage(conversation: TunnelConversation, image: ChatMessage, now: Long = System.currentTimeMillis()): Set<String> = synchronized(lock) {
+    fun confirmSentAttachment(conversation: TunnelConversation, message: ChatMessage, now: Long = System.currentTimeMillis()): Set<String> = synchronized(lock) {
         val data = readData(now)
         val live = checkNotNull(data.conversation(conversation.id, conversation.platformOrigin, conversation.localEndpointId))
-        require(!live.closed && image.kind == ChatMessageKind.IMAGE && image.conversationId == live.id && image.senderEndpointId == live.localEndpointId)
+        require(!live.closed && message.kind.isAttachment() && message.conversationId == live.id && message.senderEndpointId == live.localEndpointId)
         val dropped = if (live.visitor) emptyList() else data.rows.filter { it.belongsTo(live) && it.message.kind == ChatMessageKind.AI_FORMAL }
-        val history = (live.sentImages.filter { it.messageId != image.messageId } + image).takeLast(MAX_HISTORY_PER_CHAT)
-        val next = (if (live.visitor) live else live.handover()).copy(sentImages = history)
+        val history = (live.sentAttachments.filter { it.messageId != message.messageId } + message).takeLast(MAX_HISTORY_PER_CHAT)
+        val next = (if (live.visitor) live else live.handover()).copy(sentAttachments = history)
         writeData(data.copy(rows = data.rows - dropped.toSet()).withConversation(next).compact(now))
         dropped.map { it.message.messageId }.toSet()
     }
@@ -362,8 +362,8 @@ class TunnelChatQueueStore(
         private val oldestFinished by lazy { conversations.minOfOrNull { chat ->
             chat.inbox.minOfOrNull { if (it.pending) Long.MAX_VALUE else it.receivedAt } ?: Long.MAX_VALUE
         } ?: Long.MAX_VALUE }
-        private val oldestSentImage by lazy { conversations.minOfOrNull { chat ->
-            chat.sentImages.minOfOrNull { it.createdAt } ?: Long.MAX_VALUE
+        private val oldestSentAttachment by lazy { conversations.minOfOrNull { chat ->
+            chat.sentAttachments.minOfOrNull { it.createdAt } ?: Long.MAX_VALUE
         } ?: Long.MAX_VALUE }
 
         fun conversation(id: String, origin: String, local: String) = index[Triple(origin, local, id)]
@@ -383,8 +383,8 @@ class TunnelChatQueueStore(
         fun compact(now: Long, newest: TunnelReceipt? = null): Data {
             val expireLegacy = legacyIdsUntil != 0L && now >= legacyIdsUntil
             val cutoff = now - RECEIPT_AGE_MS
-            val imageCutoff = now - TunnelImageFiles.MAX_AGE
-            if (!expireLegacy && oldestFinished >= cutoff && bodyBytes <= MAX_HISTORY_BYTES && oldestSentImage >= imageCutoff) return this
+            val attachmentCutoff = now - TunnelAttachmentFiles.MAX_AGE
+            if (!expireLegacy && oldestFinished >= cutoff && bodyBytes <= MAX_HISTORY_BYTES && oldestSentAttachment >= attachmentCutoff) return this
             var changed = expireLegacy
             var historyBytes = pendingBodyBytes + (newest?.takeUnless { it.pending }?.bodyBytes ?: 0)
             // 保留最新正文，已处理的旧正文只保留凭据。未完成接待、会话绑定与关闭标记不淘汰。
@@ -408,10 +408,10 @@ class TunnelChatQueueStore(
                         else -> receipt
                     }
                 }
-                val images = chat.sentImages.filter { it.createdAt >= imageCutoff }
-                if (images.size != chat.sentImages.size) changed = true
-                if (inbox == chat.inbox && images == chat.sentImages && (!expireLegacy || chat.receivedMessageIds.isEmpty())) chat
-                else chat.copy(inbox = inbox, sentImages = images, receivedMessageIds = if (expireLegacy) emptyList() else chat.receivedMessageIds)
+                val attachments = chat.sentAttachments.filter { it.createdAt >= attachmentCutoff }
+                if (attachments.size != chat.sentAttachments.size) changed = true
+                if (inbox == chat.inbox && attachments == chat.sentAttachments && (!expireLegacy || chat.receivedMessageIds.isEmpty())) chat
+                else chat.copy(inbox = inbox, sentAttachments = attachments, receivedMessageIds = if (expireLegacy) emptyList() else chat.receivedMessageIds)
             }
             return if (changed) copy(conversations = compacted, legacyIdsUntil = if (expireLegacy) 0 else legacyIdsUntil) else this
         }

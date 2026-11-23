@@ -40,9 +40,9 @@ class TunnelChatRuntime(
     private val sessionBindings = ConcurrentHashMap<String, SessionBinding>()
     private val authenticatedSessions = ConcurrentHashMap.newKeySet<String>()
     private val conversationMessages = mutableMapOf<String, MutableList<ChatMessage>>()
-    private val imageFiles = TunnelImageFiles(File(context.noBackupFilesDir, "tunnel-images"))
-    private val imageDeliveries = mutableMapOf<Triple<String, String, String>, TunnelImageDelivery>()
-    private var preparingImage = false
+    private val attachmentFiles = TunnelAttachmentFiles(File(context.noBackupFilesDir, "tunnel-images"))
+    private val attachmentDeliveries = mutableMapOf<Triple<String, String, String>, TunnelAttachmentDelivery>()
+    private var preparingAttachment = false
     private val retryInitialOffer = mutableSetOf<String>()
     private val admission = TunnelConversationAdmission(
         settings = { currentSettings },
@@ -78,7 +78,7 @@ class TunnelChatRuntime(
     }
 
     init {
-        submit { synchronized(this) { imageFiles.trim(discardParts = true) } }
+        submit { synchronized(this) { attachmentFiles.trim(discardParts = true) } }
         if (withdrawals().isNotEmpty()) {
             state = state.copy(pendingWithdrawal = true)
             submit { syncWithdrawals() }
@@ -99,7 +99,7 @@ class TunnelChatRuntime(
                 }
             }
         }, 5L, 5L, TimeUnit.SECONDS)
-        retryScheduler.scheduleAtFixedRate({ onWorker { imageFiles.trim() } }, 1L, 1L, TimeUnit.HOURS)
+        retryScheduler.scheduleAtFixedRate({ onWorker { attachmentFiles.trim() } }, 1L, 1L, TimeUnit.HOURS)
     }
 
     fun observe(listener: (TunnelChatRuntimeState) -> Unit) { listeners.add(listener); listener(state) }
@@ -125,7 +125,7 @@ class TunnelChatRuntime(
         publishedOrigins = origins
         if (previous.platformOrigin != clean.platformOrigin) {
             conversationMessages.clear()
-            imageDeliveries.clear()
+            attachmentDeliveries.clear()
         }
         if (!clean.enabled) stop()
         else if (previous != currentSettings && engineReady) {
@@ -316,61 +316,89 @@ class TunnelChatRuntime(
         return message
     }
 
-    fun sendImage(conversationId: String, uri: Uri, retryId: String? = null): String {
-        require(uri.scheme == "content") { "请重新选择图片。" }
+    fun sendAttachment(conversationId: String, uri: Uri, retryId: String? = null): String {
+        require(uri.scheme == "content") { "请重新选择附件。" }
         val (original, id) = synchronized(this) {
-            check(!preparingImage) { "正在读取另一张图片。" }
-            val binding = requireImageSession(conversationId)
-            val last = imageDeliveries[key(conversationId)]
+            check(!preparingAttachment) { "正在读取另一个附件。" }
+            val binding = requireAttachmentSession(conversationId)
+            val last = attachmentDeliveries[key(conversationId)]
             val id = retryId?.takeIf { last?.messageId == it && !last.delivered } ?: UUID.randomUUID().toString()
-            preparingImage = true
+            preparingAttachment = true
             binding to id
         }
         try {
-            val input = runCatching { context.contentResolver.openInputStream(uri) }.getOrNull()
-                ?: error("无法读取所选图片，请重新选择。")
-            val (temp, attachment) = try { input.use { imageFiles.prepare(it, id) } }
-                catch (_: java.io.IOException) { error("无法读取或保存所选图片，请重试。") }
+            val resolver = context.contentResolver
+            val (temp, attachment) = try {
+                val name = resolver.attachmentName(uri)
+                val type = resolver.getType(uri)
+                val input = resolver.openInputStream(uri) ?: error("无法读取所选附件，请重新选择。")
+                input.use { attachmentFiles.prepare(it, id, name, type) }
+            } catch (_: java.io.IOException) { error("无法读取或保存所选附件，请重试。") }
             try {
                 synchronized(this) {
                     val conversation = requireOpen(conversationId)
-                    val binding = requireImageSession(conversationId)
+                    val binding = requireAttachmentSession(conversationId)
                     check(binding === original) { "聊天连接已变更，请重试。" }
                     val role = if (conversation.visitor) ChatSenderRole.VISITOR else ChatSenderRole.ENDPOINT_USER
+                    val kind = if (attachment.mimeType in tunnelImageTypes) ChatMessageKind.IMAGE else ChatMessageKind.FILE
                     val message = ChatMessage(id, conversationId, conversation.sequence + 1, role, conversation.localEndpointId,
-                        ChatMessageKind.IMAGE, System.currentTimeMillis(), payload = JSONObject().put("attachment", attachment.toJson()))
-                    val file = imageFiles.stage(conversation, message, temp)
+                        kind, System.currentTimeMillis(), payload = JSONObject().put("attachment", attachment.toJson()))
+                    val file = attachmentFiles.stage(conversation, message, temp)
                     try {
                         save(conversation.copy(sequence = message.seq))
-                        imageDeliveries.remove(key(conversationId))
-                        binding.sendingImage = message
-                        if (binding.quic?.sendImage(message.messageId, message.toJson().toString(), file.absolutePath) != true) {
-                            binding.sendingImage = null
-                            finishImage(binding, message, false)
+                        attachmentDeliveries.remove(key(conversationId))
+                        binding.sendingAttachment = message
+                        if (binding.quic?.sendAttachment(message.messageId, message.toJson().toString(), file.absolutePath) != true) {
+                            binding.sendingAttachment = null
+                            finishAttachment(binding, message, false)
                         }
                     } catch (error: Exception) {
+                        binding.sendingAttachment = null
                         file.delete()
                         throw error
                     }
                     publishState(state.message)
                 }
             } finally { temp.delete() }
-        } finally { synchronized(this) { preparingImage = false } }
+        } finally { synchronized(this) { preparingAttachment = false } }
         return id
     }
 
     fun imagePreview(message: ChatMessage): Bitmap? {
+        if (message.kind != ChatMessageKind.IMAGE) return null
         val file = synchronized(this) {
             record(message.conversationId)?.takeIf { message.senderEndpointId == it.localEndpointId || message.senderEndpointId == it.remoteEndpointId }
-                ?.let { imageFiles.file(it, message) }
+                ?.let { attachmentFiles.file(it, message) }
         } ?: return null
-        return TunnelImageFiles.preview(file)
+        return TunnelAttachmentFiles.preview(file)
     }
 
-    private fun requireImageSession(id: String): SessionBinding {
+    fun exportAttachment(conversationId: String, messageId: String, senderEndpointId: String, uri: Uri) {
+        require(uri.scheme == "content") { "请选择保存位置。" }
+        val file = synchronized(this) {
+            val chat = checkNotNull(record(conversationId)) { "聊天记录不可用。" }
+            val history = if (senderEndpointId == chat.localEndpointId) chat.sentAttachments else chat.inbox.mapNotNull { it.message }
+            val message = history.firstOrNull {
+                it.messageId == messageId && it.senderEndpointId == senderEndpointId && it.kind == ChatMessageKind.FILE
+            } ?: error("文件不可用或已过期。")
+            attachmentFiles.file(chat, message)
+        }
+        try {
+            file.inputStream().use { input ->
+                val output = context.contentResolver.openOutputStream(uri, "wt") ?: error("无法写入所选位置。")
+                output.use { input.copyTo(it) }
+            }
+        } catch (_: java.io.FileNotFoundException) {
+            error("文件不可用，或无法写入所选位置。")
+        } catch (_: java.io.IOException) {
+            error("无法保存文件，请重试。")
+        }
+    }
+
+    private fun requireAttachmentSession(id: String): SessionBinding {
         requireOpen(id)
-        val binding = checkNotNull(binding(id)?.takeIf { it.sessionId in authenticatedSessions }) { "连接后才能发送图片。" }
-        check(binding.sendingImage == null) { "上一张图片还在发送。" }
+        val binding = checkNotNull(binding(id)?.takeIf { it.sessionId in authenticatedSessions }) { "连接后才能发送附件。" }
+        check(binding.sendingAttachment == null) { "上一个附件还在发送。" }
         return binding
     }
 
@@ -383,7 +411,7 @@ class TunnelChatRuntime(
 
     @Synchronized fun endConversation(conversationId: String) {
         val conversation = requireOpen(conversationId)
-        binding(conversationId)?.quic?.cancelImage()
+        binding(conversationId)?.quic?.cancelAttachment()
         val ended = conversation.copy(closed = true)
         if (conversation.verified) {
             val role = if (conversation.visitor) ChatSenderRole.VISITOR else ChatSenderRole.ENDPOINT_USER
@@ -660,12 +688,12 @@ class TunnelChatRuntime(
             return
         }
         val message = runCatching { ChatMessage.fromJson(frame) }.getOrNull() ?: return
-        if (message.kind == ChatMessageKind.IMAGE || !permits(conversation, message)) return
+        if (message.kind.isAttachment() || !permits(conversation, message)) return
         val status = queue.receive(conversation, message)
         if (status == ChatAck.Status.REJECTED) return
         binding.quic?.send(TunnelChatProtocol.ack(ChatAck(message.messageId, message.conversationId, status)).toString())
         if (message.isEnd()) {
-            binding.quic?.cancelImage()
+            binding.quic?.cancelAttachment()
             expireClosing(binding)
         }
         if (status == ChatAck.Status.RECEIVED) {
@@ -681,45 +709,49 @@ class TunnelChatRuntime(
         if (conversation.closed) return false
         return if (conversation.visitor) {
             (message.senderRole == ChatSenderRole.AI && message.kind in setOf(ChatMessageKind.AI_FORMAL, ChatMessageKind.CONVERSATION_EVENT)) ||
-                (message.senderRole == ChatSenderRole.ENDPOINT_USER && message.kind in setOf(ChatMessageKind.HUMAN_FORMAL, ChatMessageKind.IMAGE))
-        } else message.senderRole == ChatSenderRole.VISITOR && message.kind in setOf(ChatMessageKind.TEXT, ChatMessageKind.IMAGE)
+                (message.senderRole == ChatSenderRole.ENDPOINT_USER && (message.kind == ChatMessageKind.HUMAN_FORMAL || message.kind.isAttachment()))
+        } else message.senderRole == ChatSenderRole.VISITOR && (message.kind == ChatMessageKind.TEXT || message.kind.isAttachment())
     }
 
-    private fun receiveImage(binding: SessionBinding, id: String, metadata: String, source: File): Boolean = runCatching {
-        val message = imageMessage(id, metadata) ?: return false
-        if (!TunnelImageFiles.matches(source, message.imageAttachment())) return false
-        synchronized(this) { saveReceivedImage(binding, message, source) }
+    private fun receiveAttachment(binding: SessionBinding, id: String, metadata: String, source: File): Boolean = runCatching {
+        val message = attachmentMessage(id, metadata) ?: return false
+        if (!TunnelAttachmentFiles.matches(source, message.attachment())) return false
+        synchronized(this) { saveReceivedAttachment(binding, message, source) }
     }.getOrDefault(false)
 
-    private fun imageMessage(id: String, metadata: String): ChatMessage? {
+    private fun attachmentMessage(id: String, metadata: String): ChatMessage? {
         val offer = ChatMessage.fromJson(JSONObject(metadata))
-        if (offer.kind != ChatMessageKind.IMAGE || offer.messageId != id) return null
-        return offer.copy(replyTo = null, payload = JSONObject().put("attachment", offer.imageAttachment().toJson()))
+        if (offer.messageId != id) return null
+        val attachment = offer.attachment().takeIf { it.attachmentId == id } ?: return null
+        return offer.copy(replyTo = null, payload = JSONObject().put("attachment", attachment.toJson()))
     }
 
-    private fun imageConversation(binding: SessionBinding, message: ChatMessage): TunnelConversation? {
+    private fun attachmentConversation(binding: SessionBinding, message: ChatMessage): TunnelConversation? {
         if (sessionBindings[binding.sessionId] !== binding || binding.sessionId !in authenticatedSessions) return null
         return record(binding.conversationId)?.takeIf { !it.closed && permits(it, message) }
     }
 
-    private fun reserveImage(binding: SessionBinding, id: String, metadata: String, size: Long): String = runCatching {
-        val message = imageMessage(id, metadata) ?: return ""
-        if (message.imageAttachment().size != size) return ""
+    private fun reserveAttachment(binding: SessionBinding, id: String, metadata: String, size: Long): String = runCatching {
+        val message = attachmentMessage(id, metadata) ?: return ""
+        if (message.attachment().size != size) return ""
         synchronized(this) {
-            val conversation = imageConversation(binding, message) ?: return ""
-            imageFiles.reserve(conversation, size).absolutePath
+            val conversation = attachmentConversation(binding, message) ?: return ""
+            val file = attachmentFiles.reserve(conversation, size)
+            binding.receivingAttachment = true
+            runCatching { publishState(state.message) }
+            file.absolutePath
         }
     }.getOrDefault("")
 
-    private fun saveReceivedImage(binding: SessionBinding, message: ChatMessage, source: File): Boolean {
-        val conversation = imageConversation(binding, message) ?: return false
+    private fun saveReceivedAttachment(binding: SessionBinding, message: ChatMessage, source: File): Boolean {
+        val conversation = attachmentConversation(binding, message) ?: return false
         val previous = conversation.inbox.firstOrNull { it.messageId == message.messageId }?.message
-        val existing = imageFiles.file(conversation, message)
+        val existing = attachmentFiles.file(conversation, message)
         if (previous != null || existing.exists()) {
-            val attachment = message.imageAttachment()
-            return previous?.kind == ChatMessageKind.IMAGE && previous.imageAttachment() == attachment && existing.length() == attachment.size
+            val attachment = message.attachment()
+            return previous?.kind == message.kind && previous.attachment() == attachment && existing.length() == attachment.size
         }
-        val saved = imageFiles.store(conversation, message, source)
+        val saved = attachmentFiles.store(conversation, message, source)
         var accepted = false
         try {
             accepted = queue.receive(conversation, message) == ChatAck.Status.RECEIVED
@@ -728,13 +760,13 @@ class TunnelChatRuntime(
         } finally { if (!accepted) saved.delete() }
     }
 
-    private fun finishImage(binding: SessionBinding, message: ChatMessage, delivered: Boolean) {
+    private fun finishAttachment(binding: SessionBinding, message: ChatMessage, delivered: Boolean) {
         val chat = binding.conversation
-        val staged = imageFiles.staged(chat, message)
+        val staged = attachmentFiles.staged(chat, message)
         val delivery = runCatching {
             if (!delivered) return@runCatching false
-            val saved = imageFiles.store(chat, message, staged)
-            val dropped = try { queue.confirmSentImage(chat, message) } catch (error: Exception) {
+            val saved = attachmentFiles.store(chat, message, staged)
+            val dropped = try { queue.confirmSentAttachment(chat, message) } catch (error: Exception) {
                 saved.delete()
                 throw error
             }
@@ -743,7 +775,7 @@ class TunnelChatRuntime(
         }.getOrDefault(false)
         staged.delete()
         if (key(chat.id, chat.platformOrigin, chat.localEndpointId) == key(chat.id)) {
-            imageDeliveries[key(chat.id)] = TunnelImageDelivery(message.messageId, delivery)
+            attachmentDeliveries[key(chat.id)] = TunnelAttachmentDelivery(message.messageId, delivery)
             publishState(state.message)
         }
     }
@@ -784,7 +816,7 @@ class TunnelChatRuntime(
         val conversations = currentConversations()
         conversations.filter { !it.waitingNotified && it.aiRepliesSent > 0 && !it.canReply() }.forEach { notifyWaitingHuman(it) }
         val (conversation, receipt) = conversations.mapNotNull { chat ->
-            if (chat.closed || binding(chat.id)?.sendingImage != null) null else chat.inbox.firstOrNull { it.pending }?.let { chat to it }
+            if (chat.closed || binding(chat.id)?.sendingAttachment != null) null else chat.inbox.firstOrNull { it.pending }?.let { chat to it }
         }.minByOrNull { (_, receipt) -> receipt.receivedAt } ?: return
         val text = checkNotNull(receipt.message).payload.optString("text")
         val formal = conversation.canPublish(receipt, currentSettings.maxAiReplies)
@@ -823,7 +855,7 @@ class TunnelChatRuntime(
             ?: return true
         val receipt = live.inbox.firstOrNull { it.pending && it.messageId == reply.messageId } ?: return true
         if (reply.text.isNotBlank() && reply.formal && live.canPublish(receipt, currentSettings.maxAiReplies)) {
-            if (binding(live.id)?.sendingImage != null) return false
+            if (binding(live.id)?.sendingAttachment != null) return false
             val message = textMessage(live, reply.text, ChatSenderRole.AI, ChatMessageKind.AI_FORMAL).copy(replyTo = receipt.messageId)
             if (!queue.canFit(message)) {
                 queue.finishReception(live, receipt.messageId)
@@ -872,12 +904,13 @@ class TunnelChatRuntime(
                 mode = conversation.mode,
                 aiRepliesSent = conversation.aiRepliesSent,
                 messages = (conversation.inbox.mapNotNull { receipt -> receipt.message?.let { receipt.receivedAt to it } } +
-                    conversation.sentImages.map { it.createdAt to it } +
+                    conversation.sentAttachments.map { it.createdAt to it } +
                     conversationMessages[conversation.id].orEmpty().map { it.createdAt to it })
                     .sortedBy { it.first }.takeLast(200).map { it.second },
-                canSendImage = !conversation.closed && connected,
-                sendingImage = binding?.sendingImage != null,
-                imageDelivery = imageDeliveries[key(conversation.id)],
+                canSendAttachment = !conversation.closed && connected,
+                sendingAttachment = binding?.sendingAttachment != null,
+                receivingAttachment = binding?.receivingAttachment == true,
+                attachmentDelivery = attachmentDeliveries[key(conversation.id)],
                 link = binding?.link?.takeIf { connected && !conversation.closed },
             )
         }.sortedBy { it.conversationId }
@@ -960,7 +993,8 @@ class TunnelChatRuntime(
         private val tokens = TunnelPeerToken(identity, remoteEndpointId, sessionId, conversationId, initiator)
         var answerReceived = false
         var closing = false
-        var sendingImage: ChatMessage? = null
+        var sendingAttachment: ChatMessage? = null
+        var receivingAttachment = false
         private val linkState = MutableStateFlow<TunnelChatLink?>(null)
         val link = linkState.asStateFlow()
         fun updateLink(value: TunnelChatLink?) { linkState.value = value }
@@ -982,13 +1016,17 @@ class TunnelChatRuntime(
                         matchesEndpoint(row, remoteEndpointId) }
                 }.getOrDefault(false)
             }
-            override fun reserveImage(id: String, metadata: String, size: Long) =
-                this@TunnelChatRuntime.reserveImage(this@SessionBinding, id, metadata, size)
-            override fun image(id: String, metadata: String, path: String) = receiveImage(this@SessionBinding, id, metadata, File(path))
-            override fun imageSent(id: String, delivered: Boolean) = onLive {
-                val message = sendingImage?.takeIf { it.messageId == id } ?: return@onLive
-                sendingImage = null
-                finishImage(this@SessionBinding, message, delivered)
+            override fun reserveAttachment(id: String, metadata: String, size: Long) =
+                this@TunnelChatRuntime.reserveAttachment(this@SessionBinding, id, metadata, size)
+            override fun attachment(id: String, metadata: String, path: String) = receiveAttachment(this@SessionBinding, id, metadata, File(path))
+            override fun attachmentReceiveFinished(id: String) = withLive {
+                receivingAttachment = false
+                publishState(state.message)
+            }
+            override fun attachmentSent(id: String, delivered: Boolean) = onLive {
+                val message = sendingAttachment?.takeIf { it.messageId == id } ?: return@onLive
+                sendingAttachment = null
+                finishAttachment(this@SessionBinding, message, delivered)
             }
             override fun finished(reason: String) = onLive {
                 val ready = sessionId in authenticatedSessions
@@ -1008,8 +1046,8 @@ class TunnelChatRuntime(
         fun close() {
             quic?.close()
             quic = null
-            sendingImage?.let { finishImage(this, it, false) }
-            sendingImage = null
+            sendingAttachment?.let { finishAttachment(this, it, false) }
+            sendingAttachment = null
         }
     }
 
