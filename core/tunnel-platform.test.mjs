@@ -348,15 +348,28 @@ test('tunnel platform removes hidden endpoints from discovery and rejects known-
   assert.equal((await platform.request(`${directory}/${b.profile.endpointId}`, { method: 'DELETE', headers: { Authorization: `Bearer ${hidden.registrationToken}` } })).status, 204);
 });
 
+test('tunnel platform advertises STUN by default and allows an explicit empty configuration', { timeout: 8000 }, async t => {
+  for (const [iceServers, expected] of [[undefined, [{ urls: ['stun:filesharing.asia:9087'] }]], [[], []]]) {
+    const platform = await fixture(t, { iceServers, webOrigin: 'https://web.example.test', appDomain: 'apps.example.test' });
+    const peer = identity('直连端点');
+    const row = await platform.publish(peer);
+    assert.deepEqual(row.iceServers, expected);
+    await platform.connect(peer, row.registrationToken, servers => assert.deepEqual(servers, expected));
+    const welcome = await receive(platform.browser());
+    assert.equal(welcome.type, 'web_ready');
+    assert.deepEqual(welcome.payload.ice_servers, expected);
+  }
+});
+
 test('tunnel platform issues endpoint-specific temporary TURN credentials without exposing the secret', { timeout: 8000 }, async t => {
   const secret = 'test-only-shared-secret-with-32-characters';
   const urls = ['turn:turn.test.invalid:3478?transport=udp', 'turn:turn.test.invalid:3478?transport=tcp'];
-  const platform = await fixture(t, { turn: { urls, secret, ttlSeconds: 120 } });
+  const platform = await fixture(t, { iceServers: undefined, turn: { urls, secret, ttlSeconds: 120 } });
   const a = identity('中继端点 A'), b = identity('中继端点 B');
   const started = Math.floor(Date.now() / 1000);
   const row = await platform.publish(a);
   const checkServers = servers => {
-    assert.deepEqual(servers[0], { urls: ['stun:test.invalid:3478'] });
+    assert.deepEqual(servers[0], { urls: ['stun:filesharing.asia:9087'] });
     assert.equal(servers.length, 2);
     const server = servers[1];
     const [expires, endpointId] = server.username.split(':');

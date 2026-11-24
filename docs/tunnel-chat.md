@@ -46,7 +46,9 @@ node tunnel-platform.mjs
 
 默认只监听 `127.0.0.1:9082`，可用 `DSHX_TUNNEL_PORT` 改端口。由公网 HTTPS 反向代理（负责接收域名请求并转交本机平台进程）转发 `/api/v1/dshx/chat/` 和 `/api/v1/signaling`；后一条需允许 WebSocket 升级并转发 `Authorization`。部署到 `filesharing.asia` 时，须在反向代理配置该域名的有效证书；自建平台使用自己的域名和证书。两台 DSHX 客户端使用同一平台地址，开启穿透聊天并启动引擎；使用自建平台时，在「设置 → 穿透聊天」填写其 HTTPS 地址。
 
-平台进程本身不转发正文；独立 coturn 服务提供 TURN 中继，部署步骤见下节。`DSHX_TUNNEL_ICE_SERVERS` 可设置为 WebRTC ICE（网络路径发现）服务器的 JSON 数组，例如 `[{"urls":["stun:stun.example.org:3478"]}]`，继续用于 STUN 或兼容既有配置。不要在该变量中配置长期 TURN 密码，应使用平台签发的临时凭据。
+平台默认下发 `stun:filesharing.asia:9087`，客户端无需手动填写。STUN 帮客户端发现路由器对外映射的地址和端口，供 WebRTC ICE（网络路径探测）尝试直连；它不转发正文或附件，也不保证直连成功。
+
+自建平台可用 `DSHX_TUNNEL_ICE_SERVERS` 覆盖默认地址，例如 `[{"urls":["stun:stun.example.org:3478"]}]`。不希望客户端查询默认 STUN 服务时，请填自有地址，或设为 `[]` 不下发 STUN。平台进程不转发业务流量；TURN 中继由独立 coturn 服务提供，使用平台签发的临时凭据，不要在 `DSHX_TUNNEL_ICE_SERVERS` 中配置长期 TURN 密码。
 
 当前为单进程平台，端点目录保存在内存，重启后由客户端重新注册。断开的公开端点最多保留 7 天，便于对方选择离线投递；目录读取无需账号，发起连接必须持有注册凭证。限频与并发由接收方客户端执行。部署到公网前仍需加上反代层限流和运维监控；本服务无账号层、持久目录或举报功能；已支持基于端点签名注册的临时 TURN 凭据发放。
 

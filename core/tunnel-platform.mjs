@@ -13,6 +13,7 @@ const protocol = 'cwnas-webrtc-signaling';
 const routeId = /^[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const sessionId = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const maxSignal = 64 * 1024;
+const defaultIceServers = [{ urls: ['stun:filesharing.asia:9087'] }];
 const nonce = () => randomBytes(32).toString('base64url');
 const validText = (value, max) => typeof value === 'string' && value.length <= max && !value.includes('\0');
 const isObject = value => value != null && typeof value === 'object' && !Array.isArray(value);
@@ -61,7 +62,7 @@ function verifyProfile(raw, challenge, proof) {
 }
 
 /** 只保存端点状态和信令路由；从不接收或中转聊天正文。 */
-export function createTunnelPlatform({ iceServers = [], turn, webOrigin, appDomain, visitorIpHeader } = {}) {
+export function createTunnelPlatform({ iceServers = defaultIceServers, turn, webOrigin, appDomain, visitorIpHeader } = {}) {
   const web = createWebAccess(webOrigin, appDomain);
   if (visitorIpHeader && !/^x-[a-z0-9-]+$/.test(visitorIpHeader)) throw new Error('访客来源头名称无效。');
   if (turn) {
@@ -373,7 +374,8 @@ export function createTunnelPlatform({ iceServers = [], turn, webOrigin, appDoma
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  const iceServers = JSON.parse(process.env.DSHX_TUNNEL_ICE_SERVERS ?? '[]');
+  const configuredIceServers = process.env.DSHX_TUNNEL_ICE_SERVERS;
+  const iceServers = configuredIceServers === undefined ? defaultIceServers : JSON.parse(configuredIceServers);
   if (!Array.isArray(iceServers)) throw new Error('DSHX_TUNNEL_ICE_SERVERS 必须是 JSON 数组。');
   const turnUrls = process.env.DSHX_TUNNEL_TURN_URLS;
   const secretFile = process.env.DSHX_TUNNEL_TURN_SECRET_FILE;
