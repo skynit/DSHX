@@ -484,6 +484,152 @@ class CoreTest {
         }
     }
 
+    @Test fun tunnelSignalingCancelsAnUpgradeBeforeTheServerResponds() {
+        val identity = testTunnelIdentity()
+        java.net.ServerSocket(0, 1, java.net.InetAddress.getByName("127.0.0.1")).use { server ->
+            server.soTimeout = 3000
+            val http = tunnelHttpClient().newBuilder().readTimeout(15, TimeUnit.SECONDS).build()
+            TunnelSignalingClient(http).use { client ->
+                val calls = AtomicInteger()
+                client.connect("ws://127.0.0.1:${server.localPort}/api/v1/signaling",
+                    TunnelChatSettings(endpointId = identity.endpointId), identity) { calls.incrementAndGet() }
+                server.accept().use { peer ->
+                    peer.soTimeout = 3000
+                    val input = peer.getInputStream().bufferedReader()
+                    assertTrue(input.readLine().startsWith("GET /api/v1/signaling"))
+                    while (!input.readLine().isNullOrEmpty()) Unit
+                    client.close()
+                    assertEquals("取消后服务器应立即收到 EOF", null, input.readLine())
+                    assertEquals(0, calls.get())
+                }
+            }
+        }
+    }
+
+    @Test fun tunnelSignalingFailsWhenItsWssPeerDoesNotAnswerPing() {
+        val identity = testTunnelIdentity()
+        val (tls, http) = tunnelTestTls()
+        val failures = java.util.concurrent.LinkedBlockingQueue<Throwable>()
+        java.net.ServerSocket(0, 1, java.net.InetAddress.getByName("127.0.0.1")).use { server ->
+            server.soTimeout = 3000
+            val clientHttp = http.newBuilder().pingInterval(100, TimeUnit.MILLISECONDS).build()
+            TunnelSignalingClient(clientHttp).use { client ->
+                client.connect("wss://localhost:${server.localPort}/api/v1/signaling",
+                    TunnelChatSettings(endpointId = identity.endpointId), identity) {
+                    if (it is TunnelSignalingEvent.Failed) failures.offer(it.error)
+                }
+                server.accept().use { socket ->
+                    val secured = tls.socketFactory.createSocket(socket, "localhost", socket.port, true) as javax.net.ssl.SSLSocket
+                    secured.use { peer ->
+                        peer.useClientMode = false
+                        peer.soTimeout = 3000
+                        val request = peer.getInputStream().bufferedReader().lineSequence().takeWhile { it.isNotEmpty() }.toList()
+                        val key = request.single { it.startsWith("Sec-WebSocket-Key:", ignoreCase = true) }.substringAfter(':').trim()
+                        val accept = java.util.Base64.getEncoder().encodeToString(java.security.MessageDigest.getInstance("SHA-1")
+                            .digest((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").toByteArray()))
+                        val response = "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n" +
+                            "Sec-WebSocket-Accept: $accept\r\n\r\n"
+                        peer.getOutputStream().apply { write(response.toByteArray()); flush() }
+                        // 升级成功后不读取也不回复控制帧，让 Ping 超时结束信令。
+                        assertTrue("未收到 WSS 保活超时", failures.poll(3, TimeUnit.SECONDS) is java.net.SocketTimeoutException)
+                    }
+                }
+            }
+        }
+    }
+
+    @Test fun tunnelSignalingReregistersOverWssAndStopsRetryingWithTheEngine() {
+        val identity = testTunnelIdentity()
+        val states = java.util.concurrent.LinkedBlockingQueue<Status>()
+        MockWebServer().use { server ->
+            val (tls, http) = tunnelTestTls()
+            server.useHttps(tls.socketFactory, false)
+            server.start()
+            val settings = TunnelChatSettings(enabled = true, platformOrigin = server.url("/").toString().removeSuffix("/"),
+                endpointId = identity.endpointId)
+            val context = RuntimeEnvironment.getApplication()
+            TunnelChatSettingsStore(context).save(settings)
+            fun enqueueRegistration(ticket: String) {
+                server.enqueue(MockResponse().setBody(JSONObject().put("challenge", "A".repeat(43)).toString()))
+                server.enqueue(MockResponse().setBody(JSONObject().put("registrationToken", ticket)
+                    .put("endpoint", JSONObject().put("endpointId", identity.endpointId).put("publication", "published")).toString()))
+            }
+            enqueueRegistration("expired-ticket")
+            server.enqueue(MockResponse().setResponseCode(401))
+            enqueueRegistration("fresh-ticket")
+            val peer = AtomicReference<okhttp3.WebSocket>()
+            server.enqueue(MockResponse().withWebSocketUpgrade(object : okhttp3.WebSocketListener() {
+                override fun onMessage(webSocket: okhttp3.WebSocket, text: String) {
+                    peer.set(webSocket)
+                    val request = JSONObject(text)
+                    webSocket.send(JSONObject().put("protocol", TunnelChatProtocol.SIGNALING).put("version", 1)
+                        .put("type", "register_ok").put("reply_to", request.getString("message_id"))
+                        .put("source", JSONObject().put("kind", "platform").put("id", "platform"))
+                        .put("destination", JSONObject().put("kind", "endpoint").put("id", identity.endpointId))
+                        .put("payload", JSONObject().put("registered_route_ids", JSONArray().put(identity.endpointId))
+                            .put("connection_id", "connection")).toString())
+                }
+            }))
+            TunnelChatRuntime(context, identityFactory = { identity }, http = http).use { runtime ->
+                runtime.observe { states.offer(it.status) }
+                runtime.setEngineReady(true)
+                fun await(expected: Status) {
+                    val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+                    while (true) {
+                        val state = states.poll((deadline - System.nanoTime()).coerceAtLeast(0), TimeUnit.NANOSECONDS)
+                        assertNotNull("未进入 $expected，当前为 ${runtime.state}", state)
+                        if (state == expected) return
+                    }
+                }
+                await(Status.OFFLINE)
+                await(Status.ONLINE)
+                val upgrades = (1..6).map { checkNotNull(server.takeRequest(3, TimeUnit.SECONDS)) }
+                    .filter { it.path == TunnelChatProtocol.SIGNALING_PATH }
+                assertEquals(listOf("Bearer expired-ticket", "Bearer fresh-ticket"), upgrades.map { it.getHeader("Authorization") })
+                assertTrue(peer.get().close(1001, "test_disconnect"))
+                await(Status.OFFLINE)
+                runtime.setEngineReady(false)
+                assertNull("引擎停止后仍发起了平台注册", server.takeRequest(1500, TimeUnit.MILLISECONDS))
+            }
+        }
+    }
+
+    @Test fun tunnelSignalingRetryDelayGrowsButIsBounded() {
+        assertTrue(signalRetryDelayMs(0) in 750L..1000L)
+        assertTrue(signalRetryDelayMs(3) in 6000L..8000L)
+        assertTrue(signalRetryDelayMs(Int.MAX_VALUE) in 45_000L..60_000L)
+    }
+
+    private fun testTunnelIdentity() = object : TunnelEndpointIdentity {
+        override val endpointId = "test-route"
+        override val publicKey = byteArrayOf(1)
+        override fun sign(value: ByteArray) = value
+    }
+
+    // 本机 TLS 测试只信任本用例的证书，保留正常的主机名校验。
+    private fun tunnelTestTls(): Pair<javax.net.ssl.SSLContext, okhttp3.OkHttpClient> {
+        val keys = java.security.KeyPairGenerator.getInstance("EC").apply { initialize(256) }.generateKeyPair()
+        val name = org.bouncycastle.asn1.x500.X500Name("CN=localhost")
+        val now = System.currentTimeMillis()
+        val certificate = org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder(name, java.math.BigInteger.ONE,
+            java.util.Date(now - 60_000), java.util.Date(now + 86_400_000), name, keys.public)
+            .addExtension(org.bouncycastle.asn1.x509.Extension.subjectAlternativeName, false,
+                org.bouncycastle.asn1.x509.GeneralNames(org.bouncycastle.asn1.x509.GeneralName(2, "localhost")))
+            .build(org.bouncycastle.operator.jcajce.JcaContentSignerBuilder("SHA256withECDSA").build(keys.private))
+            .let { org.bouncycastle.cert.jcajce.JcaX509CertificateConverter().getCertificate(it) }
+        val store = java.security.KeyStore.getInstance("PKCS12").apply { load(null, null) }
+        store.setCertificateEntry("platform", certificate)
+        val trust = javax.net.ssl.TrustManagerFactory.getInstance(javax.net.ssl.TrustManagerFactory.getDefaultAlgorithm())
+            .apply { init(store) }.trustManagers.filterIsInstance<javax.net.ssl.X509TrustManager>().single()
+        val clientTls = javax.net.ssl.SSLContext.getInstance("TLS").apply { init(null, arrayOf(trust), null) }
+        val password = charArrayOf('t')
+        store.setKeyEntry("platform-key", keys.private, password, arrayOf(certificate))
+        val keyManagers = javax.net.ssl.KeyManagerFactory.getInstance(javax.net.ssl.KeyManagerFactory.getDefaultAlgorithm())
+            .apply { init(store, password) }.keyManagers
+        val serverTls = javax.net.ssl.SSLContext.getInstance("TLS").apply { init(keyManagers, null, null) }
+        return serverTls to tunnelHttpClient().newBuilder().sslSocketFactory(clientTls.socketFactory, trust).build()
+    }
+
     @Test fun tunnelChatQueueKeepsOriginalIdsAcrossRestartAndRetriesEncryptedAtRest() {
         val file = folder.newFile("outbox.json")
         val cipher = FixedTunnelChatQueueCipher(ByteArray(32) { it.toByte() })

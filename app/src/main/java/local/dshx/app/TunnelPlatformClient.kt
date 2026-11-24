@@ -147,11 +147,7 @@ internal class TunnelPeerToken(
  */
 class TunnelPlatformClient(
     origin: String,
-    private val http: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(15, TimeUnit.SECONDS)
-        .followRedirects(false)
-        .build(),
+    private val http: OkHttpClient = tunnelHttpClient(),
 ) {
     private val origin: HttpUrl = origin.trim().removeSuffix("/").toHttpUrl().also {
         require(it.scheme == "https" || it.scheme == "http") { "穿透平台地址必须是 HTTP(S)。" }
@@ -226,7 +222,8 @@ class TunnelPlatformClient(
             val error = runCatching { JSONObject(body).optJSONObject("error") }.getOrNull()
             val code = error?.optString("code")?.takeIf { it.isNotBlank() } ?: "http_${response.code}"
             throw TunnelPlatformException(code, error?.optString("message")?.takeIf { it.isNotBlank() }
-                ?: "穿透平台请求失败（HTTP ${response.code}）。", response.code == 429 || response.code >= 500)
+                ?: "穿透平台请求失败（HTTP ${response.code}）。",
+                response.code == 429 || response.code >= 500 || (response.code == 409 && code == "stale_registration"))
         }
         return response
     }
@@ -288,30 +285,36 @@ class TunnelPlatformClient(
     }
 }
 
+internal fun tunnelHttpClient(): OkHttpClient = OkHttpClient.Builder()
+    .connectTimeout(10, TimeUnit.SECONDS)
+    .readTimeout(15, TimeUnit.SECONDS)
+    .pingInterval(20, TimeUnit.SECONDS)
+    .followRedirects(false)
+    .build()
+
 /** WebSocket 信令事件。业务正文只在 WebRTC DataChannel 上发送。 */
 sealed class TunnelSignalingEvent {
     data class Registered(val connectionId: String?, val registrationToken: String?, val iceServers: List<TunnelIceServer>) : TunnelSignalingEvent()
     data class Message(val type: String, val sessionId: String?, val sourceEndpointId: String?, val payload: JSONObject) : TunnelSignalingEvent()
     data class Failed(val error: Throwable) : TunnelSignalingEvent()
-    data object Closed : TunnelSignalingEvent()
+    data class Closed(val replaced: Boolean) : TunnelSignalingEvent()
 }
 
 class TunnelSignalingClient(
-    private val http: OkHttpClient = OkHttpClient.Builder().pingInterval(20, TimeUnit.SECONDS).followRedirects(false).build(),
+    private val http: OkHttpClient = tunnelHttpClient(),
 ) : AutoCloseable {
-    @Volatile private var socket: WebSocket? = null
-    @Volatile private var endpointId: String? = null
+    private data class Connection(val socket: WebSocket, val endpointId: String)
+    @Volatile private var connection: Connection? = null
 
-    fun connect(url: String, settings: TunnelChatSettings, identity: TunnelEndpointIdentity, registrationToken: String? = null,
-                listener: (TunnelSignalingEvent) -> Unit) {
+    @Synchronized fun connect(url: String, settings: TunnelChatSettings, identity: TunnelEndpointIdentity, registrationToken: String? = null,
+                              listener: (TunnelSignalingEvent) -> Unit) {
         val clean = settings.validate()
         require(identity.endpointId == clean.endpointId) { "端点身份与设置不匹配。" }
-        this.endpointId = clean.endpointId
-        socket?.close(1000, "replaced")
         val request = Request.Builder().url(url).apply {
             registrationToken?.takeIf { it.isNotBlank() }?.let { header("Authorization", "Bearer $it") }
         }.build()
-        socket = http.newWebSocket(request, SocketListener(clean, listener))
+        close()
+        connection = Connection(http.newWebSocket(request, SocketListener(clean, listener)), clean.endpointId)
     }
 
     fun sendOffer(sessionId: String, targetEndpointId: String, sdp: String, conversationId: String = sessionId): Boolean =
@@ -338,23 +341,29 @@ class TunnelSignalingClient(
 
     internal fun closeWeb(session: String, visitor: String): Boolean = sendSignal("web_close", session, visitor, JSONObject())
 
-    internal fun publishWebStatus(enabled: Boolean): Boolean = socket?.send(
-        envelope("web_status", null, null, JSONObject().put("enabled", enabled)).toString(),
-    ) == true
-
-    override fun close() {
-        socket?.close(1000, "client_closed")
-        socket = null
+    internal fun publishWebStatus(enabled: Boolean): Boolean {
+        val current = connection ?: return false
+        return current.socket.send(envelope(current.endpointId, "web_status", null, null, JSONObject().put("enabled", enabled)).toString())
     }
+
+    @Synchronized override fun close() {
+        val previous = connection
+        connection = null
+        // 升级尚未完成时，WebSocket.close 只会排队关闭帧，不能中断 HTTP 握手。
+        previous?.socket?.cancel()
+    }
+
+    @Synchronized private fun isCurrent(webSocket: WebSocket): Boolean = connection?.socket === webSocket
 
     private fun sendSignal(type: String, sessionId: String, targetEndpointId: String, payload: JSONObject): Boolean {
         require(sessionId.isNotBlank() && targetEndpointId.isNotBlank()) { "信令会话和目标端点不能为空。" }
-        val body = envelope(type, sessionId, targetEndpointId, payload)
-        require(body.toString().toByteArray(Charsets.UTF_8).size <= TunnelChatProtocol.MAX_SIGNALING_BYTES) { "信令消息过大。" }
-        return socket?.send(body.toString()) == true
+        val current = connection ?: return false
+        val body = envelope(current.endpointId, type, sessionId, targetEndpointId, payload).toString()
+        require(body.toByteArray(Charsets.UTF_8).size <= TunnelChatProtocol.MAX_SIGNALING_BYTES) { "信令消息过大。" }
+        return current.socket.send(body)
     }
 
-    private fun envelope(type: String, sessionId: String?, targetEndpointId: String?, payload: JSONObject): JSONObject = JSONObject()
+    private fun envelope(endpointId: String, type: String, sessionId: String?, targetEndpointId: String?, payload: JSONObject): JSONObject = JSONObject()
         .put("protocol", TunnelChatProtocol.SIGNALING)
         .put("version", 1)
         .put("type", type)
@@ -363,7 +372,7 @@ class TunnelSignalingClient(
             sessionId?.let { put("session_id", it) }
             // Signaling V1 的 register 首帧不得包含 source/destination。
             if (type != "register" && type != "register_proof") {
-                endpointId?.let { put("source", JSONObject().put("kind", "endpoint").put("id", it)) }
+                put("source", JSONObject().put("kind", "endpoint").put("id", endpointId))
                 targetEndpointId?.let { put("destination", JSONObject().put("kind", "endpoint").put("id", it)) }
             }
             if (payload.length() > 0 || type != "error") put("payload", JSONObject(payload.toString()))
@@ -373,15 +382,17 @@ class TunnelSignalingClient(
         private var registerId: String? = null
         private var registered = false
         override fun onOpen(webSocket: WebSocket, response: Response) {
+            if (!isCurrent(webSocket)) return
             val route = JSONObject().put("id", settings.endpointId)
             if (settings.publication == TunnelPublication.HIDDEN) route.put("code", UUID.randomUUID().toString())
-            val body = envelope("register", null, null, JSONObject()
+            val body = envelope(settings.endpointId, "register", null, null, JSONObject()
                 .put("routes", JSONArray().put(route)))
             registerId = body.getString("message_id")
             webSocket.send(body.toString())
         }
 
         override fun onMessage(webSocket: WebSocket, text: String) {
+            if (!isCurrent(webSocket)) return
             if (text.toByteArray(Charsets.UTF_8).size > TunnelChatProtocol.MAX_SIGNALING_BYTES) {
                 listener(TunnelSignalingEvent.Failed(IllegalArgumentException("入站信令消息过大。")))
                 webSocket.close(1009, "message_too_large")
@@ -394,17 +405,23 @@ class TunnelSignalingClient(
         }
 
         override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+            if (!isCurrent(webSocket)) return
             listener(TunnelSignalingEvent.Failed(IllegalArgumentException("信令不接受二进制消息。")))
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-            listener(TunnelSignalingEvent.Failed(t))
+            if (!isCurrent(webSocket)) return
+            val error = response?.takeUnless { it.code == 101 }?.let {
+                TunnelPlatformException("signal_http_${it.code}", "穿透信令升级失败（HTTP ${it.code}）。",
+                    retryable = it.code == 401 || it.code == 409 || it.code == 429 || it.code >= 500)
+            } ?: t
+            listener(TunnelSignalingEvent.Failed(error))
         }
 
         override fun onClosing(webSocket: WebSocket, code: Int, reason: String) { webSocket.close(1000, null) }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-            listener(TunnelSignalingEvent.Closed)
+            if (isCurrent(webSocket)) listener(TunnelSignalingEvent.Closed(code == 1000 && reason == "registration_changed"))
         }
 
         private fun handle(value: JSONObject) {
@@ -416,7 +433,11 @@ class TunnelSignalingClient(
             if (!registered) {
                 require(source?.optString("kind") == "platform" && value.optString("reply_to") == registerId) { "信令注册回执无效。" }
                 if (type == "register_challenge") error("平台要求端点证书挑战，当前客户端尚不支持。")
-                if (type == "error") error("平台拒绝信令注册：${value.optJSONObject("error")?.optString("code").orEmpty()}")
+                if (type == "error") {
+                    val failure = value.optJSONObject("error")
+                    val code = failure?.optString("code").orEmpty()
+                    throw TunnelPlatformException(code, "平台拒绝信令注册：$code", retryable = failure?.optBoolean("retryable") == true)
+                }
                 require(type == "register_ok" && payload.optJSONArray("registered_route_ids")?.optString(0) == settings.endpointId) { "平台未确认本端路由。" }
                 registered = true
             }

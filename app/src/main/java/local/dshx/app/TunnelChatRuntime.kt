@@ -7,16 +7,23 @@ import android.graphics.Bitmap
 import android.net.Uri
 import chatquic.Chatquic
 import chatquic.Peer
+import okhttp3.OkHttpClient
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.IOException
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArraySet
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.TimeUnit
+import javax.net.ssl.SSLHandshakeException
+import javax.net.ssl.SSLPeerUnverifiedException
+import kotlin.random.Random
 
 data class TunnelChatRuntimeState(
     val status: Status = Status.DISABLED,
@@ -30,13 +37,23 @@ data class TunnelChatRuntimeState(
 /** 运行状态只反映客户端本地生命周期，不把“平台注册成功”冒充为“聊天连接成功”。 */
 enum class Status { DISABLED, STARTING, ONLINE, OFFLINE, FAILED }
 
+private enum class SignalRetry { FAST, SLOW, NONE }
+
+// 网络故障时逐步延长等待；加少量随机偏移，避免平台恢复时端点同时拨号。
+internal fun signalRetryDelayMs(attempt: Int): Long {
+    val ceiling = minOf(60_000L, 1_000L shl attempt.coerceIn(0, 6))
+    return Random.nextLong(ceiling * 3 / 4, ceiling + 1)
+}
+
 class TunnelChatRuntime(
     private val context: Context,
     private val worker: ExecutorService = Executors.newSingleThreadExecutor(),
+    identityFactory: () -> TunnelEndpointIdentity = ::AndroidTunnelEndpointIdentity,
+    private val http: OkHttpClient = tunnelHttpClient(),
 ) : AutoCloseable {
     private val settingsStore = TunnelChatSettingsStore(context)
     private val listeners = CopyOnWriteArraySet<(TunnelChatRuntimeState) -> Unit>()
-    private val signaling = TunnelSignalingClient()
+    private val signaling = TunnelSignalingClient(http)
     private val sessionBindings = ConcurrentHashMap<String, SessionBinding>()
     private val authenticatedSessions = ConcurrentHashMap.newKeySet<String>()
     private val conversationMessages = mutableMapOf<String, MutableList<ChatMessage>>()
@@ -55,15 +72,19 @@ class TunnelChatRuntime(
     private var receiving = false
     private var receptionEpoch = 0L
     private var pendingReply: ReceptionReply? = null
-    private val retryScheduler = Executors.newSingleThreadScheduledExecutor { task -> Thread(task, "dshx-tunnel-retry").apply { isDaemon = true } }
+    private val retryScheduler = ScheduledThreadPoolExecutor(1) { task ->
+        Thread(task, "dshx-tunnel-retry").apply { isDaemon = true }
+    }.apply { removeOnCancelPolicy = true }
+    private var registrationRetry: ScheduledFuture<*>? = null
+    private var registrationTimeout: ScheduledFuture<*>? = null
+    private var registrationFailures = 0
     @Volatile private var registration: TunnelPlatformRegistration? = null
-    private val identity by lazy { AndroidTunnelEndpointIdentity() }
+    private val identity by lazy(identityFactory)
     internal val webShares = WebShares(context) { port -> (context.applicationContext as? DshApp)?.engine?.ownsLocalPort(port) == true }
     private var web: WebShareServer? = null
     private var generation = 0L
     @Volatile private var closed = false
     @Volatile private var engineReady = false
-    @Volatile private var nextRegistrationAttempt = Long.MAX_VALUE
     @Volatile private var acceptingSignals = false
     @Volatile private var currentSettings = settingsStore.read()
     private var publishedOrigins = settingsStore.publishedOrigins()
@@ -92,8 +113,7 @@ class TunnelChatRuntime(
                 synchronized(this) {
                     if (closed) return@synchronized
                     runCatching {
-                        if (engineReady && System.currentTimeMillis() >= nextRegistrationAttempt) start()
-                        if (state.status == Status.ONLINE) retryQueued()
+                        if (state.status == Status.ONLINE || authenticatedSessions.isNotEmpty()) retryQueued()
                         web?.checkTargets()
                         sessionBindings.values.forEach {
                             if (it.sessionId in authenticatedSessions && !it.closing) sampleLink(it)
@@ -153,8 +173,9 @@ class TunnelChatRuntime(
         }
         if (!clean.enabled) stop()
         else if (previous != currentSettings && engineReady) {
+            registrationFailures = 0
             if (previous.platformOrigin != clean.platformOrigin || clean.publication == TunnelPublication.HIDDEN) stop()
-            else disconnectSignaling("正在应用端点设置…", retry = false)
+            else disconnectSignaling("正在应用端点设置…", SignalRetry.NONE)
             if (withdrawals().isNotEmpty()) submit { syncWithdrawals() }
             start()
         } else if (!engineReady) update(initialState(clean))
@@ -201,7 +222,7 @@ class TunnelChatRuntime(
             update(initialState(currentSettings))
             return
         }
-        nextRegistrationAttempt = Long.MAX_VALUE
+        cancelRegistrationTimers()
         val run = ++generation
         acceptingSignals = true
         update(TunnelChatRuntimeState(Status.STARTING, "正在注册聊天端点…", currentSettings.descriptor(online = false)))
@@ -217,7 +238,7 @@ class TunnelChatRuntime(
                         }
                     }
                 }
-                val platform = TunnelPlatformClient(clean.platformOrigin)
+                val platform = TunnelPlatformClient(clean.platformOrigin, http)
                 platform.registerEndpoint(clean, identity, webShare = webShares.publicList().isNotEmpty())
             }
             synchronized(this) {
@@ -228,11 +249,14 @@ class TunnelChatRuntime(
                     signaling.connect(result.signalingUrl, currentSettings, identity, result.registrationToken) { event ->
                         onWorker { if (isCurrent(run)) handleSignalingEvent(event) }
                     }
-                    retryScheduler.schedule({ onWorker {
-                        if (isCurrent(run) && state.status == Status.STARTING) disconnectSignaling("等待信令注册超时。", retry = true)
+                    registrationTimeout = retryScheduler.schedule({ onWorker {
+                        if (isCurrent(run) && state.status == Status.STARTING) {
+                            disconnectSignaling("等待信令注册超时。", SignalRetry.FAST)
+                        }
                     } }, 25, TimeUnit.SECONDS)
                 }.onFailure { error ->
-                    disconnectSignaling(error.message ?: "穿透平台注册失败。", (error as? TunnelPlatformException)?.retryable == true)
+                    val retry = if ((error as? TunnelPlatformException)?.retryable == true) SignalRetry.FAST else SignalRetry.NONE
+                    disconnectSignaling(error.message ?: "穿透平台注册失败。", retry)
                 }
             }
         }
@@ -251,7 +275,8 @@ class TunnelChatRuntime(
         receptionEpoch++
         pendingReply = null
         acceptingSignals = false
-        nextRegistrationAttempt = Long.MAX_VALUE
+        cancelRegistrationTimers()
+        registrationFailures = 0
         web?.close()
         web = null
         signaling.close()
@@ -545,6 +570,7 @@ class TunnelChatRuntime(
             if (selected.isEmpty()) return@forEach
             val binding = binding(conversationId)
             if (binding == null) {
+                if (state.status != Status.ONLINE) return@forEach
                 attempted += selected
                 reconnect += conversation
             } else if (binding.sessionId in authenticatedSessions) {
@@ -561,6 +587,9 @@ class TunnelChatRuntime(
         if (!acceptingSignals) return
         when (event) {
             is TunnelSignalingEvent.Registered -> {
+                registrationTimeout?.cancel(false)
+                registrationTimeout = null
+                registrationFailures = 0
                 if (event.iceServers.isNotEmpty()) registration = registration?.copy(iceServers = event.iceServers)
                 val message = when {
                     withdrawals().isNotEmpty() -> "正在确认撤下旧平台上的公开端点…"
@@ -571,23 +600,44 @@ class TunnelChatRuntime(
                 updateWebCapability()
             }
             is TunnelSignalingEvent.Message -> handleSignalingMessage(event)
-            is TunnelSignalingEvent.Failed -> disconnectSignaling(
-                if (event.error is java.io.IOException) "穿透信令连接失败。" else event.error.message ?: "穿透信令失败。",
-                event.error is java.io.IOException,
-            )
-            TunnelSignalingEvent.Closed -> disconnectSignaling("穿透信令已断开。", retry = true)
+            is TunnelSignalingEvent.Failed -> {
+                val error = event.error
+                val retry = when (error) {
+                    is TunnelPlatformException -> if (error.retryable) SignalRetry.FAST else SignalRetry.SLOW
+                    is SSLHandshakeException, is SSLPeerUnverifiedException -> SignalRetry.SLOW
+                    is IOException -> SignalRetry.FAST
+                    else -> SignalRetry.SLOW
+                }
+                val message = if (error is IOException) "穿透信令连接失败。" else error.message ?: "穿透信令失败。"
+                disconnectSignaling(message, retry)
+            }
+            is TunnelSignalingEvent.Closed -> disconnectSignaling("穿透信令已断开。",
+                if (event.replaced) SignalRetry.SLOW else SignalRetry.FAST)
         }
     }
 
-    private fun disconnectSignaling(message: String, retry: Boolean) {
+    private fun cancelRegistrationTimers() {
+        registrationRetry?.cancel(false)
+        registrationRetry = null
+        registrationTimeout?.cancel(false)
+        registrationTimeout = null
+    }
+
+    private fun disconnectSignaling(message: String, retry: SignalRetry) {
         acceptingSignals = false
-        generation++
+        val run = ++generation
+        cancelRegistrationTimers()
         registration = null
-        nextRegistrationAttempt = if (retry) System.currentTimeMillis() + 15_000L else Long.MAX_VALUE
         web?.stop()
         signaling.close()
         sessionBindings.values.filterNot { it.sessionId in authenticatedSessions }.forEach { disconnectSession(it.sessionId) }
-        update(TunnelChatRuntimeState(if (retry) Status.OFFLINE else Status.FAILED, message, currentSettings.descriptor(false)))
+        if (retry != SignalRetry.NONE && engineReady && currentSettings.enabled) {
+            val delay = if (retry == SignalRetry.SLOW) TimeUnit.MINUTES.toMillis(5) else {
+                signalRetryDelayMs(registrationFailures).also { registrationFailures = (registrationFailures + 1).coerceAtMost(6) }
+            }
+            registrationRetry = retryScheduler.schedule({ onWorker { if (run == generation) start() } }, delay, TimeUnit.MILLISECONDS)
+        }
+        update(TunnelChatRuntimeState(if (retry == SignalRetry.NONE) Status.FAILED else Status.OFFLINE, message, currentSettings.descriptor(false)))
     }
 
     private fun handleSignalingMessage(event: TunnelSignalingEvent.Message) {
