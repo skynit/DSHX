@@ -14,7 +14,7 @@
 
 ## 平台部署
 
-用 `python3 tools/tunnel.py build` 构建穿透平台包。与 [聊天平台](tunnel-chat.md) 同一个进程，可选配置：
+用 `python3 tools/tunnel.py build` 构建穿透平台包 `build/dshx-tunnel-platform.tar.gz`。包内自带访问页、桥接页和 Service Worker，不需要单独编译前端。网页入口与[聊天平台](tunnel-chat.md)由同一个进程提供：
 
 | 配置 | 用途 |
 |---|---|
@@ -23,6 +23,10 @@
 | `DSHX_WEB_VISITOR_IP_HEADER` | 可选，例如 `x-real-ip`。只有平台入口受可信反代保护、反代始终用访客的真实 IP 覆盖该头时才能设置；否则按直连平台的 IP 计数。 |
 
 前两个配置必须同时提供。反向代理保留外部 `Host`，转发可信来源的 `/web/`、`/api/v1/dshx/web/signaling`（WebSocket 升级）、既有聊天目录和信令路径，以及应用泛域名的 `/__dshx/`。其他应用子域名路径不得交给平台 HTTP 代理。浏览器的 Service Worker（拦截应用网页请求的后台脚本）接管业务路径；没接管时平台明确返回 `404`。
+
+访问入口 `/web/` 显示公开端点和网页列表，负责维持访客到发布设备的数据连接。点「打开网页」时，入口先在独立应用子域名里打开桥接页。桥接页注册并确认本域的 `/__dshx/sw.js` 已接管请求，然后才打开共享网页。共享网页的同源请求走「Service Worker → 桥接页 → 访客入口 → 发布设备」，发布设备再访问事先登记的服务。发布者不需要在自己的网页里安装 Service Worker。
+
+部署后先检查 `/web/` 返回 `200`，再用已公开在线的客户端打开一个共享条目。应用子域名的 `GET /__dshx/sw.js` 应返回 JavaScript 和 `Service-Worker-Allowed: /`；同一子域名的业务路径在没有 Service Worker 接管时应返回 `404`。只确认入口能打开，不算穿透验收通过。
 
 中继复用[聊天的 TURN 部署配置](tunnel-chat.md)：配置 `DSHX_TUNNEL_TURN_URLS` 和 `DSHX_TUNNEL_TURN_SECRET_FILE`，并保持 coturn 的私网目的地址限制、带宽和连接配额。未配置 TURN 时网页只尝试直连。已有部署须同时更新 Android 发布端和平台；浏览器代码由平台提供。
 

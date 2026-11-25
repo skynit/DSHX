@@ -1,4 +1,6 @@
 const directory = document.querySelector('#directory');
+const endpoints = document.querySelector('#endpoints');
+const refresh = document.querySelector('#refresh');
 const shares = document.querySelector('#shares');
 const viewer = document.querySelector('#viewer');
 const status = document.querySelector('#status');
@@ -24,23 +26,31 @@ function row(parent, text, label, action, disabled = false) {
   parent.append(line);
 }
 
-async function listEndpoints(cursor) {
+async function listEndpoints(cursor, more) {
+  if (refresh.disabled) return;
+  refresh.disabled = true;
+  const moreButton = more?.querySelector('button');
+  if (moreButton) moreButton.disabled = true;
   const url = new URL('/api/v1/dshx/chat/endpoints', location.origin);
   if (cursor) url.searchParams.set('cursor', cursor);
   status.textContent = '正在读取端点…';
   try {
-    const response = await fetch(url);
+    const response = await fetch(url, { signal: AbortSignal.timeout(8000) });
     if (!response.ok) throw Error();
     const page = await response.json();
     const open = page.items.filter(item => item.capabilities?.includes('web-share'));
-    for (const item of open) row(directory, item.displayName || item.endpointId, item.online ? '查看网页' : '离线',
+    if (cursor) more.remove();
+    else endpoints.replaceChildren();
+    for (const item of open) row(endpoints, item.displayName || item.endpointId, item.online ? '查看网页' : '离线',
       () => connect(item.endpointId), !item.online);
-    if (page.nextCursor) row(directory, '', '加载更多', event => {
-      event.currentTarget.parentElement.remove();
-      void listEndpoints(page.nextCursor);
-    });
-    status.textContent = directory.childElementCount ? '' : '暂无公开网页';
-  } catch { status.textContent = '无法读取公开端点'; }
+    if (page.nextCursor) row(endpoints, '', '加载更多', event => void listEndpoints(page.nextCursor, event.currentTarget.parentElement));
+    if (!directory.hidden) status.textContent = endpoints.childElementCount ? '' : '暂无公开网页';
+  } catch {
+    if (!directory.hidden) status.textContent = '无法读取公开端点';
+  } finally {
+    refresh.disabled = false;
+    if (moreButton) moreButton.disabled = false;
+  }
 }
 
 function connect(endpointId, initialShare) {
@@ -58,8 +68,7 @@ function connect(endpointId, initialShare) {
     directory.hidden = false;
     viewer.hidden = true;
     history.replaceState(null, '', '/web/');
-    if (!directory.childElementCount) void listEndpoints();
-    else status.textContent = '';
+    void listEndpoints();
   });
   status.textContent = '正在建立直连…';
   const connection = new Peer(endpointId, onFrame, message => {
@@ -370,6 +379,7 @@ function derToRaw(signature) {
 }
 
 const query = new URLSearchParams(location.search);
+refresh.addEventListener('click', () => void listEndpoints());
 if (query.has('endpoint')) connect(query.get('endpoint'), query.get('share'));
 else void listEndpoints();
 addEventListener('pagehide', () => active?.close());

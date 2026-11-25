@@ -6,8 +6,21 @@
 <title>DSHX 网页共享</title>
 <link rel="stylesheet" href="/web/portal.css">
 <main>
-  <header><h1>网页共享</h1><span id="status" role="status"></span></header>
-  <section id="directory" aria-label="公开端点"></section>
+  <header><h1>DSHX 网页共享</h1><span id="status" role="status"></span></header>
+  <section id="directory" aria-labelledby="directory-title">
+    <div class="directory-header">
+      <h2 id="directory-title">公开端点</h2>
+      <button id="refresh" type="button" aria-label="刷新端点" title="刷新端点">
+        <svg aria-hidden="true" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/>
+          <path d="M21 3v5h-5"/>
+          <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/>
+          <path d="M8 16H3v5"/>
+        </svg>
+      </button>
+    </div>
+    <div id="endpoints"></div>
+  </section>
   <section id="shares" aria-label="网页列表" hidden></section>
   <div id="viewer" hidden></div>
 </main>

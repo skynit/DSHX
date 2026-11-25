@@ -311,6 +311,12 @@ test(`real Chromium loads and writes a shared app through Service Worker and a v
     };
   });
   visitor.on('pageerror', error => t.diagnostic(error.stack));
+  await visitor.goto(`${origin}/web/`);
+  await visitor.getByRole('button', { name: '查看网页' }).waitFor();
+  const reloaded = visitor.waitForResponse(response => new URL(response.url()).pathname === directory);
+  await visitor.getByRole('button', { name: '刷新端点' }).click({ timeout: 2500 });
+  assert.equal((await reloaded).status(), 200);
+  await visitor.getByRole('button', { name: '查看网页' }).waitFor();
   await visitor.goto(`${origin}/web/?endpoint=${publisher.profile.endpointId}&share=${share}`);
   const app = visitor.frameLocator('#viewer > iframe').frameLocator('iframe');
   try { await app.getByRole('heading', { name: 'Shared application' }).waitFor({ timeout: 42_000 }); }
@@ -325,6 +331,7 @@ test(`real Chromium loads and writes a shared app through Service Worker and a v
   if (turn) assert.ok(link.kinds.includes('relay'));
   else assert.ok(link.kinds.every(kind => ['host', 'srflx', 'prflx'].includes(kind)));
   const result = await app.locator('body').evaluate(async () => {
+    const worker = new URL(navigator.serviceWorker.controller.scriptURL);
     const plain = await fetch('/data').then(r => r.text());
     const upload = await fetch('/submit', { method: 'POST', body: 'x'.repeat(20_000) }).then(r => r.text());
     const range = await fetch('/range', { headers: { Range: 'bytes=1-3' } });
@@ -335,9 +342,9 @@ test(`real Chromium loads and writes a shared app through Service Worker and a v
       ws.onmessage = event => { resolve(event.data); ws.close(); };
       setTimeout(() => reject(Error('WebSocket timed out')), 5000);
     });
-    return { plain, upload: upload.length, echo, range: range.status, portion: await range.text() };
+    return { worker: worker.origin === location.origin && worker.pathname, plain, upload: upload.length, echo, range: range.status, portion: await range.text() };
   });
-  assert.deepEqual(result, { plain: 'fixtures work', upload: 20_000, echo: 'ping', range: 206, portion: 'BCD' });
+  assert.deepEqual(result, { worker: '/__dshx/sw.js', plain: 'fixtures work', upload: 20_000, echo: 'ping', range: 206, portion: 'BCD' });
   const download = visitor.waitForEvent('download', { timeout: 5000 });
   await app.getByRole('link', { name: 'Download' }).click();
   assert.equal((await download).suggestedFilename(), 'fixture.txt');
