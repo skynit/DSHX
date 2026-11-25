@@ -56,23 +56,28 @@ async function listEndpoints(cursor, more) {
   }
 }
 
-function showViewer(visible) {
-  controls.hidden = visible;
-  viewer.hidden = !visible;
+function show(screen) {
+  controls.hidden = screen !== 'controls';
+  viewer.hidden = screen !== 'viewer';
 }
 
 function showRoute() {
   active?.close();
   active = null;
-  showViewer(false);
   shares.replaceChildren();
   shares.hidden = true;
   const query = new URLSearchParams(location.search);
   directory.hidden = query.has('endpoint');
-  if (!directory.hidden) { void listEndpoints(); return; }
   const endpointId = query.get('endpoint');
-  if (!uuid.test(endpointId)) { status.textContent = '端点地址无效'; return; }
-  connect(endpointId, query.get('share'));
+  if (uuid.test(endpointId)) {
+    const share = query.get('share');
+    show(share ? 'blank' : 'controls');
+    connect(endpointId, share);
+  } else {
+    show('controls');
+    if (directory.hidden) status.textContent = '端点地址无效';
+    else void listEndpoints();
+  }
 }
 
 function connect(endpointId, initialShare) {
@@ -83,7 +88,7 @@ function connect(endpointId, initialShare) {
   status.textContent = '正在建立直连…';
   const connection = new Peer(endpointId, onFrame, message => {
     if (active !== connection) return;
-    showViewer(false);
+    show('controls');
     shares.hidden = false;
     status.textContent = message;
   }, message => { if (active === connection) status.textContent = message; });
@@ -109,19 +114,21 @@ function connect(endpointId, initialShare) {
     if (frame.done === false) return;
     if (selected) void open(selected);
     else {
+      show('controls');
       shares.hidden = false;
       status.textContent = initialShare ? '找不到指定的网页' : itemCount ? connection.connectedLabel : '没有可访问的网页';
     }
   }
   async function open(item) {
     shares.hidden = true;
-    status.textContent = '正在打开网页…';
+    show('blank');
     try {
       await connection.view(item);
-      if (active === connection && !connection.closed) showViewer(true);
+      if (active === connection && !connection.closed) show('viewer');
     } catch {
       if (active !== connection || connection.closed) return;
       connection.disposeView();
+      show('controls');
       shares.hidden = false;
       status.textContent = '无法初始化网页入口';
     }

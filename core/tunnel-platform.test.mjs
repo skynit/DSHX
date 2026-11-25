@@ -322,11 +322,24 @@ test(`real Chromium loads and writes a shared app through Service Worker and a v
   await visitor.getByRole('button', { name: '查看网页' }).waitFor();
   const listURL = `${origin}/web/?endpoint=${publisher.profile.endpointId}`;
   const shareURL = `${listURL}&share=${share}`;
-  if (turn) await visitor.goto(shareURL);
-  else {
-    await visitor.getByRole('button', { name: '查看网页' }).click();
-    await visitor.getByRole('button', { name: '打开网页' }).click();
+  async function checkBlankWhile(pattern, open) {
+    const pending = Promise.withResolvers();
+    await visitor.route(pattern, route => pending.resolve(route), { times: 1 });
+    await open();
+    const route = await pending.promise;
+    try {
+      await visitor.locator('main').waitFor({ state: 'attached', timeout: 5000 });
+      assert.equal(await visitor.locator('main').isVisible(), false, pattern);
+      assert.equal(await visitor.locator('#viewer').isVisible(), false, pattern);
+    } finally { await route.continue(); }
   }
+  await checkBlankWhile('**/__dshx/bridge', async () => {
+    if (turn) await visitor.goto(shareURL, { waitUntil: 'commit' });
+    else {
+      await visitor.getByRole('button', { name: '查看网页' }).click();
+      await visitor.getByRole('button', { name: '打开网页' }).click();
+    }
+  });
   const app = visitor.frameLocator('#viewer > iframe').frameLocator('iframe');
   try { await app.getByRole('heading', { name: 'Shared application' }).waitFor({ timeout: 42_000 }); }
   catch (error) { t.diagnostic(`访客状态：${await visitor.locator('#status').textContent()}`); throw error; }
@@ -388,6 +401,10 @@ test(`real Chromium loads and writes a shared app through Service Worker and a v
   assert.equal((await download).suggestedFilename(), 'fixture.txt');
   await app.getByRole('link', { name: 'Redirect' }).click();
   await app.getByText('fixtures work').waitFor({ timeout: 5000 });
+  if (!turn) {
+    await checkBlankWhile('**/web/portal.js', () => visitor.goto(shareURL, { waitUntil: 'commit' }));
+    await app.getByRole('heading', { name: 'Shared application' }).waitFor({ timeout: 5000 });
+  }
   publisherSocket.close();
   await visitor.getByText('端点已停止网页访问').waitFor({ timeout: 5000 });
   assert.equal(await visitor.locator('main').isVisible(), true);
