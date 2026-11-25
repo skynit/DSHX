@@ -1,4 +1,5 @@
 const controls = document.querySelector('main');
+const controlStyles = document.querySelector('#control-styles').content;
 const directory = document.querySelector('#directory');
 const directoryTitle = document.querySelector('#directory-title');
 const directoryStatus = document.querySelector('#directory-status');
@@ -19,17 +20,26 @@ const reserved = /^\/__dshx(?:\/|$)/;
 const maxChunk = 12 * 1024;
 let active;
 
-function row(parent, text, label, action, online) {
+function row(parent, text, label, action, device) {
   const line = itemRow.content.firstElementChild.cloneNode(true);
   line.querySelector('.item-name').textContent = text;
   const button = line.querySelector('button');
   button.querySelector('span').textContent = label;
-  if (online !== undefined) {
+  if (device) {
+    const { online, endpointId } = device;
+    const id = line.querySelector('.item-id');
+    if (text !== endpointId && uuid.test(endpointId)) {
+      id.hidden = false;
+      const summary = id.querySelector('summary');
+      summary.textContent = `${endpointId.slice(0, 8)}…${endpointId.slice(-4)}`;
+      summary.title = endpointId;
+      id.querySelector('span').textContent = endpointId;
+    }
     line.querySelector('.item-icon use').setAttribute('href', '#device-icon');
     const badge = line.querySelector('.availability');
     badge.hidden = false;
     badge.textContent = online ? '在线' : '离线';
-    badge.classList.toggle('online', online);
+    badge.classList.add(online ? 'badge-success' : 'badge-neutral');
     button.disabled = !online;
   }
   button.addEventListener('click', action);
@@ -39,6 +49,7 @@ function row(parent, text, label, action, online) {
 async function listEndpoints(cursor, more) {
   if (refresh.disabled) return;
   refresh.disabled = true;
+  endpoints.setAttribute('aria-busy', 'true');
   const moreButton = more?.querySelector('button');
   if (moreButton) moreButton.disabled = true;
   const url = new URL('/api/v1/dshx/chat/endpoints', location.origin);
@@ -54,11 +65,12 @@ async function listEndpoints(cursor, more) {
     for (const item of open) row(endpoints, item.displayName || item.endpointId, '查看网页', () => {
       history.pushState(null, '', `/web/?endpoint=${encodeURIComponent(item.endpointId)}`);
       showRoute();
-    }, Boolean(item.online));
+    }, item);
     if (page.nextCursor) {
       const footer = document.createElement('div');
       footer.className = 'more';
       const button = document.createElement('button');
+      button.className = 'btn btn-ghost btn-sm';
       button.textContent = '加载更多';
       button.addEventListener('click', () => void listEndpoints(page.nextCursor, footer));
       footer.append(button);
@@ -68,12 +80,14 @@ async function listEndpoints(cursor, more) {
   } catch {
     directoryStatus.textContent = '无法读取公开端点';
   } finally {
+    endpoints.removeAttribute('aria-busy');
     refresh.disabled = false;
     if (moreButton) moreButton.disabled = false;
   }
 }
 
 function show(screen) {
+  if (screen === 'controls' && controlStyles.childElementCount) document.head.append(controlStyles);
   controls.hidden = screen !== 'controls';
   viewer.hidden = screen !== 'viewer';
 }

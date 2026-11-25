@@ -256,6 +256,28 @@ test(`real Chromium loads and writes a shared app through Service Worker and a v
   assert.equal(await endpointDirectory.getByText('在线', { exact: true }).isVisible(), true);
   assert.equal(await endpointDirectory.getByRole('status').textContent(), '');
   assert.deepEqual(await refreshButton.boundingBox(), refreshPosition);
+  const id = publisher.profile.endpointId;
+  const shortId = endpointDirectory.getByTitle(id, { exact: true });
+  assert.equal(await shortId.textContent(), `${id.slice(0, 8)}…${id.slice(-4)}`);
+  const idPosition = await shortId.boundingBox();
+  assert.ok(idPosition);
+  await shortId.focus();
+  await visitor.keyboard.press('Enter');
+  assert.equal(await endpointDirectory.getByText(id, { exact: true }).isVisible(), true);
+  await visitor.keyboard.press('Enter');
+  await visitor.route(`**${directory}`, route => route.fulfill({ status: 503 }), { times: 1 });
+  await refreshButton.click();
+  await endpointDirectory.getByText('无法读取公开端点').waitFor();
+  const pendingRefresh = Promise.withResolvers();
+  await visitor.route(`**${directory}`, route => pendingRefresh.resolve(route), { times: 1 });
+  await refreshButton.click();
+  const paused = await pendingRefresh.promise;
+  try {
+    assert.equal(await refreshButton.isDisabled(), true);
+    assert.equal(await endpointDirectory.getByRole('status').textContent(), '正在读取端点…');
+    assert.deepEqual(await shortId.boundingBox(), idPosition);
+  } finally { await paused.continue(); }
+  await visitor.waitForFunction(() => !document.querySelector('#refresh').disabled);
 
   const publishing = await context.newPage();
   await publishing.goto('about:blank');
@@ -419,8 +441,11 @@ test(`real Chromium loads and writes a shared app through Service Worker and a v
   await app.getByRole('link', { name: 'Redirect' }).click();
   await app.getByText('fixtures work').waitFor({ timeout: 5000 });
   if (!turn) {
+    const componentRequests = [];
+    visitor.on('request', request => { if (request.url().includes('/web/vendor/')) componentRequests.push(request.url()); });
     await checkBlankWhile('**/web/portal.js', () => visitor.goto(shareURL, { waitUntil: 'commit' }));
     await app.getByRole('heading', { name: 'Shared application' }).waitFor({ timeout: 5000 });
+    assert.deepEqual(componentRequests, []);
   }
   publisherSocket.close();
   await visitor.getByText('端点已停止网页访问').waitFor({ timeout: 5000 });

@@ -5,6 +5,10 @@ const portal = new Map([
   ['/web/', ['portal.html', 'text/html']],
   ['/web/portal.js', ['portal.js', 'text/javascript']],
   ['/web/portal.css', ['portal.css', 'text/css']],
+  ...['button.css', 'badge.css', 'list.css', 'LICENSE'].map(name => {
+    const file = `vendor/daisyui-5.8.2/${name}`;
+    return [`/web/${file}`, [file, name === 'LICENSE' ? 'text/plain' : 'text/css']];
+  }),
   ['/web/dshx-icon.svg', ['dshx-icon.svg', 'image/svg+xml']],
   ['/web/dshx-icon-dark.svg', ['dshx-icon-dark.svg', 'image/svg+xml']],
 ]);
