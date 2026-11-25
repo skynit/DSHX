@@ -229,7 +229,8 @@ test(`real Chromium loads and writes a shared app through Service Worker and a v
   const publishing = await context.newPage();
   await publishing.goto('about:blank');
   const share = randomUUID();
-  await publishing.evaluate(({ share, iceServers, relay }) => {
+  const startPublisher = () => publishing.evaluate(({ share, iceServers, relay }) => {
+    window.publisher?.peer.close();
     const encoder = new TextEncoder();
     const peer = new RTCPeerConnection({ iceServers, iceTransportPolicy: relay ? 'relay' : 'all' });
     const channel = peer.createDataChannel('dshx-web/1', { negotiated: true, id: 0, ordered: true, protocol: 'dshx-web/1' });
@@ -256,7 +257,8 @@ test(`real Chromium loads and writes a shared app through Service Worker and a v
             ['Content-Disposition', 'attachment; filename="fixture.txt"']], 'download');
           else if (request.path === '/range') report(request, 206, [['Content-Type', 'text/plain'], ['Content-Range', 'bytes 1-3/4']], 'BCD');
           else report(request, 200, [['Content-Type', 'text/html']],
-            '<!doctype html><h1>Shared application</h1><a href="/file">Download</a><a href="/redirect">Redirect</a>');
+            '<!doctype html><meta name="color-scheme" content="light dark"><h1>Shared application</h1>' +
+            '<a href="/file">Download</a><a href="/redirect">Redirect</a><footer style="margin-top:120vh">End of page</footer>');
           break;
         case 'upload': pending.body += atob(request.bytes); reply({ type: 'upload-ack', id: request.id }); break;
         case 'upload-done': report(request, 200, [['Content-Type', 'text/plain']], pending.body); break;
@@ -280,6 +282,7 @@ test(`real Chromium loads and writes a shared app through Service Worker and a v
         // 模拟双方无法通过直连交换地址；中继协商仍使用真正的 ICE 和数据通道。
         if (turn && !frame.payload.relay_only) return;
         session = frame.session_id;
+        await startPublisher();
         const answer = await publishing.evaluate(async offer => {
           const { peer } = window.publisher;
           await peer.setRemoteDescription({ type: 'offer', sdp: offer });
@@ -317,11 +320,46 @@ test(`real Chromium loads and writes a shared app through Service Worker and a v
   await visitor.getByRole('button', { name: '刷新端点' }).click({ timeout: 2500 });
   assert.equal((await reloaded).status(), 200);
   await visitor.getByRole('button', { name: '查看网页' }).waitFor();
-  await visitor.goto(`${origin}/web/?endpoint=${publisher.profile.endpointId}&share=${share}`);
+  const listURL = `${origin}/web/?endpoint=${publisher.profile.endpointId}`;
+  const shareURL = `${listURL}&share=${share}`;
+  if (turn) await visitor.goto(shareURL);
+  else {
+    await visitor.getByRole('button', { name: '查看网页' }).click();
+    await visitor.getByRole('button', { name: '打开网页' }).click();
+  }
   const app = visitor.frameLocator('#viewer > iframe').frameLocator('iframe');
   try { await app.getByRole('heading', { name: 'Shared application' }).waitFor({ timeout: 42_000 }); }
   catch (error) { t.diagnostic(`访客状态：${await visitor.locator('#status').textContent()}`); throw error; }
+  assert.equal(await visitor.locator('main').isVisible(), false);
+  assert.equal(visitor.url(), shareURL);
+  const outer = visitor.locator('#viewer > iframe');
+  const inner = visitor.frameLocator('#viewer > iframe').locator('iframe');
+  const viewport = await visitor.evaluate(() => ({ x: 0, y: 0, width: innerWidth, height: innerHeight }));
+  for (const colorScheme of ['light', 'dark']) {
+    await visitor.emulateMedia({ colorScheme });
+    for (const iframe of [outer, inner]) {
+      assert.deepEqual(await iframe.boundingBox(), viewport);
+      assert.deepEqual(await iframe.evaluate(frame => {
+        const style = getComputedStyle(frame);
+        return [style.borderTopWidth, style.borderRightWidth, style.borderBottomWidth, style.borderLeftWidth, style.backgroundColor];
+      }), ['0px', '0px', '0px', '0px', 'rgba(0, 0, 0, 0)']);
+    }
+    const footer = app.getByText('End of page');
+    await footer.scrollIntoViewIfNeeded();
+    const bottom = await footer.boundingBox();
+    assert.ok(bottom.y >= 0 && bottom.y + bottom.height <= viewport.height);
+  }
   assert.deepEqual(attempts, turn ? ['direct', 'relay'] : ['direct']);
+  if (!turn) {
+    await visitor.goBack();
+    assert.equal(visitor.url(), listURL);
+    await visitor.getByRole('button', { name: '打开网页' }).waitFor({ timeout: 5000 });
+    assert.equal(await outer.count(), 0);
+    await visitor.goForward();
+    assert.equal(visitor.url(), shareURL);
+    await app.getByRole('heading', { name: 'Shared application' }).waitFor({ timeout: 5000 });
+    assert.equal(await visitor.locator('main').isVisible(), false);
+  }
   const link = await visitor.evaluate(async () => {
     const stats = await window.testPeer.getStats();
     const pair = stats.get([...stats.values()].find(row => row.type === 'transport')?.selectedCandidatePairId);
@@ -352,6 +390,8 @@ test(`real Chromium loads and writes a shared app through Service Worker and a v
   await app.getByText('fixtures work').waitFor({ timeout: 5000 });
   publisherSocket.close();
   await visitor.getByText('端点已停止网页访问').waitFor({ timeout: 5000 });
+  assert.equal(await visitor.locator('main').isVisible(), true);
+  assert.equal(await outer.count(), 0);
 });
 
 test('tunnel platform rejects tampering, replay and routing as another endpoint', { timeout: 8000 }, async t => {

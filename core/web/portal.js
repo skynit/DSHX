@@ -1,3 +1,4 @@
+const controls = document.querySelector('main');
 const directory = document.querySelector('#directory');
 const endpoints = document.querySelector('#endpoints');
 const refresh = document.querySelector('#refresh');
@@ -41,8 +42,10 @@ async function listEndpoints(cursor, more) {
     const open = page.items.filter(item => item.capabilities?.includes('web-share'));
     if (cursor) more.remove();
     else endpoints.replaceChildren();
-    for (const item of open) row(endpoints, item.displayName || item.endpointId, item.online ? '查看网页' : '离线',
-      () => connect(item.endpointId), !item.online);
+    for (const item of open) row(endpoints, item.displayName || item.endpointId, item.online ? '查看网页' : '离线', () => {
+      history.pushState(null, '', `/web/?endpoint=${encodeURIComponent(item.endpointId)}`);
+      showRoute();
+    }, !item.online);
     if (page.nextCursor) row(endpoints, '', '加载更多', event => void listEndpoints(page.nextCursor, event.currentTarget.parentElement));
     if (!directory.hidden) status.textContent = endpoints.childElementCount ? '' : '暂无公开网页';
   } catch {
@@ -53,50 +56,75 @@ async function listEndpoints(cursor, more) {
   }
 }
 
-function connect(endpointId, initialShare) {
-  if (!uuid.test(endpointId)) { status.textContent = '端点地址无效'; return; }
+function showViewer(visible) {
+  controls.hidden = visible;
+  viewer.hidden = !visible;
+}
+
+function showRoute() {
   active?.close();
-  directory.hidden = true;
-  shares.hidden = false;
+  active = null;
+  showViewer(false);
   shares.replaceChildren();
-  viewer.replaceChildren();
-  viewer.hidden = true;
+  shares.hidden = true;
+  const query = new URLSearchParams(location.search);
+  directory.hidden = query.has('endpoint');
+  if (!directory.hidden) { void listEndpoints(); return; }
+  const endpointId = query.get('endpoint');
+  if (!uuid.test(endpointId)) { status.textContent = '端点地址无效'; return; }
+  connect(endpointId, query.get('share'));
+}
+
+function connect(endpointId, initialShare) {
   row(shares, '', '返回端点', () => {
-    active?.close();
-    active = null;
-    shares.hidden = true;
-    directory.hidden = false;
-    viewer.hidden = true;
     history.replaceState(null, '', '/web/');
-    void listEndpoints();
+    showRoute();
   });
   status.textContent = '正在建立直连…';
   const connection = new Peer(endpointId, onFrame, message => {
     if (active !== connection) return;
-    connection.disposeView();
-    viewer.hidden = true;
+    showViewer(false);
+    shares.hidden = false;
     status.textContent = message;
   }, message => { if (active === connection) status.textContent = message; });
   active = connection;
   let itemCount = 0;
+  let selected;
   function onFrame(frame) {
     if (active !== connection || frame.type !== 'list' || !Array.isArray(frame.items)) return;
     for (const item of frame.items.slice(0, 32)) {
       if (!uuid.test(item.id) || typeof item.name !== 'string' || !safePath(item.path)) continue;
       itemCount++;
-      row(shares, item.name, '打开网页', () => void open(item));
-      if (item.id === initialShare) void open(item);
+      row(shares, item.name, '打开网页', () => {
+        const url = new URL(location.href);
+        if (url.searchParams.get('share') !== item.id) {
+          url.searchParams.set('share', item.id);
+          history.pushState(null, '', url);
+        }
+        if (connection.closed) showRoute();
+        else void open(item);
+      });
+      if (item.id === initialShare) selected = item;
     }
-    if (frame.done !== false) status.textContent = itemCount ? connection.connectedLabel : '没有可访问的网页';
+    if (frame.done === false) return;
+    if (selected) void open(selected);
+    else {
+      shares.hidden = false;
+      status.textContent = initialShare ? '找不到指定的网页' : itemCount ? connection.connectedLabel : '没有可访问的网页';
+    }
   }
   async function open(item) {
+    shares.hidden = true;
     status.textContent = '正在打开网页…';
     try {
       await connection.view(item);
-      viewer.hidden = false;
-      status.textContent = connection.connectedLabel;
-      history.replaceState(null, '', `/web/?endpoint=${encodeURIComponent(endpointId)}&share=${encodeURIComponent(item.id)}`);
-    } catch { if (active === connection) status.textContent = '无法初始化网页入口'; }
+      if (active === connection && !connection.closed) showViewer(true);
+    } catch {
+      if (active !== connection || connection.closed) return;
+      connection.disposeView();
+      shares.hidden = false;
+      status.textContent = '无法初始化网页入口';
+    }
   }
 }
 
@@ -378,8 +406,8 @@ function derToRaw(signature) {
   return result;
 }
 
-const query = new URLSearchParams(location.search);
 refresh.addEventListener('click', () => void listEndpoints());
-if (query.has('endpoint')) connect(query.get('endpoint'), query.get('share'));
-else void listEndpoints();
+showRoute();
+addEventListener('popstate', showRoute);
 addEventListener('pagehide', () => active?.close());
+addEventListener('pageshow', event => { if (event.persisted) showRoute(); });
