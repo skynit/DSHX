@@ -24,8 +24,8 @@ android {
         minSdk = 26
         targetSdk = 28
         testInstrumentationRunner = "local.dshx.app.ChatQuicInstrumentation"
-        versionCode = providers.gradleProperty("dshxVersionCode").orElse("9").get().toInt()
-        versionName = providers.gradleProperty("dshxVersionName").orElse("0.3.2").get()
+        versionCode = providers.gradleProperty("dshxVersionCode").orElse("10").get().toInt()
+        versionName = providers.gradleProperty("dshxVersionName").orElse("0.3.3").get()
         resValue("string", "update_url", updateUrl.get())
         val info = file("src/main/assets/core-info.json")
         val abi = providers.gradleProperty("dshxAbi").orNull
