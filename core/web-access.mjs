@@ -5,6 +5,8 @@ const portal = new Map([
   ['/web/', ['portal.html', 'text/html']],
   ['/web/portal.js', ['portal.js', 'text/javascript']],
   ['/web/portal.css', ['portal.css', 'text/css']],
+  ['/web/dshx-icon.svg', ['dshx-icon.svg', 'image/svg+xml']],
+  ['/web/dshx-icon-dark.svg', ['dshx-icon-dark.svg', 'image/svg+xml']],
 ]);
 const runtime = new Map([
   ['/__dshx/bridge', ['bridge.html', 'text/html']],
@@ -42,7 +44,7 @@ export function createWebAccess(webOrigin, appDomain) {
         'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer',
         'Content-Security-Policy': app
           ? `default-src 'none'; script-src 'self'; style-src 'self'; worker-src 'self'; frame-src 'self'; frame-ancestors ${origin.origin}`
-          : `default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self' wss://${origin.host}; frame-src https://*.${appDomain}${port}; frame-ancestors 'none'; base-uri 'none'`,
+          : `default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self' wss://${origin.host}; frame-src https://*.${appDomain}${port}; frame-ancestors 'none'; base-uri 'none'`,
         ...(name === 'portal.html' ? { 'X-DSHX-App-Domain': appDomain } : {}),
         ...(name === 'sw.js' ? { 'Service-Worker-Allowed': '/' } : {}),
       };

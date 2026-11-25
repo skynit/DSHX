@@ -4,11 +4,26 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="dshx-app-domain" content="%%DSHX_APP_DOMAIN%%">
 <title>DSHX 网页共享</title>
+<link rel="icon" href="/web/dshx-icon.svg" type="image/svg+xml">
+<link rel="icon" href="/web/dshx-icon-dark.svg" type="image/svg+xml" media="(prefers-color-scheme: dark)">
 <link rel="stylesheet" href="/web/portal.css">
 <main hidden>
-  <header><h1>DSHX 网页共享</h1></header>
+  <!-- Lucide 图标，许可见 LUCIDE-LICENSE.txt。 -->
+  <svg class="symbols" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><defs>
+    <symbol id="device-icon" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8m-4-4v4"/></symbol>
+    <symbol id="page-icon" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 21V9"/></symbol>
+    <symbol id="open-icon" viewBox="0 0 24 24"><path d="M7 7h10v10M7 17 17 7"/></symbol>
+  </defs></svg>
+  <header class="masthead"><div class="wrap brand">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="/web/dshx-icon-dark.svg">
+      <img width="44" height="44" src="/web/dshx-icon.svg" alt="">
+    </picture>
+    <h1>DSHX <span>网页共享</span></h1>
+  </div></header>
+  <div class="wrap workspace">
   <section id="directory" aria-labelledby="directory-title">
-    <div class="section-heading">
+    <div class="toolbar">
       <h2 id="directory-title" tabindex="-1">公开端点</h2>
       <button id="refresh" type="button" aria-label="刷新端点" title="刷新端点">
         <svg aria-hidden="true" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -18,17 +33,31 @@
           <path d="M8 16H3v5"/>
         </svg>
       </button>
-      <p id="directory-status" role="status"></p>
     </div>
-    <div id="endpoints"></div>
+    <div class="panel">
+      <div class="directory-notice">
+        <svg class="state-icon" aria-hidden="true"><use href="#device-icon"/></svg>
+        <p id="directory-status" role="status"></p>
+      </div>
+      <div id="endpoints"></div>
+    </div>
   </section>
-  <div id="endpoint" hidden>
-    <div class="section-heading">
-      <p id="connection-status" role="status"></p>
-      <button id="back" type="button">返回端点</button>
+  <section id="endpoint" aria-labelledby="shares-title" hidden>
+    <div class="toolbar"><h2 id="shares-title">共享网页</h2></div>
+    <div class="panel">
+      <div class="connection-notice">
+        <p id="connection-status" role="status"></p>
+        <button id="back" type="button"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="m12 19-7-7 7-7M19 12H5"/></svg>返回端点</button>
+      </div>
+      <div id="shares" hidden></div>
     </div>
-    <section id="shares" aria-label="网页列表" hidden></section>
+  </section>
   </div>
+  <template id="item-row"><div class="row">
+    <svg class="item-icon" aria-hidden="true"><use href="#page-icon"/></svg>
+    <span class="item-name"></span><span class="availability" hidden></span>
+    <button type="button"><span></span><svg aria-hidden="true"><use href="#open-icon"/></svg></button>
+  </div></template>
 </main>
 <div id="viewer" hidden></div>
 <script type="module" src="/web/portal.js"></script>

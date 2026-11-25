@@ -1,23 +1,62 @@
-:root{color-scheme:light dark;--bg:#f8f7f4;--panel:#fffefa;--text:#272522;--muted:#655f58;--line:#dedbd5;--accent:#2455a5;font:15px/1.5 system-ui,sans-serif}
-@media(prefers-color-scheme:dark){:root{--bg:#222120;--panel:#2a2927;--text:#eeece8;--muted:#bcb6ae;--line:#45423e;--accent:#9bbdff}}
-*{box-sizing:border-box}
-body{margin:0;color:var(--text)}
-main{padding:32px 24px;margin:auto;max-width:52rem}
-header{border-bottom:1px solid var(--line);padding-bottom:16px}
-h1{font-size:22px;margin:0}
-.section-heading{display:flex;align-items:center;flex-wrap:wrap;gap:8px 16px;padding-block:16px}
-.section-heading h2{font-size:16px;margin:0}
-.section-heading [role=status]{margin:0;color:var(--muted);overflow-wrap:anywhere;min-width:0}
-#directory .section-heading{display:grid;grid-template-columns:minmax(0,max-content) 44px;row-gap:0}
-#directory-status{grid-column:1 / -1}
-.row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px solid var(--line)}
-.row span{overflow-wrap:anywhere}
-button{font:inherit;color:var(--accent);background:var(--panel);border:1px solid var(--line);border-radius:6px;min-height:44px;padding:6px 12px;cursor:pointer;flex:none}
-button:enabled:active{background:var(--line)}
-button:disabled{color:var(--muted);cursor:default}
-button:focus-visible,h2:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-:root:has(main:not([hidden])){background:var(--bg)}
-#viewer{position:fixed;inset:0}
-#viewer > iframe{display:block;width:100%;height:100%;border:0;background:transparent}
-#refresh{display:grid;place-items:center;width:44px;padding:0;color:var(--text);border-color:transparent;border-radius:50%}
-#refresh:disabled{color:var(--muted)}
+/* 沿用 DSHX 客户端 AppColors 的明暗主题。 */
+:root {
+  color-scheme: light dark;
+  --bg: #f7f7f5; --surface: #fcfcfb; --raised: #fff; --inset: #f0f1ef;
+  --text: #202220; --muted: #626962; --line: #e4e5e2; --accent: #2f6cc4;
+  --online: #216d4e; --online-bg: #e8f2eb; --danger: #b33d48;
+  font: 15px/1.5 system-ui, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0e0e0e; --surface: #181818; --raised: #202020; --inset: #292929;
+    --text: #ececec; --muted: #a6a6a6; --line: #333; --accent: #78a7ef;
+    --online: #86cba6; --online-bg: #20362b; --danger: #e3848a;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; color: var(--text); }
+:root:has(main:not([hidden])) { background: var(--bg); }
+.wrap { width: min(100% - 32px, 64rem); margin-inline: auto; }
+.masthead { background: var(--surface); border-bottom: 1px solid var(--line); }
+.brand { display: flex; align-items: center; gap: 12px; min-height: 72px; }
+.brand img { display: block; border-radius: 8px; }
+h1, h2, p { margin: 0; }
+h1 { display: flex; align-items: center; gap: 14px; font-size: 23px; font-weight: 700; line-height: 1.25; }
+h1 span { padding-inline-start: 14px; border-inline-start: 1px solid var(--line); color: var(--muted); font-size: 16px; font-weight: 500; }
+.workspace { padding-block: 32px 48px; }
+.toolbar { min-height: 48px; margin-bottom: 12px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+h2 { font-size: 21px; font-weight: 650; }
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; }
+svg { fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.symbols { position: absolute; width: 0; height: 0; }
+button svg { width: 16px; height: 16px; flex: none; }
+button { min-height: 40px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 6px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--raised); color: var(--text); font: inherit; font-size: 14px; cursor: pointer; }
+button:enabled:hover, button:enabled:active { background: var(--inset); }
+button:disabled { color: var(--muted); background: transparent; cursor: default; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+#refresh { width: 44px; height: 44px; padding: 0; }
+.directory-notice, .connection-notice { display: grid; justify-items: center; align-content: center; gap: 12px; }
+.directory-notice:has(p:not(:empty)), .connection-notice { min-height: 168px; padding: 24px; }
+.state-icon, .item-icon { box-sizing: content-box; padding: 8px; border-radius: 6px; background: var(--inset); color: var(--muted); }
+.state-icon { width: 25px; height: 25px; }
+.item-icon { width: 18px; height: 18px; }
+.panel:has(#endpoints:not(:empty)) .state-icon { display: none; }
+.panel:has(#endpoints:not(:empty)) .directory-notice:has(p:not(:empty)),
+.panel:has(#shares:not(:empty)) .connection-notice { min-height: 0; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+.panel:has(#shares:not(:empty)) .connection-notice { display: flex; align-items: center; flex-wrap: wrap; }
+[role=status] { color: var(--muted); }
+#connection-status::before, .availability::before { content: ''; display: inline-block; width: 6px; height: 6px; margin-inline-end: 7px; border-radius: 50%; background: currentColor; vertical-align: .14em; }
+#connection-status[data-tone=direct] { color: var(--online); }
+#connection-status[data-tone=relay] { color: var(--accent); }
+#connection-status[data-tone=error]::before { background: var(--danger); }
+.row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; align-items: center; gap: 12px; padding: 14px 16px; }
+.row + .row, .more:not(:first-child) { border-top: 1px solid var(--line); }
+.row button { grid-column: 4; }
+.item-name { font-weight: 550; overflow-wrap: anywhere; }
+.availability { padding: 2px 9px; border-radius: 20px; background: var(--inset); color: var(--muted); font-size: 12px; white-space: nowrap; }
+.availability.online { color: var(--online); background: var(--online-bg); }
+.more { display: grid; justify-content: center; padding: 12px; }
+@media (pointer: coarse) { button, #refresh { min-width: 48px; min-height: 48px; } }
+@media (max-width: 32rem) { .row { gap: 8px; padding-inline: 12px; } .item-icon { display: none; } .item-name { grid-column: 1 / 3; } }
+#viewer { position: fixed; inset: 0; }
+#viewer > iframe { display: block; width: 100%; height: 100%; border: 0; background: transparent; }

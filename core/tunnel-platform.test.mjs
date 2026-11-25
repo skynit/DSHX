@@ -236,6 +236,13 @@ test(`real Chromium loads and writes a shared app through Service Worker and a v
   const endpointDirectory = visitor.getByRole('region', { name: '公开端点' });
   const refreshButton = endpointDirectory.getByRole('button', { name: '刷新端点' });
   await endpointDirectory.getByRole('status').filter({ hasText: '暂无公开网页' }).waitFor({ timeout: 2500 });
+  for (const [colorScheme, logoFile] of [['light', 'dshx-icon.svg'], ['dark', 'dshx-icon-dark.svg']]) {
+    await visitor.emulateMedia({ colorScheme });
+    await visitor.waitForFunction(file => {
+      const logo = document.querySelector('header img');
+      return logo?.complete && logo.naturalWidth > 0 && logo.currentSrc.endsWith(`/web/${file}`);
+    }, logoFile, { timeout: 2500 });
+  }
   const refreshPosition = await refreshButton.boundingBox();
   await visitor.keyboard.press('Tab');
   assert.equal(await refreshButton.evaluate(button => button.matches(':focus-visible')), true);
@@ -246,6 +253,7 @@ test(`real Chromium loads and writes a shared app through Service Worker and a v
   await visitor.keyboard.press('Enter');
   assert.equal((await reloaded).status(), 200);
   await endpointDirectory.getByRole('button', { name: '查看网页' }).waitFor({ timeout: 2500 });
+  assert.equal(await endpointDirectory.getByText('在线', { exact: true }).isVisible(), true);
   assert.equal(await endpointDirectory.getByRole('status').textContent(), '');
   assert.deepEqual(await refreshButton.boundingBox(), refreshPosition);
 
@@ -422,7 +430,8 @@ test(`real Chromium loads and writes a shared app through Service Worker and a v
   assert.equal(await back.evaluate(button => button === document.activeElement), true);
   await visitor.keyboard.press('Enter');
   assert.equal(visitor.url(), `${origin}/web/`);
-  await endpointDirectory.getByRole('button', { name: '离线' }).waitFor({ timeout: 2500 });
+  await endpointDirectory.getByText('离线', { exact: true }).waitFor({ timeout: 2500 });
+  assert.equal(await endpointDirectory.getByRole('button', { name: '查看网页' }).isDisabled(), true);
 });
 
 test('tunnel platform rejects tampering, replay and routing as another endpoint', { timeout: 8000 }, async t => {

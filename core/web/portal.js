@@ -8,6 +8,7 @@ const endpoint = document.querySelector('#endpoint');
 const connectionStatus = document.querySelector('#connection-status');
 const back = document.querySelector('#back');
 const shares = document.querySelector('#shares');
+const itemRow = document.querySelector('#item-row');
 const viewer = document.querySelector('#viewer');
 const appDomain = document.querySelector('meta[name=dshx-app-domain]').content;
 const protocol = 'cwnas-webrtc-signaling';
@@ -18,16 +19,20 @@ const reserved = /^\/__dshx(?:\/|$)/;
 const maxChunk = 12 * 1024;
 let active;
 
-function row(parent, text, label, action, disabled = false) {
-  const line = document.createElement('div');
-  line.className = 'row';
-  const name = document.createElement('span');
-  name.textContent = text;
-  const button = document.createElement('button');
-  button.textContent = label;
-  button.disabled = disabled;
+function row(parent, text, label, action, online) {
+  const line = itemRow.content.firstElementChild.cloneNode(true);
+  line.querySelector('.item-name').textContent = text;
+  const button = line.querySelector('button');
+  button.querySelector('span').textContent = label;
+  if (online !== undefined) {
+    line.querySelector('.item-icon use').setAttribute('href', '#device-icon');
+    const badge = line.querySelector('.availability');
+    badge.hidden = false;
+    badge.textContent = online ? '在线' : '离线';
+    badge.classList.toggle('online', online);
+    button.disabled = !online;
+  }
   button.addEventListener('click', action);
-  line.append(name, button);
   parent.append(line);
 }
 
@@ -46,11 +51,19 @@ async function listEndpoints(cursor, more) {
     const open = page.items.filter(item => item.capabilities?.includes('web-share'));
     if (cursor) more.remove();
     else endpoints.replaceChildren();
-    for (const item of open) row(endpoints, item.displayName || item.endpointId, item.online ? '查看网页' : '离线', () => {
+    for (const item of open) row(endpoints, item.displayName || item.endpointId, '查看网页', () => {
       history.pushState(null, '', `/web/?endpoint=${encodeURIComponent(item.endpointId)}`);
       showRoute();
-    }, !item.online);
-    if (page.nextCursor) row(endpoints, '', '加载更多', event => void listEndpoints(page.nextCursor, event.currentTarget.parentElement));
+    }, Boolean(item.online));
+    if (page.nextCursor) {
+      const footer = document.createElement('div');
+      footer.className = 'more';
+      const button = document.createElement('button');
+      button.textContent = '加载更多';
+      button.addEventListener('click', () => void listEndpoints(page.nextCursor, footer));
+      footer.append(button);
+      endpoints.append(footer);
+    }
     directoryStatus.textContent = endpoints.childElementCount ? '' : '暂无公开网页';
   } catch {
     directoryStatus.textContent = '无法读取公开端点';
@@ -81,21 +94,26 @@ function showRoute() {
     connect(endpointId, share);
   } else {
     show('controls');
-    if (hasEndpoint) connectionStatus.textContent = '端点地址无效';
+    if (hasEndpoint) setConnectionStatus('端点地址无效', 'error');
     else void listEndpoints();
   }
 }
 
+function setConnectionStatus(message, tone = 'neutral') {
+  connectionStatus.dataset.tone = tone;
+  connectionStatus.textContent = message;
+}
+
 function connect(endpointId, initialShare) {
-  connectionStatus.textContent = '正在建立直连…';
+  setConnectionStatus('正在建立直连…');
   const connection = new Peer(endpointId, onFrame, message => {
     if (active !== connection) return;
     const restoreFocus = controls.hidden;
     show('controls');
     shares.hidden = false;
-    connectionStatus.textContent = message;
+    setConnectionStatus(message, 'error');
     if (restoreFocus) back.focus();
-  }, message => { if (active === connection) connectionStatus.textContent = message; });
+  }, message => { if (active === connection) setConnectionStatus(message); });
   active = connection;
   let itemCount = 0;
   let selected;
@@ -120,7 +138,9 @@ function connect(endpointId, initialShare) {
     else {
       show('controls');
       shares.hidden = false;
-      connectionStatus.textContent = initialShare ? '找不到指定的网页' : itemCount ? connection.connectedLabel : '没有可访问的网页';
+      if (initialShare) setConnectionStatus('找不到指定的网页', 'error');
+      else if (itemCount) setConnectionStatus(connection.connectedLabel, connection.attempt.relay ? 'relay' : 'direct');
+      else setConnectionStatus('没有可访问的网页');
     }
   }
   async function open(item) {
@@ -134,7 +154,7 @@ function connect(endpointId, initialShare) {
       connection.disposeView();
       show('controls');
       shares.hidden = false;
-      connectionStatus.textContent = '无法初始化网页入口';
+      setConnectionStatus('无法初始化网页入口', 'error');
       back.focus();
     }
   }
