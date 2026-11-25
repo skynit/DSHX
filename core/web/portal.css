@@ -1,11 +1,23 @@
 :root{color-scheme:light dark;--bg:#f8f7f4;--panel:#fffefa;--text:#272522;--muted:#655f58;--line:#dedbd5;--accent:#2455a5;font:15px/1.5 system-ui,sans-serif}
 @media(prefers-color-scheme:dark){:root{--bg:#222120;--panel:#2a2927;--text:#eeece8;--muted:#bcb6ae;--line:#45423e;--accent:#9bbdff}}
-*{box-sizing:border-box}body{margin:0;color:var(--text)}main{padding:16px 24px;margin:auto;max-width:76rem}header{display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;border-bottom:1px solid var(--line);padding-bottom:12px}h1{font-size:20px;margin:0}#status{color:var(--muted)}section{padding-block:10px}.row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px solid var(--line)}.row span{overflow-wrap:anywhere}button{font:inherit;color:var(--accent);background:var(--panel);border:1px solid var(--line);border-radius:6px;min-height:44px;padding:6px 12px;cursor:pointer}button:disabled{color:var(--muted);cursor:default}button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+*{box-sizing:border-box}
+body{margin:0;color:var(--text)}
+main{padding:32px 24px;margin:auto;max-width:52rem}
+header{border-bottom:1px solid var(--line);padding-bottom:16px}
+h1{font-size:22px;margin:0}
+.section-heading{display:flex;align-items:center;flex-wrap:wrap;gap:8px 16px;padding-block:16px}
+.section-heading h2{font-size:16px;margin:0}
+.section-heading [role=status]{margin:0;color:var(--muted);overflow-wrap:anywhere;min-width:0}
+#directory .section-heading{display:grid;grid-template-columns:minmax(0,max-content) 44px;row-gap:0}
+#directory-status{grid-column:1 / -1}
+.row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px solid var(--line)}
+.row span{overflow-wrap:anywhere}
+button{font:inherit;color:var(--accent);background:var(--panel);border:1px solid var(--line);border-radius:6px;min-height:44px;padding:6px 12px;cursor:pointer;flex:none}
+button:enabled:active{background:var(--line)}
+button:disabled{color:var(--muted);cursor:default}
+button:focus-visible,h2:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 :root:has(main:not([hidden])){background:var(--bg)}
 #viewer{position:fixed;inset:0}
 #viewer > iframe{display:block;width:100%;height:100%;border:0;background:transparent}
-.directory-header{display:flex;align-items:center;justify-content:space-between;gap:12px}
-.directory-header h2{font-size:16px;margin:0}
-#refresh{display:grid;place-items:center;width:44px;padding:0;color:var(--text);border-color:transparent;background:var(--panel)}
-#refresh:enabled:active{background:var(--line)}
+#refresh{display:grid;place-items:center;width:44px;padding:0;color:var(--text);border-color:transparent;border-radius:50%}
 #refresh:disabled{color:var(--muted)}

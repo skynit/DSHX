@@ -217,8 +217,6 @@ test(`real Chromium loads and writes a shared app through Service Worker and a v
   tls.on('upgrade', (...args) => platform.server.emit('upgrade', ...args));
   t.after(() => { tls.closeAllConnections(); tls.close(); });
   const publisher = identity('真实浏览器测试');
-  const registration = await platform.publish(publisher, { webShare: true });
-  const publisherSocket = await platform.connect(publisher, registration.registrationToken, servers => assert.equal(servers.length, turn ? 1 : 0));
   const { chromium } = await import(process.env.DSHX_PLAYWRIGHT_MODULE);
   const browser = await chromium.launch({ executablePath: process.env.DSHX_CHROME_PATH, headless: true, args: [
     '--ignore-certificate-errors', '--disable-features=WebRtcHideLocalIpsWithMdns', '--no-proxy-server',
@@ -226,6 +224,31 @@ test(`real Chromium loads and writes a shared app through Service Worker and a v
   ] });
   t.after(() => browser.close());
   const context = await browser.newContext({ acceptDownloads: true });
+  const visitor = await context.newPage();
+  await visitor.addInitScript(() => {
+    const Peer = window.RTCPeerConnection;
+    window.RTCPeerConnection = class extends Peer {
+      constructor(config) { super(config); window.testPeer = this; }
+    };
+  });
+  visitor.on('pageerror', error => t.diagnostic(error.stack));
+  await visitor.goto(`${origin}/web/`);
+  const endpointDirectory = visitor.getByRole('region', { name: '公开端点' });
+  const refreshButton = endpointDirectory.getByRole('button', { name: '刷新端点' });
+  await endpointDirectory.getByRole('status').filter({ hasText: '暂无公开网页' }).waitFor({ timeout: 2500 });
+  const refreshPosition = await refreshButton.boundingBox();
+  await visitor.keyboard.press('Tab');
+  assert.equal(await refreshButton.evaluate(button => button.matches(':focus-visible')), true);
+
+  const registration = await platform.publish(publisher, { webShare: true });
+  const publisherSocket = await platform.connect(publisher, registration.registrationToken, servers => assert.equal(servers.length, turn ? 1 : 0));
+  const reloaded = visitor.waitForResponse(response => new URL(response.url()).pathname === directory);
+  await visitor.keyboard.press('Enter');
+  assert.equal((await reloaded).status(), 200);
+  await endpointDirectory.getByRole('button', { name: '查看网页' }).waitFor({ timeout: 2500 });
+  assert.equal(await endpointDirectory.getByRole('status').textContent(), '');
+  assert.deepEqual(await refreshButton.boundingBox(), refreshPosition);
+
   const publishing = await context.newPage();
   await publishing.goto('about:blank');
   const share = randomUUID();
@@ -306,20 +329,6 @@ test(`real Chromium loads and writes a shared app through Service Worker and a v
       });
     }).catch(error => t.diagnostic(error.stack));
   });
-  const visitor = await context.newPage();
-  await visitor.addInitScript(() => {
-    const Peer = window.RTCPeerConnection;
-    window.RTCPeerConnection = class extends Peer {
-      constructor(config) { super(config); window.testPeer = this; }
-    };
-  });
-  visitor.on('pageerror', error => t.diagnostic(error.stack));
-  await visitor.goto(`${origin}/web/`);
-  await visitor.getByRole('button', { name: '查看网页' }).waitFor();
-  const reloaded = visitor.waitForResponse(response => new URL(response.url()).pathname === directory);
-  await visitor.getByRole('button', { name: '刷新端点' }).click({ timeout: 2500 });
-  assert.equal((await reloaded).status(), 200);
-  await visitor.getByRole('button', { name: '查看网页' }).waitFor();
   const listURL = `${origin}/web/?endpoint=${publisher.profile.endpointId}`;
   const shareURL = `${listURL}&share=${share}`;
   async function checkBlankWhile(pattern, open) {
@@ -342,7 +351,7 @@ test(`real Chromium loads and writes a shared app through Service Worker and a v
   });
   const app = visitor.frameLocator('#viewer > iframe').frameLocator('iframe');
   try { await app.getByRole('heading', { name: 'Shared application' }).waitFor({ timeout: 42_000 }); }
-  catch (error) { t.diagnostic(`访客状态：${await visitor.locator('#status').textContent()}`); throw error; }
+  catch (error) { t.diagnostic(`访客状态：${await visitor.getByRole('status', { includeHidden: true }).allTextContents()}`); throw error; }
   assert.equal(await visitor.locator('main').isVisible(), false);
   assert.equal(visitor.url(), shareURL);
   const outer = visitor.locator('#viewer > iframe');
@@ -409,6 +418,11 @@ test(`real Chromium loads and writes a shared app through Service Worker and a v
   await visitor.getByText('端点已停止网页访问').waitFor({ timeout: 5000 });
   assert.equal(await visitor.locator('main').isVisible(), true);
   assert.equal(await outer.count(), 0);
+  const back = visitor.getByRole('button', { name: '返回端点' });
+  assert.equal(await back.evaluate(button => button === document.activeElement), true);
+  await visitor.keyboard.press('Enter');
+  assert.equal(visitor.url(), `${origin}/web/`);
+  await endpointDirectory.getByRole('button', { name: '离线' }).waitFor({ timeout: 2500 });
 });
 
 test('tunnel platform rejects tampering, replay and routing as another endpoint', { timeout: 8000 }, async t => {

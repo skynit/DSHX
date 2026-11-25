@@ -6,10 +6,10 @@
 <title>DSHX 网页共享</title>
 <link rel="stylesheet" href="/web/portal.css">
 <main hidden>
-  <header><h1>DSHX 网页共享</h1><span id="status" role="status"></span></header>
+  <header><h1>DSHX 网页共享</h1></header>
   <section id="directory" aria-labelledby="directory-title">
-    <div class="directory-header">
-      <h2 id="directory-title">公开端点</h2>
+    <div class="section-heading">
+      <h2 id="directory-title" tabindex="-1">公开端点</h2>
       <button id="refresh" type="button" aria-label="刷新端点" title="刷新端点">
         <svg aria-hidden="true" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/>
@@ -18,10 +18,17 @@
           <path d="M8 16H3v5"/>
         </svg>
       </button>
+      <p id="directory-status" role="status"></p>
     </div>
     <div id="endpoints"></div>
   </section>
-  <section id="shares" aria-label="网页列表" hidden></section>
+  <div id="endpoint" hidden>
+    <div class="section-heading">
+      <p id="connection-status" role="status"></p>
+      <button id="back" type="button">返回端点</button>
+    </div>
+    <section id="shares" aria-label="网页列表" hidden></section>
+  </div>
 </main>
 <div id="viewer" hidden></div>
 <script type="module" src="/web/portal.js"></script>

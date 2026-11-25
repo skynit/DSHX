@@ -1,10 +1,14 @@
 const controls = document.querySelector('main');
 const directory = document.querySelector('#directory');
+const directoryTitle = document.querySelector('#directory-title');
+const directoryStatus = document.querySelector('#directory-status');
 const endpoints = document.querySelector('#endpoints');
 const refresh = document.querySelector('#refresh');
+const endpoint = document.querySelector('#endpoint');
+const connectionStatus = document.querySelector('#connection-status');
+const back = document.querySelector('#back');
 const shares = document.querySelector('#shares');
 const viewer = document.querySelector('#viewer');
-const status = document.querySelector('#status');
 const appDomain = document.querySelector('meta[name=dshx-app-domain]').content;
 const protocol = 'cwnas-webrtc-signaling';
 const uuid = /^[\da-f-]{36}$/;
@@ -34,7 +38,7 @@ async function listEndpoints(cursor, more) {
   if (moreButton) moreButton.disabled = true;
   const url = new URL('/api/v1/dshx/chat/endpoints', location.origin);
   if (cursor) url.searchParams.set('cursor', cursor);
-  status.textContent = '正在读取端点…';
+  directoryStatus.textContent = '正在读取端点…';
   try {
     const response = await fetch(url, { signal: AbortSignal.timeout(8000) });
     if (!response.ok) throw Error();
@@ -47,9 +51,9 @@ async function listEndpoints(cursor, more) {
       showRoute();
     }, !item.online);
     if (page.nextCursor) row(endpoints, '', '加载更多', event => void listEndpoints(page.nextCursor, event.currentTarget.parentElement));
-    if (!directory.hidden) status.textContent = endpoints.childElementCount ? '' : '暂无公开网页';
+    directoryStatus.textContent = endpoints.childElementCount ? '' : '暂无公开网页';
   } catch {
-    if (!directory.hidden) status.textContent = '无法读取公开端点';
+    directoryStatus.textContent = '无法读取公开端点';
   } finally {
     refresh.disabled = false;
     if (moreButton) moreButton.disabled = false;
@@ -67,7 +71,9 @@ function showRoute() {
   shares.replaceChildren();
   shares.hidden = true;
   const query = new URLSearchParams(location.search);
-  directory.hidden = query.has('endpoint');
+  const hasEndpoint = query.has('endpoint');
+  directory.hidden = hasEndpoint;
+  endpoint.hidden = !hasEndpoint;
   const endpointId = query.get('endpoint');
   if (uuid.test(endpointId)) {
     const share = query.get('share');
@@ -75,23 +81,21 @@ function showRoute() {
     connect(endpointId, share);
   } else {
     show('controls');
-    if (directory.hidden) status.textContent = '端点地址无效';
+    if (hasEndpoint) connectionStatus.textContent = '端点地址无效';
     else void listEndpoints();
   }
 }
 
 function connect(endpointId, initialShare) {
-  row(shares, '', '返回端点', () => {
-    history.replaceState(null, '', '/web/');
-    showRoute();
-  });
-  status.textContent = '正在建立直连…';
+  connectionStatus.textContent = '正在建立直连…';
   const connection = new Peer(endpointId, onFrame, message => {
     if (active !== connection) return;
+    const restoreFocus = controls.hidden;
     show('controls');
     shares.hidden = false;
-    status.textContent = message;
-  }, message => { if (active === connection) status.textContent = message; });
+    connectionStatus.textContent = message;
+    if (restoreFocus) back.focus();
+  }, message => { if (active === connection) connectionStatus.textContent = message; });
   active = connection;
   let itemCount = 0;
   let selected;
@@ -116,7 +120,7 @@ function connect(endpointId, initialShare) {
     else {
       show('controls');
       shares.hidden = false;
-      status.textContent = initialShare ? '找不到指定的网页' : itemCount ? connection.connectedLabel : '没有可访问的网页';
+      connectionStatus.textContent = initialShare ? '找不到指定的网页' : itemCount ? connection.connectedLabel : '没有可访问的网页';
     }
   }
   async function open(item) {
@@ -130,7 +134,8 @@ function connect(endpointId, initialShare) {
       connection.disposeView();
       show('controls');
       shares.hidden = false;
-      status.textContent = '无法初始化网页入口';
+      connectionStatus.textContent = '无法初始化网页入口';
+      back.focus();
     }
   }
 }
@@ -414,6 +419,11 @@ function derToRaw(signature) {
 }
 
 refresh.addEventListener('click', () => void listEndpoints());
+back.addEventListener('click', () => {
+  history.replaceState(null, '', '/web/');
+  showRoute();
+  directoryTitle.focus();
+});
 showRoute();
 addEventListener('popstate', showRoute);
 addEventListener('pagehide', () => active?.close());
