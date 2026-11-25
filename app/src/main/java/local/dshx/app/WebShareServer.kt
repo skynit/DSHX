@@ -39,16 +39,17 @@ internal class WebShareServer(
         when (event.type) {
             "web_offer" -> {
                 val offer = event.payload.optString("sdp")
+                val relay = event.payload.optBoolean("relay_only")
                 if (sessions.containsKey(id)) return
                 if (!public || shares.publicList().isEmpty() || sessions.size >= 12 || offer.isBlank() ||
-                    offer.lineSequence().any { it.startsWith("a=candidate:", true) && !directWebCandidate(it) }) {
+                    offer.lineSequence().any { it.startsWith("a=candidate:", true) && !webCandidate(it, relay) }) {
                     signaling.closeWeb(id, visitor)
                     return
                 }
-                val session = Session(id, visitor, offer)
+                val session = Session(id, visitor, offer, if (relay) TunnelChatLink.Path.RELAY else TunnelChatLink.Path.DIRECT)
                 sessions[id] = session
-                runCatching { transport.acceptIncoming(id, visitor, offer, servers) }.onFailure { end(id) }
-                scheduler.schedule({ schedule { if (sessions[id] === session && !session.ready) end(id) } }, 25, TimeUnit.SECONDS)
+                runCatching { transport.acceptIncoming(id, visitor, offer, servers, relayOnly = relay) }.onFailure { connectionFailed(id) }
+                scheduler.schedule({ schedule { if (sessions[id] === session && !session.ready) connectionFailed(id) } }, 25, TimeUnit.SECONDS)
             }
             "web_candidate" -> if (sessions[id]?.visitor == visitor) runCatching {
                 transport.addRemoteCandidate(id, event.payload.getString("candidate"),
@@ -73,8 +74,8 @@ internal class WebShareServer(
                 if (!signaling.candidateWeb(it.id, it.visitor, event.candidate)) end(it.id)
             }
             is WebRtcChatEvent.StateChanged -> when (event.info.state) {
-                WebRtcChatSessionInfo.State.CONNECTED -> sessions[event.info.sessionId]?.let(::verifyDirect)
-                WebRtcChatSessionInfo.State.FAILED, WebRtcChatSessionInfo.State.CLOSED -> end(event.info.sessionId)
+                WebRtcChatSessionInfo.State.CONNECTED -> sessions[event.info.sessionId]?.let(::verifyLink)
+                WebRtcChatSessionInfo.State.FAILED, WebRtcChatSessionInfo.State.CLOSED -> connectionFailed(event.info.sessionId)
                 WebRtcChatSessionInfo.State.CONNECTING -> Unit
             }
             is WebRtcChatEvent.Frame -> sessions[event.sessionId]?.let { session ->
@@ -82,24 +83,24 @@ internal class WebShareServer(
                 if (session.ready) session.proxy.receive(frame)
                 else if (frame.optString("type") == "list") session.waitingList = true
             }
-            is WebRtcChatEvent.Failed -> end(event.sessionId)
+            is WebRtcChatEvent.Failed -> connectionFailed(event.sessionId)
             is WebRtcChatEvent.LocalOffer -> Unit
         }
     }
 
-    private fun verifyDirect(session: Session) {
+    private fun verifyLink(session: Session) {
         transport.readLink(session.id) { link -> schedule {
             if (sessions[session.id] !== session) return@schedule
             when (link?.path) {
-                TunnelChatLink.Path.DIRECT -> {
+                session.path -> {
                     session.ready = true
                     if (session.waitingList) {
                         session.waitingList = false
                         session.proxy.receive(JSONObject().put("type", "list"))
                     }
                 }
-                TunnelChatLink.Path.RELAY -> end(session.id)
-                null -> scheduler.schedule({ schedule { if (sessions[session.id] === session) verifyDirect(session) } }, 200, TimeUnit.MILLISECONDS)
+                null -> scheduler.schedule({ schedule { if (sessions[session.id] === session) verifyLink(session) } }, 200, TimeUnit.MILLISECONDS)
+                else -> end(session.id)
             }
         } }
     }
@@ -108,11 +109,13 @@ internal class WebShareServer(
     fun checkTargets() = sessions.values.filterNot { it.proxy.valid() }.map { it.id }.forEach { end(it) }
     fun stop() = sessions.keys.toList().forEach { end(it) }
 
-    private fun end(id: String, notify: Boolean = true) {
+    private fun connectionFailed(id: String) = end(id, failed = sessions[id]?.ready == false)
+
+    private fun end(id: String, notify: Boolean = true, failed: Boolean = false) {
         val session = sessions.remove(id) ?: return
         session.active = false
         session.proxy.close()
-        if (notify) signaling.closeWeb(id, session.visitor)
+        if (notify) signaling.closeWeb(id, session.visitor, failed)
         transport.discardSession(id)
     }
 
@@ -122,7 +125,7 @@ internal class WebShareServer(
         workers.shutdownNow()
     }
 
-    private inner class Session(val id: String, val visitor: String, val offer: String) {
+    private inner class Session(val id: String, val visitor: String, val offer: String, val path: TunnelChatLink.Path) {
         @Volatile var active = true
         @Volatile var ready = false
         var waitingList = false

@@ -2,6 +2,7 @@ import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 import { join } from 'node:path';
 import { policyHost } from './host.mjs';
+import { mainAgent } from './engine.mjs';
 
 export const name = 'dshx-android-apps';
 export const inject = ['tools', 'systemPrompt', 'sessionController', 'agents', 'storageDomain'];
@@ -23,11 +24,22 @@ export const appTools = [
   { name: 'app_remove', description: '移除微应用，先停止功能；仅按用户选择删除独立运行记录。', parameters: { ...common, id, deleteData: { type: 'boolean', required: true, description: '是否删除本应用独立记录。' } } },
 ];
 export const appToolNames = new Set(appTools.map(tool => tool.name));
+export const webShareTool = 'web_share_create';
+const shareDraft = { name: webShareTool, description: '仅在本机创建停用的网页共享条目，不启动服务、不公开。先用 create-dshx-web-share 技能核实需求。', parameters: {
+  operationId: text('一次创建的标准小写 UUID；结果不确定时用同一个编号和原参数查询或重试。'),
+  name: text('共享名称，1 至 80 字。'), address: text('手机可访问的 HTTP/HTTPS 固定地址：127.0.0.1 或同一局域网内的 IPv4。'),
+} };
 
 export async function callApp(host, action, args, exec) {
   exec.signal?.throwIfAborted();
   if (!exec.agent?.session?.id) throw new Error('微应用管理需要当前有效会话。');
-  if (!appToolNames.has(`app_${action}`) || Buffer.byteLength(JSON.stringify(args)) > 1024 * 1024 + 8192) throw new Error('微应用管理参数无效或过大。');
+  if (action === 'create-web-share') {
+    if (!mainAgent(exec.agent) || !args || Object.keys(args).length !== 3 ||
+        !['operationId', 'name', 'address'].every(key => typeof args[key] === 'string') ||
+        Buffer.byteLength(JSON.stringify(args)) > 3072) throw new Error('网页共享需要当前本机主会话和有效创建参数。');
+  } else if (!appToolNames.has(`app_${action}`) || Buffer.byteLength(JSON.stringify(args)) > 1024 * 1024 + 8192) {
+    throw new Error('微应用管理参数无效或过大。');
+  }
   return host.query('apps', { action, args, session: exec.agent.session.id }, exec.signal);
 }
 
@@ -95,13 +107,16 @@ export async function apply(ctx) {
       return result;
     },
   };
-  for (const definition of appTools) ctx.tools.register(defineTool({ ...definition, isConcurrencySafe: () => false,
+  for (const definition of [...appTools, shareDraft]) ctx.tools.register(defineTool({ ...definition, isConcurrencySafe: () => false,
     output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
-    execute: (args, exec) => callApp(policyHost, definition.name.slice(4), args, exec),
+    execute: (args, exec) => callApp(policyHost, definition === shareDraft ? 'create-web-share' : definition.name.slice(4), args, exec),
   }));
   const create = appCreator(ctx, process.env.DSH_HOME, history);
   policyHost.createApp = create;
   ctx.effect(() => async () => { if (policyHost.createApp === create) policyHost.createApp = undefined; await queue; await domain.close(); });
+  ctx.systemPrompt.section({ name: 'android:web-share', order: 107,
+    text: '用户要求制作可共享网页或登记已有网页服务时，先加载 skill({name:"create-dshx-web-share"})。网页共享不是微应用安装；使用 web_share_create 只保存停用条目，不自动开启端点或发布。',
+  });
   ctx.systemPrompt.section({ name: 'android:apps', order: 106,
     text: '用户要求 Java 原生 Android 应用或编译 Java 工程时，终端预装 dshx-apk：先读 dshx-apk --help，可用 init 创建工程、build 编译资源和 Java 并签名验签；支持 Java 8、API 26–34、app/libs/*.jar，不支持 Kotlin、AAR、Gradle/Maven 或 C/C++。按 build 返回的真实 path 用 present 交付 APK；签名通过与安装、功能验证分别报告。网页微应用沿用 app_*：用户在当前对话要求创建、修改微应用或导出其 APK 时，先用 skill({name:"create-dshx-app"}) 加载完整流程；本轮已有该技能正文时直接沿用。在当前会话制作并交付，用户无需先打开创建页面或另建会话。DSHX 通过 app_* 工具管理微应用，通过 app_export 和 present 交付其 APK；具体步骤、权限、重试和验证要求以技能及其运行契约为准。',
   });

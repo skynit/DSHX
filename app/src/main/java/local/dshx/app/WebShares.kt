@@ -20,7 +20,7 @@ internal data class WebShare(val id: String, val name: String, val url: HttpUrl,
 }
 
 internal fun webShareUrl(value: String): HttpUrl {
-    val url = value.trim().toHttpUrlOrNull() ?: error("请填写 HTTP 或 HTTPS 服务地址。")
+    val url = requireNotNull(value.trim().toHttpUrlOrNull()) { "请填写 HTTP 或 HTTPS 服务地址。" }
     require(url.username.isEmpty() && url.password.isEmpty() && url.fragment == null && webPath(url.encodedPath)) { "地址不能包含登录凭据、片段或保留路径。" }
     val host = url.host
     require(host == "127.0.0.1" || privateIpv4(host)) { "只接受 127.0.0.1 或局域网的固定 IPv4 地址。" }
@@ -67,12 +67,30 @@ internal class WebShares(context: Context, private val protectedPort: (Int) -> B
     }
 
     @Synchronized fun save(id: String?, name: String, address: String, enabled: Boolean): WebShare {
+        return save(id ?: UUID.randomUUID().toString(), name, webShareUrl(address), enabled, creating = id == null)
+    }
+
+    @Synchronized fun createDraft(args: JSONObject): JSONObject {
+        val fields = setOf("operationId", "name", "address")
+        require(args.keys().asSequence().toSet() == fields && fields.all { args.opt(it) is String }) { "创建共享只接受编号、名称和地址。" }
+        val id = args.getString("operationId")
+        require(runCatching { UUID.fromString(id).toString() == id }.getOrDefault(false)) { "请使用标准小写 UUID 作为操作编号。" }
+        val name = args.getString("name").trim()
+        val address = args.getString("address")
+        require(address.length <= 2048) { "服务地址过长。" }
         val url = webShareUrl(address)
+        val item = saved.value.find { it.id == id }?.also {
+            require(it.name == name && it.url == url) { "该编号已用于其他共享，不会覆盖原条目。" }
+        } ?: save(id, name, url, enabled = false, creating = true)
+        return JSONObject().put("id", item.id).put("name", item.name).put("address", item.url.toString()).put("enabled", item.enabled)
+    }
+
+    private fun save(id: String, name: String, url: HttpUrl, enabled: Boolean, creating: Boolean): WebShare {
         val list = saved.value
         require(name.trim().length in 1..80) { "名称须为 1 至 80 字。" }
-        require(if (id == null) list.size < 32 else list.any { it.id == id }) { "共享不存在或条目已满。" }
+        require(if (creating) list.size < 32 else list.any { it.id == id }) { "共享不存在或条目已满。" }
         require(!protectedPort(url.port) || url.host != "127.0.0.1") { "不能共享 DSHX 管理服务。" }
-        val item = WebShare(id ?: UUID.randomUUID().toString(), name.trim(), url, enabled)
+        val item = WebShare(id, name.trim(), url, enabled)
         val network = if (!item.local && enabled) checkNotNull(onLink(item)) { "目标不在当前 Wi-Fi 或有线局域网中。" } else null
         persist(list.filterNot { it.id == item.id } + item)
         if (network == null) approvals.remove(item.id) else approvals[item.id] = network

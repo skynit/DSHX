@@ -8432,7 +8432,7 @@ test('Android micro apps create APK requests through native export and keep deli
   await assert.rejects(callApp({ query: async () => { throw new Error('不应调用'); } }, 'export', {}, {}), /有效会话/);
 });
 
-test('Android micro apps load the bundled creation skill through the official tool in an ordinary chat', async t => {
+test('Android bundled creation skills load through the official tool in an ordinary chat', async t => {
   const { Context } = await load('@deepseek-ai/cordis');
   const { createScope } = await load('@deepseek-ai/dsh-scope');
   const { createUserMessage } = await load('@deepseek-ai/dsh-llm');
@@ -8440,6 +8440,8 @@ test('Android micro apps load the bundled creation skill through the official to
   const source = join(process.env.DSHX_APP_ASSETS, 'skills/create-dshx-app');
   const installed = join(home, 'skills/create-dshx-app');
   await cp(source, installed, { recursive: true });
+  const siteSkill = 'create-dshx-web-share';
+  await cp(join(process.env.DSHX_APP_ASSETS, 'skills', siteSkill), join(home, 'skills', siteSkill), { recursive: true });
   const ctx = new Context();
   t.after(() => ctx.fiber.dispose());
   ctx.provide('workingDirectory', { ensure: async () => workspace });
@@ -8478,7 +8480,37 @@ test('Android micro apps load the bundled creation skill through the official to
     assert.equal(injections.length, 1);
     assert.equal(injections[0].source.name, summary.name);
     assert.ok(injections[0].content.some(block => block.type === 'text' && block.text.includes(body)));
+    const site = await ctx.tools.execute({ name: 'skill', arguments: { name: siteSkill }, agent, signal, callId: 'load-web-share' });
+    assert.equal(site.isError, false, JSON.stringify(site));
+    assert.match(site.value.content, /web_share_create/);
+    assert.match(site.value.content, /新条目默认停用/);
+    const share = await step(`/create-dshx-web-share 帮我做一个共享网页`);
+    assert.ok(share.messages.some(message => message.source.kind === 'skill-invocation' && message.source.name === siteSkill));
   } finally { detach(); scope.dispose(); }
+});
+
+test('Android web share creation forwards a disabled draft to the host only from a local main session', async () => {
+  const { callApp, webShareTool } = await import(pathToFileURL(join(core, 'apps.mjs')));
+  const { toolAvailable } = await import(pathToFileURL(join(core, 'policy.mjs')));
+  const { policyHost } = await import(pathToFileURL(join(core, 'host.mjs')));
+  const calls = [];
+  const host = { query: async (...args) => { calls.push(args); return { id: args[1].args.operationId, enabled: false }; } };
+  const agent = { session: { id: 'local', header: {} } };
+  const child = { session: { id: 'child', header: { parentSession: 'local' } } };
+  const args = { operationId: crypto.randomUUID(), name: '测试网页', address: 'http://127.0.0.1:8090/' };
+  assert.deepEqual(await callApp(host, 'create-web-share', args, { agent }), { id: args.operationId, enabled: false });
+  assert.deepEqual(calls[0].slice(0, 2), ['apps', { action: 'create-web-share', args, session: 'local' }]);
+  await assert.rejects(callApp(host, 'create-web-share', { ...args, enabled: true }, { agent }));
+  await assert.rejects(callApp(host, 'create-web-share', args, { agent: child }));
+  assert.equal(calls.length, 1);
+  const previous = policyHost.cachedMode;
+  try {
+    policyHost.cachedMode = () => 'full';
+    assert.equal(toolAvailable(webShareTool, agent), true);
+    assert.equal(toolAvailable(webShareTool, child), false);
+    policyHost.cachedMode = () => 'tunnel';
+    assert.equal(toolAvailable(webShareTool, agent), false);
+  } finally { policyHost.cachedMode = previous; }
 });
 
 test('Android micro apps SDK connects once and performs real asynchronous storage calls', async () => {

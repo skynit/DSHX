@@ -3,7 +3,7 @@ import { lstat, realpath } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { policyHost } from './host.mjs';
 import { phoneToolNames } from './phone.mjs';
-import { appToolNames } from './apps.mjs';
+import { appToolNames, webShareTool } from './apps.mjs';
 import { isMemoryTool, memoryToolAvailable } from './memory.mjs';
 import { isKnowledgeTool, knowledgeToolAvailable } from './knowledge.mjs';
 import { engineToolNames, mainAgent } from './engine.mjs';
@@ -77,7 +77,8 @@ export function toolAvailable(name, agent) {
   if (mode === 'tunnel') return false;
   const engine = engineToolNames.has(name) && (name !== 'engine_restart' || mode === 'full' && mainAgent(agent));
   const management = managementTools.has(name) && mode === 'full' && mainAgent(agent);
-  return Boolean(workspace) && (fileTools.has(name) || name === 'skill' || engine || management || memoryToolAvailable(name) || knowledgeToolAvailable(name, agent) || (commandTools.has(name) || phoneToolNames.has(name) || appToolNames.has(name)) && mode === 'full') && mode !== 'unavailable' &&
+  const webShare = name === webShareTool && mode === 'full' && mainAgent(agent);
+  return Boolean(workspace) && (fileTools.has(name) || name === 'skill' || engine || management || webShare || memoryToolAvailable(name) || knowledgeToolAvailable(name, agent) || (commandTools.has(name) || phoneToolNames.has(name) || appToolNames.has(name)) && mode === 'full') && mode !== 'unavailable' &&
     !(mode === 'read-only' && ['write', 'edit'].includes(name));
 }
 
@@ -85,7 +86,7 @@ export function toolReason(exec) {
   if (!workspace) return 'Android 工作区尚未配置，工具不可用。';
   if (isMemoryTool(exec.name) && !memoryToolAvailable(exec.name)) return '记忆功能尚未启用或尚未生效。';
   if (isKnowledgeTool(exec.name) && !knowledgeToolAvailable(exec.name, exec.agent)) return '知识来源未启用、尚未就绪或无法确认当前用户请求。';
-  if (!fileTools.has(exec.name) && exec.name !== 'skill' && !managementTools.has(exec.name) && !engineToolNames.has(exec.name) && !commandTools.has(exec.name) && !phoneToolNames.has(exec.name) && !appToolNames.has(exec.name) && !isMemoryTool(exec.name) && !isKnowledgeTool(exec.name)) return '此 Android 开发版尚未适配该模型工具。';
+  if (!fileTools.has(exec.name) && exec.name !== 'skill' && exec.name !== webShareTool && !managementTools.has(exec.name) && !engineToolNames.has(exec.name) && !commandTools.has(exec.name) && !phoneToolNames.has(exec.name) && !appToolNames.has(exec.name) && !isMemoryTool(exec.name) && !isKnowledgeTool(exec.name)) return '此 Android 开发版尚未适配该模型工具。';
   if (!toolAvailable(exec.name, exec.agent)) return '当前会话尚未连接，工具暂不可用。';
   if (exec.arguments?.sandbox_permissions !== undefined) return 'Android 当前默认完全权限，不支持单次沙箱提权参数。';
   if (commandTools.has(exec.name) && exec.arguments?.run_in_background === true) return 'Android 当前仅开放前台命令。';

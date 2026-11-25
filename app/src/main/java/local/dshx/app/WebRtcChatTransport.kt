@@ -96,9 +96,10 @@ class WebRtcChatTransport(
     private fun createSession(sessionId: String, remoteEndpointId: String, iceServers: List<TunnelIceServer>, relayOnly: Boolean, initiator: Boolean): Session {
         require(sessions[sessionId] == null) { "WebRTC 会话编号已存在。" }
         val servers = if (webShare) iceServers.mapNotNull { server ->
-            server.urls.filter { it.startsWith("stun:", true) || it.startsWith("stuns:", true) }
-                .takeIf { it.isNotEmpty() }?.let { TunnelIceServer(it) }
+            server.urls.filter { it.substringBefore(':').lowercase() in if (relayOnly) setOf("turn", "turns") else setOf("stun", "stuns") }
+                .takeIf { it.isNotEmpty() }?.let { if (relayOnly) server.copy(urls = it) else TunnelIceServer(it) }
         } else iceServers
+        require(!webShare || !relayOnly || servers.isNotEmpty()) { "平台未提供网页中继配置。" }
         val config = PeerConnection.RTCConfiguration(servers.map { server ->
             PeerConnection.IceServer.builder(server.urls).apply {
                 server.username?.let(::setUsername)
@@ -131,7 +132,7 @@ class WebRtcChatTransport(
             }
         }
         val peer = factory.createPeerConnection(config, observer) ?: error("无法创建 WebRTC 对等连接。")
-        session = Session(sessionId, remoteEndpointId, peer, initiator)
+        session = Session(sessionId, remoteEndpointId, peer, initiator, relayOnly)
         check(sessions.putIfAbsent(sessionId, session) == null) { "WebRTC 会话编号已存在。" }
         try {
             session.openChannel()
@@ -147,6 +148,7 @@ class WebRtcChatTransport(
         val remoteEndpointId: String,
         val peer: PeerConnection,
         val initiator: Boolean,
+        val relayOnly: Boolean,
     ) {
         private var channel: DataChannel? = null
         private val channelLock = Any()
@@ -169,7 +171,7 @@ class WebRtcChatTransport(
         }
 
         fun localCandidate(candidate: IceCandidate) = synchronized(localCandidates) {
-            if (!active() || webShare && !directWebCandidate(candidate.sdp)) return@synchronized
+            if (!active() || webShare && !webCandidate(candidate.sdp, relayOnly)) return@synchronized
             if (descriptionPublished) onEvent(WebRtcChatEvent.LocalCandidate(sessionId, remoteEndpointId, candidate))
             else if (localCandidates.size < 128) localCandidates += candidate
         }
@@ -228,7 +230,7 @@ class WebRtcChatTransport(
         }
 
         fun addCandidate(candidate: IceCandidate) = synchronized(pendingCandidates) {
-            if (webShare && !directWebCandidate(candidate.sdp)) return@synchronized
+            if (webShare && !webCandidate(candidate.sdp, relayOnly)) return@synchronized
             if (remoteDescriptionSet) peer.addIceCandidate(candidate)
             else if (pendingCandidates.size < 128) pendingCandidates += candidate
             Unit
@@ -290,8 +292,11 @@ class WebRtcChatTransport(
     private fun maxFrame() = if (webShare) 32 * 1024 else Chatquic.MaxDatagram
 }
 
-private val directCandidateType = Regex("^(?:a=)?candidate:\\S+\\s+\\d+\\s+\\S+\\s+\\d+\\s+\\S+\\s+\\d+\\s+typ\\s+(host|srflx|prflx)(?:\\s|$)", RegexOption.IGNORE_CASE)
-internal fun directWebCandidate(candidate: String) = directCandidateType.containsMatchIn(candidate)
+private val webCandidateType = Regex("^(?:a=)?candidate:\\S+\\s+\\d+\\s+\\S+\\s+\\d+\\s+\\S+\\s+\\d+\\s+typ\\s+(\\w+)(?:\\s|$)", RegexOption.IGNORE_CASE)
+internal fun webCandidate(candidate: String, relayOnly: Boolean): Boolean {
+    val kind = webCandidateType.find(candidate)?.groupValues?.get(1)?.lowercase()
+    return if (relayOnly) kind == "relay" else kind == "host" || kind == "srflx" || kind == "prflx"
+}
 
 internal fun selectedChatLink(stats: Map<String, RTCStats>): TunnelChatLink? {
     val pairId = stats.values.firstNotNullOfOrNull { entry ->

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { createHash, generateKeyPairSync, randomUUID, sign } from 'node:crypto';
+import { createHash, createHmac, generateKeyPairSync, randomUUID, sign } from 'node:crypto';
 import { once } from 'node:events';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { createServer as httpsServer } from 'node:https';
@@ -134,6 +134,8 @@ test('browser guests only signal supported public web shares and never enter the
   assert.deepEqual((await receive(guest)).payload, answer);
   send(guest, 'web_candidate', { candidate: 'candidate:1 1 udp 2122260223 192.0.2.6 4000 typ relay', sdp_mid: '0', sdp_mline_index: 0 }, request);
   assert.equal((await receive(guest)).error.code, 'invalid_signal');
+  send(guest, 'web_relay', {}, target(publisher));
+  assert.equal((await receive(guest)).error.code, 'invalid_signal');
   const { items } = await (await platform.request(directory)).json();
   assert.equal(items.length, 2);
   assert.deepEqual(items.find(item => item.endpointId === publisher.profile.endpointId).capabilities, ['text', 'web-share']);
@@ -144,8 +146,62 @@ test('browser guests only signal supported public web shares and never enter the
   assert.deepEqual(updated.find(item => item.endpointId === publisher.profile.endpointId).capabilities, ['text']);
 });
 
-test('real Chromium loads and writes a shared app through Service Worker and a verified direct channel', {
-  skip: !process.env.DSHX_PLAYWRIGHT_MODULE, timeout: 45_000,
+test('web relay is issued once after a direct attempt and routes only relay candidates', { timeout: 8000 }, async t => {
+  const turn = { urls: ['turn:turn.test.invalid:3478'], secret: 'test-only-web-relay-shared-secret', ttlSeconds: 3600 };
+  const platform = await fixture(t, { webOrigin: 'https://web.example.test', appDomain: 'apps.example.test', turn });
+  const publisher = identity('接收网页'), other = identity('另一端点');
+  const registration = await platform.publish(publisher, { webShare: true });
+  const destination = await platform.connect(publisher, registration.registrationToken, servers => assert.deepEqual(servers[1].urls, turn.urls));
+  const browser = platform.browser();
+  const welcome = await receive(browser);
+  assert.equal(welcome.payload.relay_available, true);
+  assert.deepEqual(welcome.payload.ice_servers, [{ urls: ['stun:test.invalid:3478'] }]);
+  const visitor = { profile: { endpointId: welcome.destination.id } };
+  const direct = target(publisher), relay = target(publisher);
+  const offer = { description: { type: 'offer', sdp: 'offer' } };
+  send(browser, 'web_relay', {}, relay);
+  assert.equal((await receive(browser)).error.code, 'invalid_signal');
+  send(browser, 'web_offer', { ...offer, relay_only: true }, relay);
+  assert.equal((await receive(browser)).error.code, 'invalid_signal');
+  send(browser, 'web_offer', offer, direct);
+  assert.deepEqual((await receive(destination)).payload, offer);
+  send(browser, 'web_relay', {}, relay);
+  assert.equal((await receive(browser)).error.code, 'invalid_signal');
+  send(destination, 'web_close', { connection_failed: true }, target(visitor, direct.session_id));
+  assert.deepEqual((await receive(browser)).payload, { connection_failed: true });
+  send(browser, 'web_relay', {}, target(other));
+  assert.equal((await receive(browser)).error.code, 'invalid_signal');
+  const now = Math.floor(Date.now() / 1000);
+  send(browser, 'web_relay', {}, relay);
+  const grant = await receive(browser);
+  assert.equal(grant.type, 'web_relay_ready');
+  assert.equal(grant.session_id, relay.session_id);
+  const [server] = grant.payload.ice_servers;
+  const [time, username] = server.username.split(':');
+  assert.equal(username, welcome.destination.id);
+  assert.ok(Number(time) >= now + 1800 && Number(time) <= Math.floor(Date.now() / 1000) + 1800);
+  assert.deepEqual(server.urls, turn.urls);
+  assert.equal(server.credential, createHmac('sha1', turn.secret).update(server.username).digest('base64'));
+  send(browser, 'web_offer', { ...offer, relay_only: true }, target(publisher));
+  assert.equal((await receive(browser)).error.code, 'invalid_signal');
+  send(browser, 'web_offer', { ...offer, relay_only: true }, relay);
+  assert.deepEqual((await receive(destination)).payload, { ...offer, relay_only: true });
+  const candidate = { candidate: 'candidate:1 1 udp 2122260223 192.0.2.6 4000 typ host', sdp_mid: '0', sdp_mline_index: 0 };
+  send(browser, 'web_candidate', candidate, relay);
+  assert.equal((await receive(browser)).error.code, 'invalid_signal');
+  candidate.candidate = candidate.candidate.replace('typ host', 'typ relay');
+  send(browser, 'web_candidate', candidate, relay);
+  assert.deepEqual((await receive(destination)).payload, candidate);
+  send(destination, 'web_close', {}, target(visitor, relay.session_id));
+  assert.equal((await receive(browser)).type, 'web_close');
+  send(browser, 'web_relay', {}, target(publisher));
+  assert.equal((await receive(browser)).error.code, 'invalid_signal');
+});
+
+const relayUrl = process.env.DSHX_TEST_WEB_TURN_URL;
+const relaySecret = process.env.DSHX_TEST_WEB_TURN_SECRET;
+test(`real Chromium loads and writes a shared app through Service Worker and a verified ${relayUrl ? 'relay' : 'direct'} channel`, {
+  skip: !process.env.DSHX_PLAYWRIGHT_MODULE, timeout: 55_000,
 }, async t => {
   const certDir = mkdtempSync(path.join(os.tmpdir(), 'dshx-web-test-'));
   t.after(() => rmSync(certDir, { recursive: true, force: true }));
@@ -155,13 +211,14 @@ test('real Chromium loads and writes a shared app through Service Worker and a v
   tls.listen(0, '127.0.0.1');
   await once(tls, 'listening');
   const origin = `https://portal.test:${tls.address().port}`;
-  const platform = await fixture(t, { webOrigin: origin, appDomain: 'apps.test', iceServers: [] });
+  const turn = relayUrl ? { urls: [relayUrl], secret: relaySecret } : undefined;
+  const platform = await fixture(t, { webOrigin: origin, appDomain: 'apps.test', iceServers: [], turn });
   tls.on('request', (req, res) => platform.server.emit('request', req, res));
   tls.on('upgrade', (...args) => platform.server.emit('upgrade', ...args));
   t.after(() => { tls.closeAllConnections(); tls.close(); });
   const publisher = identity('真实浏览器测试');
   const registration = await platform.publish(publisher, { webShare: true });
-  const publisherSocket = await platform.connect(publisher, registration.registrationToken, servers => assert.deepEqual(servers, []));
+  const publisherSocket = await platform.connect(publisher, registration.registrationToken, servers => assert.equal(servers.length, turn ? 1 : 0));
   const { chromium } = await import(process.env.DSHX_PLAYWRIGHT_MODULE);
   const browser = await chromium.launch({ executablePath: process.env.DSHX_CHROME_PATH, headless: true, args: [
     '--ignore-certificate-errors', '--disable-features=WebRtcHideLocalIpsWithMdns', '--no-proxy-server',
@@ -172,9 +229,9 @@ test('real Chromium loads and writes a shared app through Service Worker and a v
   const publishing = await context.newPage();
   await publishing.goto('about:blank');
   const share = randomUUID();
-  await publishing.evaluate(({ share }) => {
+  await publishing.evaluate(({ share, iceServers, relay }) => {
     const encoder = new TextEncoder();
-    const peer = new RTCPeerConnection({ iceServers: [] });
+    const peer = new RTCPeerConnection({ iceServers, iceTransportPolicy: relay ? 'relay' : 'all' });
     const channel = peer.createDataChannel('dshx-web/1', { negotiated: true, id: 0, ordered: true, protocol: 'dshx-web/1' });
     channel.binaryType = 'arraybuffer';
     const requests = new Map();
@@ -210,13 +267,19 @@ test('real Chromium loads and writes a shared app through Service Worker and a v
       }
     };
     window.publisher = { peer };
-  }, { share });
+  }, { share, iceServers: registration.iceServers, relay: Boolean(turn) });
   let incoming = Promise.resolve();
+  const attempts = [];
+  let session;
   publisherSocket.on('message', raw => {
     incoming = incoming.then(async () => {
       const frame = JSON.parse(raw);
       const recipient = { session_id: frame.session_id, destination: frame.source };
       if (frame.type === 'web_offer') {
+        attempts.push(frame.payload.relay_only === true ? 'relay' : 'direct');
+        // 模拟双方无法通过直连交换地址；中继协商仍使用真正的 ICE 和数据通道。
+        if (turn && !frame.payload.relay_only) return;
+        session = frame.session_id;
         const answer = await publishing.evaluate(async offer => {
           const { peer } = window.publisher;
           await peer.setRemoteDescription({ type: 'offer', sdp: offer });
@@ -235,17 +298,32 @@ test('real Chromium loads and writes a shared app through Service Worker and a v
         const proof = `${Buffer.from(publisher.profile.publicKey, 'base64').toString('base64url')}.${sign('sha256', Buffer.from(text), publisher.privateKey).toString('base64url')}`;
         send(publisherSocket, 'web_answer', { description: answer, proof }, recipient);
       }
-      if (frame.type === 'web_candidate') await publishing.evaluate(candidate => window.publisher.peer.addIceCandidate(candidate), {
+      if (frame.type === 'web_candidate' && frame.session_id === session) await publishing.evaluate(candidate => window.publisher.peer.addIceCandidate(candidate), {
         candidate: frame.payload.candidate, sdpMid: frame.payload.sdp_mid, sdpMLineIndex: frame.payload.sdp_mline_index,
       });
     }).catch(error => t.diagnostic(error.stack));
   });
   const visitor = await context.newPage();
+  await visitor.addInitScript(() => {
+    const Peer = window.RTCPeerConnection;
+    window.RTCPeerConnection = class extends Peer {
+      constructor(config) { super(config); window.testPeer = this; }
+    };
+  });
   visitor.on('pageerror', error => t.diagnostic(error.stack));
   await visitor.goto(`${origin}/web/?endpoint=${publisher.profile.endpointId}&share=${share}`);
   const app = visitor.frameLocator('#viewer > iframe').frameLocator('iframe');
-  try { await app.getByRole('heading', { name: 'Shared application' }).waitFor({ timeout: 30_000 }); }
+  try { await app.getByRole('heading', { name: 'Shared application' }).waitFor({ timeout: 42_000 }); }
   catch (error) { t.diagnostic(`访客状态：${await visitor.locator('#status').textContent()}`); throw error; }
+  assert.deepEqual(attempts, turn ? ['direct', 'relay'] : ['direct']);
+  const link = await visitor.evaluate(async () => {
+    const stats = await window.testPeer.getStats();
+    const pair = stats.get([...stats.values()].find(row => row.type === 'transport')?.selectedCandidatePairId);
+    return { state: pair?.state, kinds: [pair?.localCandidateId, pair?.remoteCandidateId].map(id => stats.get(id)?.candidateType) };
+  });
+  assert.equal(link.state, 'succeeded');
+  if (turn) assert.ok(link.kinds.includes('relay'));
+  else assert.ok(link.kinds.every(kind => ['host', 'srflx', 'prflx'].includes(kind)));
   const result = await app.locator('body').evaluate(async () => {
     const plain = await fetch('/data').then(r => r.text());
     const upload = await fetch('/submit', { method: 'POST', body: 'x'.repeat(20_000) }).then(r => r.text());

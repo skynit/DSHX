@@ -218,6 +218,7 @@ class PolicyBridge(
                         val owner = policy.state.sessions.first { it.id == session }
                         val handler = requireNotNull(apps)
                         val action = request.getString("action"); val args = request.getJSONObject("args")
+                        if (action == "create-web-share") require(owner.parent == null && frame.toByteArray().size <= 4096)
                         require(appSlots.tryAcquire()) { "微应用管理请求过多。" }
                         thread(name = "dsh-app-call", isDaemon = true) {
                             val result = JSONObject().put("id", id)
@@ -225,8 +226,11 @@ class PolicyBridge(
                                 require(!closed && policy.state.sessions.any { it === owner })
                                 result.put("result", handler(action, args)).put("ok", true)
                             } catch (error: Exception) {
-                                result.put("ok", false).put("error", if (error is IllegalArgumentException) error.message?.take(180)
-                                    else "微应用操作未完成，请按原操作编号核实结果。")
+                                result.put("ok", false).put("error", when {
+                                    error is IllegalArgumentException -> error.message?.take(180)
+                                    action == "create-web-share" -> "共享条目未确认，请查看网页共享或按原编号重试。"
+                                    else -> "微应用操作未完成，请按原操作编号核实结果。"
+                                })
                             } finally { appSlots.release() }
                             runCatching { send(socket, result) }
                         }

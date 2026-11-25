@@ -76,6 +76,7 @@ export function createTunnelPlatform({ iceServers = defaultIceServers, turn, web
   const profiles = new Map();
   const guests = new Map();
   const guestCounts = new Map();
+  const relayIssues = new Map();
   const challenges = new Map();
   const tokens = new Map();
   const sessions = new Map();
@@ -85,12 +86,15 @@ export function createTunnelPlatform({ iceServers = defaultIceServers, turn, web
     const urls = [server?.urls].flat().filter(url => typeof url === 'string' && /^stuns?:[^\s]+$/i.test(url));
     return urls.length ? [{ urls }] : [];
   });
+  const relayServer = (id, expires) => {
+    const username = `${expires}:${id}`;
+    const credential = createHmac('sha1', turn.secret).update(username).digest('base64');
+    return { urls: turn.urls, username, credential };
+  };
   const issueIceServers = profile => {
     if (!turn) return iceServers;
     profile.turnExpiresAtSeconds = Math.floor(Date.now() / 1000) + turn.ttlSeconds;
-    const username = `${profile.turnExpiresAtSeconds}:${profile.info.endpointId}`;
-    const credential = createHmac('sha1', turn.secret).update(username).digest('base64');
-    return [...iceServers, { urls: turn.urls, username, credential }];
+    return [...iceServers, relayServer(profile.info.endpointId, profile.turnExpiresAtSeconds)];
   };
   const describe = ({ info: { endpointId, displayName, publicIntroduction, publication, acceptance, capabilities }, socket }) => ({
     endpointId, displayName, publicIntroduction, publication, acceptance, capabilities, online: socket?.readyState === WebSocket.OPEN,
@@ -209,7 +213,7 @@ export function createTunnelPlatform({ iceServers = defaultIceServers, turn, web
     const payload = message.payload;
     const target = message.destination?.id;
     const wireType = message.type;
-    const webLink = ['web_offer', 'web_answer', 'web_candidate', 'web_close'].includes(wireType);
+    const webLink = ['web_offer', 'web_answer', 'web_candidate', 'web_close', 'web_relay'].includes(wireType);
     const type = webLink ? (wireType === 'web_close' ? 'session_close' : wireType.slice(4)) : wireType;
     const reject = code => send(profile.socket, platformFrame(profile, 'error', message, { error: { code } }));
     if (!sessionId.test(id) || message.destination?.kind !== 'endpoint' || !routeId.test(target) ||
@@ -217,38 +221,64 @@ export function createTunnelPlatform({ iceServers = defaultIceServers, turn, web
         !isObject(payload) || (profile.guest && !webLink)) return reject('invalid_signal');
     const peer = profiles.get(target) ?? (webLink ? guests.get(target) : undefined);
     const bound = sessions.get(id);
+    const webAvailable = () => peer?.info.capabilities?.includes('web-share') && peer.socket?.readyState === WebSocket.OPEN;
+    if (wireType === 'web_relay') {
+      if (!turn || !profile.guest || profile.directTarget !== target || profile.sessions.size || bound || profile.relayPermit) return reject('invalid_signal');
+      if (!webAvailable()) return reject('unavailable');
+      const now = Date.now();
+      const ttl = Math.min(turn.ttlSeconds, 1800);
+      let issued = relayIssues.get(profile.address);
+      if (!issued || issued.expires <= now) {
+        if (relayIssues.size >= 4096 && !issued) return reject('busy');
+        relayIssues.set(profile.address, issued = { count: 0, expires: now + ttl * 1000 });
+      }
+      if (issued.count >= 32) return reject('busy');
+      issued.count++;
+      profile.relayPermit = { id, target, expires: now + 25_000 };
+      return send(profile.socket, platformFrame(profile, 'web_relay_ready', message, { payload: {
+        ice_servers: [relayServer(profile.info.endpointId, Math.floor(now / 1000) + ttl)],
+      } }));
+    }
+    const relay = webLink && (type === 'offer' ? payload.relay_only === true : bound?.relay === true);
+    const validCandidate = candidate => webCandidate(candidate, relay);
     if (type === 'offer') {
       if (!validText(payload.description?.sdp, 60 * 1024) || payload.description.type !== 'offer' || !payload.description.sdp) return reject('invalid_signal');
-      if (webLink && (!web || !profile.guest || hasRelay(payload.description.sdp))) return reject('invalid_signal');
-      if (webLink && !peer?.info.capabilities?.includes('web-share')) return reject('unavailable');
+      if (webLink && (!web || !profile.guest || !validWebSdp(payload.description.sdp, validCandidate))) return reject('invalid_signal');
+      if (relay && (profile.relayPermit?.id !== id || profile.relayPermit.target !== target ||
+          profile.relayPermit.used || profile.relayPermit.expires <= Date.now())) return reject('invalid_signal');
+      if (webLink && !webAvailable()) return reject('unavailable');
       if (payload.conversation_id !== undefined && (typeof payload.conversation_id !== 'string' || !sessionId.test(payload.conversation_id))) return reject('invalid_signal');
       if (peer?.info.publication !== 'published' || peer.socket?.readyState !== WebSocket.OPEN) return reject('unavailable');
       // 暂停接收还要允许客户端识别并放行旧会话重连，所以接收策略由端点裁决。
       const count = owner => [...owner.sessions].filter(sid => sessions.get(sid)?.web === webLink).length;
       if (bound || count(profile) >= (webLink ? 1 : 64) || count(peer) >= (webLink ? 12 : 64)) return reject('busy');
-      sessions.set(id, { from: profile, to: peer, web: webLink });
+      sessions.set(id, { from: profile, to: peer, web: webLink, relay });
       profile.sessions.add(id);
       peer.sessions.add(id);
+      if (relay) profile.relayPermit.used = true;
+      else if (webLink) profile.directTarget = target;
     } else {
       if (!bound || !(bound.from === profile && bound.to === peer || bound.to === profile && bound.from === peer)) return reject('unknown_session');
       if (bound.web !== webLink) return reject('invalid_signal');
       if (type === 'answer') {
         if (bound.to !== profile || bound.answered || payload.description?.type !== 'answer' ||
             !validText(payload.description.sdp, 60 * 1024) || !payload.description.sdp || (webLink &&
-              (!validText(payload.proof, 320) || !/^[\w-]+\.[\w-]+$/.test(payload.proof) || hasRelay(payload.description.sdp)))) return reject('invalid_signal');
+              (!validText(payload.proof, 320) || !/^[\w-]+\.[\w-]+$/.test(payload.proof) || !validWebSdp(payload.description.sdp, validCandidate)))) return reject('invalid_signal');
         bound.answered = true;
       } else if (type === 'candidate') {
         if (!validText(payload.candidate, 4096) || !payload.candidate ||
             (payload.sdp_mid != null && !validText(payload.sdp_mid, 256)) ||
             !Number.isInteger(payload.sdp_mline_index) || payload.sdp_mline_index < 0 ||
-            (webLink && !directCandidate(payload.candidate))) return reject('invalid_signal');
+            (webLink && !validCandidate(payload.candidate))) return reject('invalid_signal');
       } else if (type === 'session_close') removeSession(id);
       else return reject('invalid_signal');
     }
     const clean = type === 'offer' || type === 'answer' ? { description: { type, sdp: payload.description.sdp },
       ...(!webLink && type === 'offer' && payload.conversation_id !== undefined ? { conversation_id: payload.conversation_id } : {}),
+      ...(relay && type === 'offer' ? { relay_only: true } : {}),
       ...(webLink && type === 'answer' ? { proof: payload.proof } : {}) } :
-      type === 'candidate' ? { candidate: payload.candidate, sdp_mid: payload.sdp_mid, sdp_mline_index: payload.sdp_mline_index } : {};
+      type === 'candidate' ? { candidate: payload.candidate, sdp_mid: payload.sdp_mid, sdp_mline_index: payload.sdp_mline_index } :
+      webLink && !profile.guest && payload.connection_failed === true ? { connection_failed: true } : {};
     if (!send(peer.socket, { protocol, version: 1, type: wireType, message_id: message.message_id, session_id: id,
       source: endpoint(profile.info.endpointId), destination: endpoint(target), payload: clean })) {
       removeSession(id);
@@ -280,7 +310,7 @@ export function createTunnelPlatform({ iceServers = defaultIceServers, turn, web
   function acceptGuest(ws, address) {
     const uuid = randomUUID();
     const id = `${uuid.slice(0, 14)}8${uuid.slice(15)}`;
-    const profile = { info: { endpointId: id }, guest: true, socket: ws, sessions: new Set() };
+    const profile = { info: { endpointId: id }, guest: true, address, socket: ws, sessions: new Set() };
     guests.set(id, profile);
     guestCounts.set(address, (guestCounts.get(address) ?? 0) + 1);
     let emptySince = Date.now();
@@ -289,7 +319,7 @@ export function createTunnelPlatform({ iceServers = defaultIceServers, turn, web
     let count = 0;
     const pulse = setInterval(() => {
       const now = Date.now();
-      if ([...profile.sessions].some(id => sessions.get(id)?.answered)) emptySince = now;
+      if (profile.relayPermit?.expires > now || [...profile.sessions].some(id => sessions.get(id)?.answered)) emptySince = now;
       if (!alive || now >= expires || now - emptySince >= 30_000) return ws.terminate();
       alive = false;
       count = 0;
@@ -313,7 +343,9 @@ export function createTunnelPlatform({ iceServers = defaultIceServers, turn, web
         route(profile, frame);
       } catch { ws.terminate(); }
     });
-    send(ws, { protocol, version: 1, type: 'web_ready', destination: endpoint(id), payload: { ice_servers: directServers } });
+    send(ws, { protocol, version: 1, type: 'web_ready', destination: endpoint(id), payload: {
+      ice_servers: directServers, ...(turn ? { relay_available: true } : {}),
+    } });
   }
 
   function acceptSocket(profile, ws) {
@@ -365,6 +397,7 @@ export function createTunnelPlatform({ iceServers = defaultIceServers, turn, web
 
   const sweep = setInterval(() => {
     const now = Date.now();
+    for (const [address, issued] of relayIssues) if (issued.expires <= now) relayIssues.delete(address);
     for (const [challenge, pending] of challenges) if (pending.expires <= now) challenges.delete(challenge);
     for (const [token, profile] of tokens) if (!activeToken(profile)) tokens.delete(token);
     for (const [id, profile] of profiles) if (!profile.socket && now - profile.updated > 7 * 24 * 3600_000) profiles.delete(id);
@@ -388,10 +421,11 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     .listen(port, '127.0.0.1', () => console.log(`DSHX 穿透平台监听 127.0.0.1:${port}`));
 }
 
-function directCandidate(candidate) {
-  return /^candidate:\S+\s+\d+\s+\S+\s+\d+\s+\S+\s+\d+\s+typ\s+(?:host|srflx|prflx)(?:\s|$)/i.test(candidate);
+function webCandidate(candidate, relay) {
+  const kind = /^candidate:\S+\s+\d+\s+\S+\s+\d+\s+\S+\s+\d+\s+typ\s+(\w+)(?:\s|$)/i.exec(candidate)?.[1].toLowerCase();
+  return relay ? kind === 'relay' : ['host', 'srflx', 'prflx'].includes(kind);
 }
 
-function hasRelay(sdp) {
-  return sdp.split(/\r?\n/).some(line => /^a=candidate:/i.test(line) && !directCandidate(line.slice(2)));
+function validWebSdp(sdp, validCandidate) {
+  return sdp.split(/\r?\n/).every(line => !/^a=candidate:/i.test(line) || validCandidate(line.slice(2)));
 }

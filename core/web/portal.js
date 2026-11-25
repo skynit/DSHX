@@ -5,7 +5,8 @@ const status = document.querySelector('#status');
 const appDomain = document.querySelector('meta[name=dshx-app-domain]').content;
 const protocol = 'cwnas-webrtc-signaling';
 const uuid = /^[\da-f-]{36}$/;
-const direct = /^(?:a=)?candidate:\S+\s+\d+\s+\S+\s+\d+\s+\S+\s+\d+\s+typ\s+(host|srflx|prflx)(?:\s|$)/i;
+const candidateType = /^(?:a=)?candidate:\S+\s+\d+\s+\S+\s+\d+\s+\S+\s+\d+\s+typ\s+(\w+)(?:\s|$)/i;
+const directKinds = ['host', 'srflx', 'prflx'];
 const reserved = /^\/__dshx(?:\/|$)/;
 const maxChunk = 12 * 1024;
 let active;
@@ -66,7 +67,7 @@ function connect(endpointId, initialShare) {
     connection.disposeView();
     viewer.hidden = true;
     status.textContent = message;
-  });
+  }, message => { if (active === connection) status.textContent = message; });
   active = connection;
   let itemCount = 0;
   function onFrame(frame) {
@@ -77,14 +78,14 @@ function connect(endpointId, initialShare) {
       row(shares, item.name, '打开网页', () => void open(item));
       if (item.id === initialShare) void open(item);
     }
-    if (frame.done !== false) status.textContent = itemCount ? '已直连' : '没有可访问的网页';
+    if (frame.done !== false) status.textContent = itemCount ? connection.connectedLabel : '没有可访问的网页';
   }
   async function open(item) {
     status.textContent = '正在打开网页…';
     try {
       await connection.view(item);
       viewer.hidden = false;
-      status.textContent = '已直连';
+      status.textContent = connection.connectedLabel;
       history.replaceState(null, '', `/web/?endpoint=${encodeURIComponent(endpointId)}&share=${encodeURIComponent(item.id)}`);
     } catch { if (active === connection) status.textContent = '无法初始化网页入口'; }
   }
@@ -97,94 +98,150 @@ function safePath(value) {
 
 class Peer {
   requests = new Map();
-  session = crypto.randomUUID();
-  remoteCandidates = [];
-  localCandidates = [];
   closed = false;
 
-  constructor(endpoint, onFrame, onError) {
+  constructor(endpoint, onFrame, onError, onStatus) {
     this.endpoint = endpoint;
     this.onFrame = onFrame;
     this.onError = onError;
+    this.onStatus = onStatus;
     this.socket = new WebSocket(`${location.origin.replace(/^https:/, 'wss:')}/api/v1/dshx/web/signaling`);
-    this.socket.onmessage = ({ data }) => { this.signals = (this.signals ?? Promise.resolve()).then(() => this.signal(JSON.parse(data))).catch(() => this.fail('直连验证失败')); };
+    this.socket.onmessage = ({ data }) => {
+      this.signals = (this.signals ?? Promise.resolve()).then(async () => {
+        const frame = JSON.parse(data);
+        try { await this.signal(frame); }
+        catch { if (!frame.session_id || this.attempt?.id === frame.session_id) this.fail('网页连接验证失败'); }
+      }).catch(() => this.fail('网页信令格式无效'));
+    };
     this.socket.onclose = this.socket.onerror = () => this.fail('网页连接已断开');
     this.timer = setTimeout(() => this.fail('无法建立设备直连'), 25_000);
   }
 
-  signalSend(type, payload) {
-    this.socket.send(JSON.stringify({ protocol, version: 1, message_id: crypto.randomUUID(), type, session_id: this.session,
+  get connectedLabel() { return this.attempt.relay ? '已通过中继连接' : '已直连'; }
+
+  signalSend(attempt, type, payload) {
+    this.socket.send(JSON.stringify({ protocol, version: 1, message_id: crypto.randomUUID(), type, session_id: attempt.id,
       destination: { kind: 'endpoint', id: this.endpoint }, payload }));
   }
 
   async signal(frame) {
     if (this.closed || frame.protocol !== protocol || frame.version !== 1) return;
     const payload = frame.payload;
-    if (frame.type === 'web_ready' && !this.peer) {
+    if (frame.type === 'web_ready' && !this.attempt) {
       this.visitor = frame.destination.id;
+      this.relayAvailable = payload.relay_available === true;
       const iceServers = payload.ice_servers.flatMap(server => {
         const urls = server.urls.filter(url => /^stuns?:/i.test(url));
         return urls.length ? [{ urls }] : [];
       });
-      this.peer = new RTCPeerConnection({ iceServers });
-      this.channel = this.peer.createDataChannel('dshx-web/1', { negotiated: true, id: 0, ordered: true, protocol: 'dshx-web/1' });
-      this.peer.onicecandidate = ({ candidate }) => {
-        if (!candidate || !direct.test(candidate.candidate)) return;
-        const data = { candidate: candidate.candidate, sdp_mid: candidate.sdpMid, sdp_mline_index: candidate.sdpMLineIndex };
-        if (!this.offered) this.localCandidates.push(data);
-        else this.signalSend('web_candidate', data);
-      };
-      this.peer.onconnectionstatechange = () => {
-        if (['failed', 'closed'].includes(this.peer.connectionState)) this.fail('网页直连已断开');
-      };
-      this.channel.binaryType = 'arraybuffer';
-      this.channel.onopen = () => this.checkDirect().catch(() => this.fail('无法确认设备直连'));
-      this.channel.onclose = () => this.fail('网页共享已关闭');
-      this.channel.onmessage = ({ data }) => this.receive(data);
-      const description = await this.peer.createOffer();
-      await this.peer.setLocalDescription(description);
-      this.offer = description.sdp;
-      this.signalSend('web_offer', { description });
-      this.offered = true;
-      for (const candidate of this.localCandidates.splice(0)) this.signalSend('web_candidate', candidate);
-      return;
+      const attempt = this.attempt = this.newAttempt(false);
+      this.setTimer(() => this.connectionFailed(attempt), this.relayAvailable ? 12_000 : 25_000);
+      return this.start(attempt, iceServers);
     }
-    if (frame.session_id !== this.session || frame.destination?.id !== this.visitor) return;
+    const attempt = this.attempt;
+    if (!attempt || frame.session_id !== attempt.id || frame.destination?.id !== this.visitor) return;
     if (frame.type === 'error' && frame.source?.kind === 'platform') return this.fail('端点当前无法建立网页连接');
-    if (frame.source?.id !== this.endpoint || !this.peer) return;
-    if (frame.type === 'web_answer' && !this.peer.remoteDescription) {
+    if (frame.type === 'web_relay_ready' && frame.source?.kind === 'platform' && attempt.relay && !attempt.peer) {
+      return this.start(attempt, payload.ice_servers);
+    }
+    const { peer } = attempt;
+    if (frame.source?.id !== this.endpoint || !peer) return;
+    if (frame.type === 'web_answer' && !peer.remoteDescription) {
       const sdp = payload.description.sdp;
-      if (sdp.split(/\r?\n/).some(line => line.startsWith('a=candidate:') && !direct.test(line))) throw Error();
-      await verifyAnswer(this, sdp, payload.proof);
-      await this.peer.setRemoteDescription(payload.description);
-      for (const candidate of this.remoteCandidates.splice(0)) await this.peer.addIceCandidate(candidate);
-    } else if (frame.type === 'web_candidate' && direct.test(payload.candidate)) {
+      if (sdp.split(/\r?\n/).some(line => /^a=candidate:/i.test(line) && !this.validCandidate(attempt, line))) throw Error();
+      await verifyAnswer(this, attempt, sdp, payload.proof);
+      if (!this.current(attempt)) return;
+      await peer.setRemoteDescription(payload.description);
+      for (const candidate of attempt.remoteCandidates.splice(0)) {
+        if (this.current(attempt)) await peer.addIceCandidate(candidate);
+      }
+    } else if (frame.type === 'web_candidate' && this.validCandidate(attempt, payload.candidate)) {
       const candidate = { candidate: payload.candidate, sdpMid: payload.sdp_mid, sdpMLineIndex: payload.sdp_mline_index };
-      if (this.peer.remoteDescription) await this.peer.addIceCandidate(candidate);
-      else if (this.remoteCandidates.length < 128) this.remoteCandidates.push(candidate);
-    } else if (frame.type === 'web_close') this.fail('端点已停止网页访问');
+      if (peer.remoteDescription) await peer.addIceCandidate(candidate);
+      else if (attempt.remoteCandidates.length < 128) attempt.remoteCandidates.push(candidate);
+    } else if (frame.type === 'web_close') {
+      if (payload.connection_failed === true) this.connectionFailed(attempt, false);
+      else this.fail('端点已停止网页访问');
+    }
   }
 
-  async checkDirect() {
-    for (let attempt = 0; attempt < 30 && !this.closed; attempt++) {
-      const stats = await this.peer.getStats();
+  newAttempt(relay) { return { id: crypto.randomUUID(), relay, localCandidates: [], remoteCandidates: [] }; }
+
+  current(attempt) { return !this.closed && this.attempt === attempt; }
+
+  setTimer(callback, timeout) {
+    clearTimeout(this.timer);
+    this.timer = setTimeout(callback, timeout);
+  }
+
+  validCandidate(attempt, candidate) {
+    const kind = candidateType.exec(candidate)?.[1].toLowerCase();
+    return attempt.relay ? kind === 'relay' : directKinds.includes(kind);
+  }
+
+  async start(attempt, iceServers) {
+    const peer = attempt.peer = new RTCPeerConnection({ iceServers, iceTransportPolicy: attempt.relay ? 'relay' : 'all' });
+    const channel = attempt.channel = peer.createDataChannel('dshx-web/1', { negotiated: true, id: 0, ordered: true, protocol: 'dshx-web/1' });
+    peer.onicecandidate = ({ candidate }) => {
+      if (!this.current(attempt) || this.socket.readyState !== WebSocket.OPEN || !candidate || !this.validCandidate(attempt, candidate.candidate)) return;
+      const data = { candidate: candidate.candidate, sdp_mid: candidate.sdpMid, sdp_mline_index: candidate.sdpMLineIndex };
+      if (attempt.offered) this.signalSend(attempt, 'web_candidate', data);
+      else if (attempt.localCandidates.length < 128) attempt.localCandidates.push(data);
+    };
+    peer.onconnectionstatechange = () => {
+      if (['failed', 'closed'].includes(peer.connectionState)) this.connectionFailed(attempt);
+    };
+    channel.binaryType = 'arraybuffer';
+    channel.onopen = () => this.checkLink(attempt).catch(() => {
+      if (this.current(attempt)) this.fail('无法确认网页连接');
+    });
+    channel.onclose = () => this.connectionFailed(attempt);
+    channel.onmessage = ({ data }) => { if (this.current(attempt)) this.receive(data); };
+    const description = await peer.createOffer();
+    if (!this.current(attempt)) return;
+    await peer.setLocalDescription(description);
+    if (!this.current(attempt)) return;
+    attempt.offer = description.sdp;
+    this.signalSend(attempt, 'web_offer', { description, ...(attempt.relay ? { relay_only: true } : {}) });
+    attempt.offered = true;
+    for (const candidate of attempt.localCandidates.splice(0)) this.signalSend(attempt, 'web_candidate', candidate);
+  }
+
+  connectionFailed(attempt, notifyPeer = true) {
+    if (!this.current(attempt)) return;
+    if (this.ready) return this.fail('网页连接已断开');
+    if (!this.relayAvailable || attempt.relay || !attempt.offered || this.socket.readyState !== WebSocket.OPEN) {
+      return this.fail(attempt.relay ? '无法建立中继连接' : '无法建立设备直连');
+    }
+    // 新会话只重试连接协商。已发送数据请求的连接不走这个分支。
+    if (notifyPeer) this.signalSend(attempt, 'web_close', {});
+    const relay = this.attempt = this.newAttempt(true);
+    attempt.channel?.close();
+    attempt.peer?.close();
+    this.onStatus('直连未成功，正在尝试中继…');
+    this.setTimer(() => this.connectionFailed(relay), 25_000);
+    this.signalSend(relay, 'web_relay', {});
+  }
+
+  async checkLink(attempt) {
+    for (let check = 0; check < 30 && this.current(attempt); check++) {
+      const stats = await attempt.peer.getStats();
+      if (!this.current(attempt)) return;
       const pair = stats.get([...stats.values()].find(value => value.type === 'transport')?.selectedCandidatePairId);
       const kinds = [stats.get(pair?.localCandidateId)?.candidateType, stats.get(pair?.remoteCandidateId)?.candidateType];
-      if (kinds.includes('relay')) break;
-      if (pair?.state === 'succeeded' && kinds.every(kind => ['host', 'srflx', 'prflx'].includes(kind))) {
+      if (pair?.state === 'succeeded' && (attempt.relay ? kinds.includes('relay') : kinds.every(kind => directKinds.includes(kind)))) {
         this.ready = true;
-        clearTimeout(this.timer);
-        this.timer = setTimeout(() => this.fail('读取网页列表超时'), 10_000);
+        this.setTimer(() => this.fail('读取网页列表超时'), 10_000);
         await this.send({ type: 'list' });
         return;
       }
       await sleep(150);
     }
-    if (!this.closed) this.fail('无法确认设备直连');
+    if (this.current(attempt)) this.fail('无法确认网页连接');
   }
 
   async send(frame) {
-    const channel = this.channel;
+    const channel = this.attempt?.channel;
     while (!this.closed && channel?.bufferedAmount > 128 * 1024) await sleep(15);
     if (!this.ready || this.closed || channel?.readyState !== 'open') throw Error('网页连接已断开');
     channel.send(new TextEncoder().encode(JSON.stringify(frame)));
@@ -272,8 +329,8 @@ class Peer {
     this.closed = true;
     clearTimeout(this.timer);
     this.disposeView();
-    this.channel?.close();
-    this.peer?.close();
+    this.attempt?.channel?.close();
+    this.attempt?.peer?.close();
     this.socket.close();
   }
 }
@@ -281,7 +338,7 @@ class Peer {
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const unbase64 = text => Uint8Array.from(atob(text.replaceAll('-', '+').replaceAll('_', '/')), char => char.charCodeAt(0));
 
-async function verifyAnswer(peer, answer, proof) {
+async function verifyAnswer(peer, attempt, answer, proof) {
   const [keyText, signature] = proof.split('.');
   const keyBytes = unbase64(keyText);
   const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', keyBytes));
@@ -291,7 +348,7 @@ async function verifyAnswer(peer, answer, proof) {
   const id = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
   if (id !== peer.endpoint) throw Error('端点身份不一致');
   const key = await crypto.subtle.importKey('spki', keyBytes, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']);
-  const transcript = new TextEncoder().encode(`dshx-web/1\n${peer.session}\n${peer.visitor}\n${peer.endpoint}\n${peer.offer}\n${answer}`);
+  const transcript = new TextEncoder().encode(`dshx-web/1\n${attempt.id}\n${peer.visitor}\n${peer.endpoint}\n${attempt.offer}\n${answer}`);
   if (!await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, key, derToRaw(unbase64(signature)), transcript)) throw Error('端点签名无效');
 }
 

@@ -216,7 +216,9 @@ class Engine(private val context: Context, private val worker: Executor = Execut
         (bridge ?: throw IllegalStateException("请先启动 dsh，再创建微应用。")).createApp(data)
 
     fun apps(action: String, data: org.json.JSONObject = org.json.JSONObject()): org.json.JSONObject {
-        val store = (context.applicationContext as DshApp).apps
+        val app = context.applicationContext as DshApp
+        if (action == "create-web-share") return app.tunnelChat.webShares.createDraft(data)
+        val store = app.apps
         if (action == "export") return AppApk(context.applicationContext, store).export(data)
         return store.call(action, data).also { result ->
             if (action == "status" && !data.has("operationId")) {

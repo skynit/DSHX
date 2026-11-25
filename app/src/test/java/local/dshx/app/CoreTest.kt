@@ -6424,6 +6424,49 @@ class CoreTest {
         @Implementation protected override fun getChild(index: Int): AccessibilityNodeInfo? = null
     }
 
+    @Test fun webShareDraftBridgeOnlyCreatesFromLocalMainSession() {
+        val context = RuntimeEnvironment.getApplication()
+        val policy = ToolPolicy().apply { begin("share-bridge") }
+        WebShares(context) { it == 8913 }.use { shares ->
+            PolicyBridge(policy, "share-bridge", apps = { action, data ->
+                assertEquals("create-web-share", action)
+                shares.createDraft(data)
+            }) {}.use { bridge ->
+                bridge.start()
+                PolicyConnection(bridge).use { connection ->
+                    policy.register(bridge.instance, "root", "本机", null)
+                    policy.register(bridge.instance, "child", "子会话", "root")
+                    policy.register(bridge.instance, "tunnel:visitor", "访客", null)
+                    val id = java.util.UUID.randomUUID().toString()
+                    fun create(call: Int, session: String = "root", address: String = "http://127.0.0.1:8080/", publish: Boolean = false) =
+                        connection.query(call, "apps", session) {
+                            put("action", "create-web-share")
+                            put("args", JSONObject().put("operationId", id).put("name", "网页草稿").put("address", address)
+                                .apply { if (publish) put("enabled", true) })
+                        }
+                    for ((call, session) in listOf("unknown", "child", "tunnel:visitor").withIndex()) {
+                        assertFalse(create(call + 1, session).getBoolean("ok"))
+                    }
+                    assertFalse(create(4, publish = true).getBoolean("ok"))
+                    assertFalse(create(5, address = "http://127.0.0.1:8913/").getBoolean("ok"))
+                    assertFalse(create(6, address = "https://example.test/").getBoolean("ok"))
+                    assertTrue(shares.items.value.isEmpty())
+                    val receipt = create(7).getJSONObject("result")
+                    assertEquals(id, receipt.getString("id"))
+                    assertFalse(receipt.getBoolean("enabled"))
+                    assertEquals(receipt.toString(), create(8).getJSONObject("result").toString())
+                    assertFalse(create(9, address = "http://127.0.0.1:8081/").getBoolean("ok"))
+                    assertEquals(id, shares.items.value.single().id)
+                    assertTrue(shares.publicList().isEmpty())
+                    WebShares(context) { false }.use { reopened ->
+                        assertEquals(id, reopened.items.value.single().id)
+                        assertTrue(reopened.publicList().isEmpty())
+                    }
+                }
+            }
+        }
+    }
+
     @Test @Config(shadows = [PhoneAccess::class, UnreadablePhoneNode::class])
     fun phoneControlCoordinateGesturesRejectAnUnreadableDeclaredChild() {
         val controller = phoneService()

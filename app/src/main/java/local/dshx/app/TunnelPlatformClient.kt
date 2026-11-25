@@ -339,7 +339,8 @@ class TunnelSignalingClient(
         sendSignal("web_candidate", session, visitor, JSONObject().put("candidate", candidate.sdp)
             .put("sdp_mid", candidate.sdpMid ?: JSONObject.NULL).put("sdp_mline_index", candidate.sdpMLineIndex))
 
-    internal fun closeWeb(session: String, visitor: String): Boolean = sendSignal("web_close", session, visitor, JSONObject())
+    internal fun closeWeb(session: String, visitor: String, failed: Boolean = false): Boolean =
+        sendSignal("web_close", session, visitor, JSONObject().apply { if (failed) put("connection_failed", true) })
 
     internal fun publishWebStatus(enabled: Boolean): Boolean {
         val current = connection ?: return false
