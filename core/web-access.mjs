@@ -5,6 +5,9 @@ const portal = new Map([
   ['/web/', ['portal.html', 'text/html']],
   ['/web/portal.js', ['portal.js', 'text/javascript']],
   ['/web/portal.css', ['portal.css', 'text/css']],
+  ['/web/peer.js', ['peer.js', 'text/javascript']],
+  ['/web/viewer.js', ['viewer.js', 'text/javascript']],
+  ['/web/viewer.css', ['bridge.css', 'text/css']],
   ...['button.css', 'badge.css', 'list.css', 'LICENSE'].map(name => {
     const file = `vendor/daisyui-5.8.2/${name}`;
     return [`/web/${file}`, [file, name === 'LICENSE' ? 'text/plain' : 'text/css']];
@@ -37,7 +40,10 @@ export function createWebAccess(webOrigin, appDomain) {
       const app = host?.endsWith(appSuffix) && /^s-[a-f0-9]{32}$/.test(host.slice(0, -appSuffix.length));
       const isPortal = host === origin.host && url.pathname.startsWith('/web');
       if (!app && !isPortal) return false;
-      const file = (app ? runtime : portal).get(url.pathname);
+      const entry = isPortal && url.pathname === '/web/';
+      const direct = entry && url.searchParams.has('endpoint') &&
+        (url.searchParams.has('share') || url.searchParams.get('list') !== '1');
+      const file = direct ? ['viewer.html', 'text/html'] : (app ? runtime : portal).get(url.pathname);
       if (!file || !['GET', 'HEAD'].includes(req.method)) {
         res.writeHead(404, { 'Cache-Control': 'no-store' }).end();
         return true;
@@ -48,8 +54,8 @@ export function createWebAccess(webOrigin, appDomain) {
         'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer',
         'Content-Security-Policy': app
           ? `default-src 'none'; script-src 'self'; style-src 'self'; worker-src 'self'; frame-src 'self'; frame-ancestors ${origin.origin}`
-          : `default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self' wss://${origin.host}; frame-src https://*.${appDomain}${port}; frame-ancestors 'none'; base-uri 'none'`,
-        ...(name === 'portal.html' ? { 'X-DSHX-App-Domain': appDomain } : {}),
+          : `default-src 'none'; script-src 'self'; style-src 'self'; img-src ${direct ? 'data:' : "'self'"}; connect-src 'self' wss://${origin.host}; frame-src https://*.${appDomain}${port}; frame-ancestors 'none'; base-uri 'none'`,
+        ...(entry ? { 'X-DSHX-App-Domain': appDomain } : {}),
         ...(name === 'sw.js' ? { 'Service-Worker-Allowed': '/' } : {}),
       };
       let source = readFileSync(new URL(`./web/${name}`, import.meta.url));

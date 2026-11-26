@@ -70,6 +70,14 @@ import kotlinx.coroutines.withTimeout
 class CoreTest {
     @get:Rule val folder = TemporaryFolder()
 
+    @Test fun webShareLinkOpensTheWebsiteUnlessBrowsingExplicitly() {
+        val endpoint = "c7bcf8fd-4908-8d38-aa15-489b32fce7e9"
+        val platform = "https://example.test:8443"
+        val link = "$platform/web/?endpoint=$endpoint"
+        assertEquals(link, webShareLink(platform, endpoint).toString())
+        assertEquals("$link&list=1", webShareLink(platform, endpoint, list = true).toString())
+    }
+
     @Test fun webShareTargetsStayOnTheRegisteredService() {
         val context = RuntimeEnvironment.getApplication()
         val shares = WebShares(context) { it == 8913 }

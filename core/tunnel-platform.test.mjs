@@ -282,7 +282,8 @@ test(`real Chromium loads and writes a shared app through Service Worker and a v
   const publishing = await context.newPage();
   await publishing.goto('about:blank');
   const share = randomUUID();
-  const startPublisher = () => publishing.evaluate(({ share, iceServers, relay }) => {
+  const otherShare = randomUUID();
+  const startPublisher = () => publishing.evaluate(({ share, otherShare, iceServers, relay }) => {
     window.publisher?.peer.close();
     const encoder = new TextEncoder();
     const peer = new RTCPeerConnection({ iceServers, iceTransportPolicy: relay ? 'relay' : 'all' });
@@ -299,9 +300,17 @@ test(`real Chromium loads and writes a shared app through Service Worker and a v
       const request = JSON.parse(new TextDecoder().decode(data));
       const pending = requests.get(request.id);
       switch (request.type) {
-        case 'list': reply({ type: 'list', items: [{ id: share, name: '测试网站', path: '/' }] }); break;
+        case 'list':
+          reply({ type: 'list', done: false, items: [{ id: share, name: '测试网站', path: '/' }] });
+          reply({ type: 'list', done: false, items: [{ id: otherShare, name: '另一个网站', path: '/other' }] });
+          reply({ type: 'list', done: true, items: [] });
+          break;
         case 'open':
           requests.set(request.id, { ...request, body: '' });
+          if (request.share === otherShare && request.path === '/other') {
+            report(request, 200, [['Content-Type', 'text/html']], '<h1>Another application</h1>');
+            return;
+          }
           if (request.share !== share) { reply({ type: 'error', id: request.id }); return; }
           if (request.upload) reply({ type: 'upload-ready', id: request.id });
           else if (request.path === '/data') report(request, 200, [['Content-Type', 'text/plain']], 'fixtures work');
@@ -322,7 +331,7 @@ test(`real Chromium loads and writes a shared app through Service Worker and a v
       }
     };
     window.publisher = { peer };
-  }, { share, iceServers: registration.iceServers, relay: Boolean(turn) });
+  }, { share, otherShare, iceServers: registration.iceServers, relay: Boolean(turn) });
   let incoming = Promise.resolve();
   const attempts = [];
   let session;
@@ -359,36 +368,60 @@ test(`real Chromium loads and writes a shared app through Service Worker and a v
       });
     }).catch(error => t.diagnostic(error.stack));
   });
-  const listURL = `${origin}/web/?endpoint=${publisher.profile.endpointId}`;
-  const shareURL = `${listURL}&share=${share}`;
+  const endpointURL = `${origin}/web/?endpoint=${publisher.profile.endpointId}`;
+  const listURL = `${endpointURL}&list=1`;
+  const shareURL = `${endpointURL}&share=${share}`;
+  const outer = visitor.locator('body > iframe');
+  const app = visitor.frameLocator('body > iframe').frameLocator('iframe');
+  const appHeading = app.getByRole('heading', { name: 'Shared application' });
+  const directoryRequests = [];
+  visitor.on('request', request => {
+    if (/^\/web\/(?:portal\.|vendor\/|dshx-icon)/.test(new URL(request.url()).pathname)) directoryRequests.push(request.url());
+  });
   async function checkBlankWhile(pattern, open) {
     const pending = Promise.withResolvers();
     await visitor.route(pattern, route => pending.resolve(route), { times: 1 });
     await open();
     const route = await pending.promise;
     try {
-      await visitor.locator('main').waitFor({ state: 'attached', timeout: 5000 });
-      assert.equal(await visitor.locator('main').isVisible(), false, pattern);
-      assert.equal(await visitor.locator('#viewer').isVisible(), false, pattern);
+      assert.equal(await visitor.locator('main').count(), 0, pattern);
+      assert.equal(await outer.isVisible(), false, pattern);
     } finally { await route.continue(); }
   }
-  await checkBlankWhile('**/__dshx/bridge', async () => {
-    if (turn) await visitor.goto(shareURL, { waitUntil: 'commit' });
-    else {
-      await visitor.getByRole('button', { name: '查看网页' }).click();
-      await visitor.getByRole('button', { name: '打开网页' }).click();
-    }
-  });
-  const app = visitor.frameLocator('#viewer > iframe').frameLocator('iframe');
-  try { await app.getByRole('heading', { name: 'Shared application' }).waitFor({ timeout: 42_000 }); }
-  catch (error) { t.diagnostic(`访客状态：${await visitor.getByRole('status', { includeHidden: true }).allTextContents()}`); throw error; }
-  assert.equal(await visitor.locator('main').isVisible(), false);
-  assert.equal(visitor.url(), shareURL);
-  const outer = visitor.locator('#viewer > iframe');
-  const inner = visitor.frameLocator('#viewer > iframe').locator('iframe');
+  if (!turn) {
+    await visitor.getByRole('button', { name: '查看网页' }).click();
+    assert.equal(visitor.url(), listURL);
+    const openButtons = visitor.getByRole('button', { name: '打开网页' });
+    await openButtons.last().waitFor({ timeout: 5000 });
+    assert.equal(await openButtons.count(), 2);
+    await openButtons.first().click();
+    await appHeading.waitFor({ timeout: 5000 });
+    assert.equal(visitor.url(), shareURL);
+    await visitor.goBack();
+    assert.equal(visitor.url(), listURL);
+    await openButtons.last().waitFor({ timeout: 5000 });
+    assert.equal(await outer.count(), 0);
+    await visitor.goForward();
+    await appHeading.waitFor({ timeout: 5000 });
+    assert.equal(visitor.url(), shareURL);
+  }
+  attempts.length = 0;
+  directoryRequests.length = 0;
+  await checkBlankWhile('**/__dshx/bridge', () => visitor.goto(endpointURL, { waitUntil: 'commit' }));
+  await appHeading.waitFor({ timeout: 5000 });
+  assert.equal(await visitor.title(), '测试网站');
+  assert.equal(await visitor.locator('main').count(), 0);
+  assert.equal(visitor.url(), endpointURL);
+  assert.deepEqual(directoryRequests, []);
+  const inner = visitor.frameLocator('body > iframe').locator('iframe');
   const viewport = await visitor.evaluate(() => ({ x: 0, y: 0, width: innerWidth, height: innerHeight }));
   for (const colorScheme of ['light', 'dark']) {
     await visitor.emulateMedia({ colorScheme });
+    await appHeading.evaluate((heading, scheme) => {
+      if (!heading.ownerDocument.defaultView.matchMedia(`(prefers-color-scheme: ${scheme})`).matches) {
+        throw Error(`共享网页未收到 ${scheme} 主题偏好`);
+      }
+    }, colorScheme);
     for (const iframe of [outer, inner]) {
       assert.deepEqual(await iframe.boundingBox(), viewport);
       assert.deepEqual(await iframe.evaluate(frame => {
@@ -402,16 +435,6 @@ test(`real Chromium loads and writes a shared app through Service Worker and a v
     assert.ok(bottom.y >= 0 && bottom.y + bottom.height <= viewport.height);
   }
   assert.deepEqual(attempts, turn ? ['direct', 'relay'] : ['direct']);
-  if (!turn) {
-    await visitor.goBack();
-    assert.equal(visitor.url(), listURL);
-    await visitor.getByRole('button', { name: '打开网页' }).waitFor({ timeout: 5000 });
-    assert.equal(await outer.count(), 0);
-    await visitor.goForward();
-    assert.equal(visitor.url(), shareURL);
-    await app.getByRole('heading', { name: 'Shared application' }).waitFor({ timeout: 5000 });
-    assert.equal(await visitor.locator('main').isVisible(), false);
-  }
   const link = await visitor.evaluate(async () => {
     const stats = await window.testPeer.getStats();
     const pair = stats.get([...stats.values()].find(row => row.type === 'transport')?.selectedCandidatePairId);
@@ -441,20 +464,20 @@ test(`real Chromium loads and writes a shared app through Service Worker and a v
   await app.getByRole('link', { name: 'Redirect' }).click();
   await app.getByText('fixtures work').waitFor({ timeout: 5000 });
   if (!turn) {
-    const componentRequests = [];
-    visitor.on('request', request => { if (request.url().includes('/web/vendor/')) componentRequests.push(request.url()); });
-    await checkBlankWhile('**/web/portal.js', () => visitor.goto(shareURL, { waitUntil: 'commit' }));
-    await app.getByRole('heading', { name: 'Shared application' }).waitFor({ timeout: 5000 });
-    assert.deepEqual(componentRequests, []);
+    const missing = visitor.waitForEvent('console', { predicate: message => message.text() === '没有找到可访问的网页', timeout: 5000 });
+    await visitor.goto(`${endpointURL}&share=${randomUUID()}`);
+    await missing;
+    assert.equal(await visitor.locator('main, iframe').count(), 0);
+    await checkBlankWhile('**/web/viewer.js', () => visitor.goto(`${endpointURL}&share=${otherShare}`, { waitUntil: 'commit' }));
+    await app.getByRole('heading', { name: 'Another application' }).waitFor({ timeout: 5000 });
+    assert.equal(await visitor.title(), '另一个网站');
+    assert.deepEqual(directoryRequests, []);
   }
+  const disconnected = visitor.waitForEvent('console', { predicate: message => message.text() === '端点已停止网页访问', timeout: 5000 });
   publisherSocket.close();
-  await visitor.getByText('端点已停止网页访问').waitFor({ timeout: 5000 });
-  assert.equal(await visitor.locator('main').isVisible(), true);
-  assert.equal(await outer.count(), 0);
-  const back = visitor.getByRole('button', { name: '返回端点' });
-  assert.equal(await back.evaluate(button => button === document.activeElement), true);
-  await visitor.keyboard.press('Enter');
-  assert.equal(visitor.url(), `${origin}/web/`);
+  await disconnected;
+  assert.equal(await visitor.locator('main, iframe').count(), 0);
+  await visitor.goto(`${origin}/web/`);
   await endpointDirectory.getByText('离线', { exact: true }).waitFor({ timeout: 2500 });
   assert.equal(await endpointDirectory.getByRole('button', { name: '查看网页' }).isDisabled(), true);
 });

@@ -85,14 +85,16 @@ internal fun WebSharesSettings(runtime: TunnelChatRuntime, state: TunnelChatRunt
     } }
 }
 
-internal fun webShareLink(platform: String, endpoint: String): Uri {
+internal fun webShareLink(platform: String, endpoint: String, list: Boolean = false): Uri {
     val url = platform.toHttpUrl()
     require(url.isHttps && endpoint.matches(Regex("[a-f0-9-]{36}"))) { "网页共享需要 HTTPS 平台。" }
-    return Uri.parse(url.newBuilder().encodedPath("/web/").addQueryParameter("endpoint", endpoint).build().toString())
+    val link = url.newBuilder().encodedPath("/web/").addQueryParameter("endpoint", endpoint)
+    if (list) link.addQueryParameter("list", "1")
+    return Uri.parse(link.build().toString())
 }
 
 internal fun openWebShare(context: Context, platform: String, endpoint: String) {
-    val link = webShareLink(platform, endpoint)
+    val link = webShareLink(platform, endpoint, list = true)
     // 由浏览器引擎承载访问页，应用不向外部网页注入 Android 接口。
     val extras = Bundle().apply { putBinder("android.support.customtabs.extra.SESSION", null) }
     context.startActivity(Intent(Intent.ACTION_VIEW, link).putExtras(extras))
