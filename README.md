@@ -24,26 +24,51 @@ DSHX 是非官方 Android 应用，内置 DeepSeek 官方 **deepseek-harness（�
 
 ## 界面预览
 
-**网页共享目录**：浏览器可以查看已公开的端点。端点是 DSHX 客户端注册的对外入口；穿透平台维护这份目录，帮助访客找到发布设备。同一端点可以分享多个网页。
+以下是 Android 模拟器和浏览器里的实际界面，使用空白配置或测试数据。Android 截图来自 0.3.4 及可在模拟器运行引擎的 0.3.2 开发包，部分界面随版本变化。点击截图可以查看大图。
+
+### 对话与助手
+
+| 工作台 | 文字对话 | 助手设置 | 语音对话 |
+| :---: | :---: | :---: | :---: |
+| [<img src="assets/readme/workbench.webp" width="160" alt="工作台显示引擎状态、模型与会话和运行诊断入口">](assets/readme/workbench.webp) | [<img src="assets/readme/dialog.webp" width="160" alt="文字对话首页及模型选择入口">](assets/readme/dialog.webp) | [<img src="assets/readme/assistant.webp" width="160" alt="助手与资料设置中的名字、身份与提示词入口">](assets/readme/assistant.webp) | [<img src="assets/readme/voice.webp" width="160" alt="语音交互设置中的唤醒、识别与播报选项">](assets/readme/voice.webp) |
+
+### 资料与文件
+
+| 本机知识库 | 长期记忆 | 文件与附件 | 技能管理 |
+| :---: | :---: | :---: | :---: |
+| [<img src="assets/readme/knowledge.webp" width="160" alt="知识库资料标签，可添加资料、创建集合和检索正文">](assets/readme/knowledge.webp) | [<img src="assets/readme/memory.webp" width="160" alt="知识库记忆标签，可新增与搜索记忆，并查看待确认条目">](assets/readme/memory.webp) | [<img src="assets/readme/files.webp" width="160" alt="知识库文件标签，可搜索和上传文件">](assets/readme/files.webp) | [<img src="assets/readme/skills.webp" width="160" alt="知识库技能标签，显示开发包中的内置技能示例">](assets/readme/skills.webp) |
+
+### 手机能力与扩展
+
+| 手机操作 | 任务分工 | 实验体 | 微应用 | 插件 |
+| :---: | :---: | :---: | :---: | :---: |
+| [<img src="assets/readme/phone-control.webp" width="128" alt="手机操作与权限设置，显示无障碍、悬浮提示和通知授权状态">](assets/readme/phone-control.webp) | [<img src="assets/readme/task-routing.webp" width="128" alt="任务分工设置，可分别为简单任务和截图识别选择模型">](assets/readme/task-routing.webp) | [<img src="assets/readme/specimen.webp" width="128" alt="实验体首页，显示培养状态和运行日志分类">](assets/readme/specimen.webp) | [<img src="assets/readme/micro-apps.webp" width="128" alt="创建微应用表单，提供 DSHX 内运行和导出独立安装包两种格式">](assets/readme/micro-apps.webp) | [<img src="assets/readme/plugins.webp" width="128" alt="dsh 插件管理页，显示添加插件入口、内置设置和实验功能">](assets/readme/plugins.webp) |
+
+### 跨网络聊天与网页共享
+
+| 跨网络聊天列表 | 聊天中的 AI 接待 | 添加共享网页 |
+| :---: | :---: | :---: |
+| [<img src="assets/readme/tunnel-inbox.webp" width="160" alt="跨网络聊天列表，右下角加号可打开端点发现">](assets/readme/tunnel-inbox.webp) | [<img src="assets/readme/tunnel-conversation.webp" width="160" alt="开发验收中访客与公开端点的 AI 助手对话">](assets/readme/tunnel-conversation.webp) | [<img src="assets/readme/web-share.webp" width="160" alt="Android 网页共享设置，添加服务地址并选择是否启用共享">](assets/readme/web-share.webp) |
+
+**网页共享目录。** 端点是由 DSHX 注册的对外入口，平台维护的目录可以找到公开的端点。同一个端点可以分享多个网页。
 
 ![DSHX 网页共享目录的浅色与深色主题，展示端点在线状态和查看网页入口](assets/readme/web-directory.webp)
 
-**直接打开共享网页**：通过分享链接进入后，浏览器内容区只显示发布者的网页，没有 DSHX 导航或连接状态栏。下图是从链接打开的测试网页。
+**直接打开共享网页。** 通过分享链接打开后，浏览器内容区只显示发布者的网页，没有 DSHX 导航或连接状态栏。下图是从链接打开的测试网页。
 
 ![直达链接打开的测试网页，内容区没有 DSHX 导航或按钮](assets/readme/web-direct.webp)
 
-**Android 穿透聊天**：左侧是会话列表，右下角加号打开「发现」；右侧是测试会话中的 AI 接待。截图为开发验收界面，使用测试数据。
+### 应用管理
 
-<p>
-  <img src="assets/readme/tunnel-inbox.webp" width="245" alt="Android 深色聊天列表，显示会话状态和右下角的发现端点按钮">
-  <img src="assets/readme/tunnel-conversation.webp" width="245" alt="Android 浅色聊天详情，展示访客与公开端点的 AI 助手对话">
-</p>
+| 外观 | 备份与恢复 | 应用内更新 | 运行诊断 |
+| :---: | :---: | :---: | :---: |
+| [<img src="assets/readme/appearance.webp" width="160" alt="深色主题下的设置页，可选择跟随系统、浅色或深色">](assets/readme/appearance.webp) | [<img src="assets/readme/backup.webp" width="160" alt="备份与恢复页，可导出或恢复会话和附件">](assets/readme/backup.webp) | [<img src="assets/readme/update.webp" width="160" alt="应用更新页，显示已安装的版本和检查更新入口">](assets/readme/update.webp) | [<img src="assets/readme/diagnostics.webp" width="160" alt="运行诊断页，显示本机日志以及模拟器运行不匹配安装包时的错误示例">](assets/readme/diagnostics.webp) |
 
 <a id="当前状态"></a>
 
 ## 近期更新
 
-当前公开版本为 **[v0.3.4 开发预览](https://github.com/skynit/DSHX/releases/tag/v0.3.4)**。各版本的提交见 [GitHub 发行记录](https://github.com/skynit/DSHX/releases)。
+本文涵盖至 **[v0.3.4 开发预览](https://github.com/skynit/DSHX/releases/tag/v0.3.4)**。各版本的提交见 [GitHub 发行记录](https://github.com/skynit/DSHX/releases)。
 
 | 版本 | 改动 |
 | --- | --- |
@@ -67,7 +92,7 @@ DSHX 是非官方 Android 应用，内置 DeepSeek 官方 **deepseek-harness（�
 
 ### 设备要求
 
-项目声明最低 Android 8.0（API 26，即 Android 系统接口版本），部分能力另有更高系统要求。聊天页需要 **Android System WebView 126 或更新版本**：它是 Android 提供、由应用创建的网页容器，负责显示 dsh 的聊天页面，与处理请求的引擎分别运行。设备兼容性仍需按具体机型验证。
+项目声明最低 Android 8.0（API 26，即 Android 系统接口版本），部分能力另有更高系统要求。文字对话页需要 **Android System WebView 126 或更新版本**：它是 Android 提供、由应用创建的网页容器，负责显示 dsh 的对话页面，处理模型请求的则是引擎。设备兼容性仍需按具体机型验证。
 
 语音输入默认在手机上使用 **Silero VAD + SenseVoice**：前者检测讲话和停顿，后者把语音片段转换为文字。首次需在“设置 → 语音交互 → 语音识别”下载约 229 MiB 模型，此后录音在本机处理，单次讲话限 30 秒。也可选择手机提供的系统识别服务，其联网需求取决于该服务。关键词唤醒独立运行；回答播报使用在线服务，需要网络。
 
@@ -119,17 +144,17 @@ python3 tools/tunnel.py build
 
 ### 启动并配置
 
-1. 打开 DSHX，在“工作台”点击“启动 dsh”。应用校验并安装随包提供的运行文件，然后启动引擎。
-2. 在工作台点击“页面导航”，选择“对话”，配置自己的模型服务地址、模型名称和所需凭据。云端模型需要联网，费用由所选服务决定。
+1. 打开 DSHX，应用通常会在后台启动 dsh。若尚未运行，或之前手动停过，在工作台点「启动 dsh」，等待工作区就绪。
+2. 在工作台打开「模型与会话」，也可以通过「页面导航 → 对话」进入同一页面。配置自己的模型服务地址、模型名称和所需凭据。云端模型需要联网，费用由所选服务决定。
 3. 发送下面的消息，确认当前会话中出现实际模型回答：
 
    ```text
    你好，请用一句话介绍你能做什么。
    ```
 
-4. 按需进入“设置”：在“语音交互”检查系统识别与播报，在“任务分工”配置可选的小模型，在“手机操作与权限”开启手机能力，在“助手与资料 → 知识库”管理资料、记忆、文件和技能。可选本机文字模型仍需下载并校验；播报默认使用 Edge TTS，也可配置火山语音合成或音频生成，无需下载播报模型。
+4. 按需进入「设置」：在「语音交互」下载本机识别模型或改用系统识别，并配置播报；在「任务分工」为简单任务和截图配置模型；在「手机操作与权限」开启所需能力并完成系统授权。在「助手与资料 → 知识库」可以管理资料、记忆、文件和技能。
 
-引擎启动、聊天网页加载和模型回答是三个独立检查点。首次使用以实际收到回答为准。
+引擎启动、文字对话页加载和模型回答是三个独立检查点。首次使用以实际收到回答为准。底栏的「聊天」用于跨设备通信，不是配置模型的入口。
 
 <a id="术语与整体架构"></a>
 <a id="典型执行流程"></a>
@@ -149,7 +174,7 @@ flowchart TD
     A <--> V[语音与模型分工]
 ```
 
-文字从聊天页面进入 dsh；语音由手机系统服务收音、识别后交给正式会话，有限的简单文字任务也可按规则交给本机小模型。dsh 请求配置的模型，收到工具调用后执行对应操作，再将结果交给模型继续处理，最终返回回答。语音页逐步显示回答，并把可朗读文字按短句交给所选播报服务；思考内容和工具参数不会进入播报。手机工具通过本机通信转交 Android 应用执行，执行前仍需检查能力开关与系统授权。
+文字从对话页面进入 dsh。语音默认由 DSHX 录音并在本机识别，也可以交给选定的 Android 系统识别服务；两种方式都把识别后的文字交给当前会话。配置任务分工后，符合规则的简单任务可交给另选的本机或在线模型。dsh 请求模型，收到工具调用后执行对应操作，再把结果交给模型继续处理。语音页逐步显示回答，把可朗读文字按短句交给所选播报服务；思考内容和工具参数不会进入播报。手机工具由 Android 应用执行，执行前仍需检查能力开关和系统授权。
 
 长期记忆保存用户管理或自动整理得到的偏好、事实和经验；知识库保存用户主动导入的参考资料。它们与完整对话记录分别存储，按需要提供有限背景或检索结果。谁创建各组件、请求如何流转以及数据如何保存，见[术语与整体架构](docs/architecture.md)和[典型执行流程](docs/workflows.md)。
 
@@ -158,21 +183,27 @@ flowchart TD
 
 ## 功能一览
 
-| 能力 | 当前用途 | 使用条件与说明 |
+| 功能 | 用途与条件 | 预览 |
 |---|---|---|
-| 文字聊天与助手设置 | 多轮对话，自定义助手名字、身份和回答要求 | 配置模型服务；[界面](docs/interface.md) · [助手设置](docs/assistant.md) |
-| 文件、命令与附件 | 读写文件、搜索内容、执行前台命令、交付附件，并保留用户手动终端 | 使用应用已有访问权限；[文件与工具](docs/tools.md) |
-| 手机操作 | 28 个手机工具，覆盖应用查找、界面观察与操作、分享和设备能力 | 对应能力开关与系统授权；[手机能力](docs/phone.md) |
-| 语音对话 | 本地 VAD 与语音识别、可选系统识别、本机关键词唤醒、回答逐段播报，以及语音或按钮打断 | 本地识别需首次下载模型与麦克风权限，本地插话在说完后确认；默认使用 Edge TTS，火山需自行配置凭据与开通服务，播报均需联网；[语音说明](docs/voice.md) |
-| 任务分工 | 文字或语音中的简单任务使用默认本地、导入本地或在线模型；截图可单独指定图片模型 | 本机文字模型需下载或导入，截图理解需支持图片的服务；[模型分工](docs/voice.md#自定义分工模型) |
-| 长期记忆 | 保存、管理和召回偏好、事实与经验，按需自动整理 | 长期记忆和自动整理默认关闭；[记忆说明](docs/memory.md) |
-| 本机知识库 | 导入 UTF-8 编码的 Markdown、TXT，进行关键词与语义检索 | 关键词检索在本机，语义检索和摘要需另配服务；[知识库](docs/knowledge.md) |
-| 备份与归档 | 分别导出会话数据和知识资料，用于恢复或迁移 | 两种格式覆盖不同数据；[存储范围](docs/storage.md) · [归档说明](docs/backup.md) |
-| 微应用 | 让 dsh 创建带页面、逻辑和独立数据的应用，也可导出独立安装包 | 可在 DSHX 内运行，或单独安装导出的版本；[微应用说明](docs/apps.md) |
-| 穿透聊天 | 跨网络收发文字、图片和指定类型的附件；支持 AI 接待和人工接管 | 双方使用同一穿透平台，优先直连；平台配置中继后可回退；[穿透聊天说明](docs/tunnel-chat.md) |
-| 网页共享 | 将手机本机或局域网内已运行的网页服务共享给浏览器访客 | 发布设备需公开在线，访客不用安装 DSHX；[网页共享说明](docs/web-share.md) |
-| 应用内更新 | 检查版本、后台下载、断点续传、验证安装包 | 安装需用户在 Android 系统安装器中确认；[应用内更新说明](docs/update.md) |
-| 插件 | 复用官方插件安装、启用和工具扩展机制 | 需满足 Android 兼容与工具调用条件；[插件说明](docs/plugins.md) |
+| 工作台 | 查看引擎状态、启动或停止 dsh，进入模型与会话；[引擎管理](docs/engine.md) | [截图](assets/readme/workbench.webp) |
+| 文字对话 | 配置模型后发起多轮对话，查看会话记录与工具结果；[对话界面](docs/interface.md) | [截图](assets/readme/dialog.webp) |
+| 助手设置 | 自定义助手的名字、身份和回答要求；[助手设置](docs/assistant.md) | [截图](assets/readme/assistant.webp) |
+| 语音对话 | 默认在本机识别，可选系统识别，支持关键词唤醒、逐段播报和打断。输入需麦克风权限，本机识别首次需下载模型；播报需联网，默认使用 Edge TTS（把文字转为语音的在线服务），也可配置火山服务；[语音说明](docs/voice.md) | [截图](assets/readme/voice.webp) |
+| 本机知识库 | 导入 UTF-8 编码的 Markdown 或 TXT 文档。本机可按关键词查找；按语义查找或生成摘要需另配服务，可能向所选服务发送资料；[知识库](docs/knowledge.md) | [截图](assets/readme/knowledge.webp) |
+| 长期记忆 | 保存偏好、事实与经验。允许对话使用记忆和开启自动整理是两个独立开关，默认均关闭；新自动整理的条目直接保存，「待确认」主要用于旧候选；[记忆说明](docs/memory.md) | [截图](assets/readme/memory.webp) |
+| 文件、命令与附件 | 在知识库管理上传原件和聊天附件；助手可在应用已有权限内读写文件、搜索或执行前台命令，用户也可使用手动终端；[文件与工具](docs/tools.md) | [截图](assets/readme/files.webp) |
+| 技能管理 | 用户可以创建、编辑和删除技能。技能是给 dsh 读的操作说明，不是插件，也不会增加系统权限；[技能说明](docs/interface.md#知识库统一入口) | [截图](assets/readme/skills.webp) |
+| 手机操作 | 查找可见应用、读取页面控件、点击或滑动。需开启对应能力并完成系统授权；读取和操作界面还需无障碍服务已连接；[手机能力](docs/phone.md) | [截图](assets/readme/phone-control.webp) |
+| 任务分工 | 简单文字或语音任务可另选本机或在线模型；本机模型须先下载或导入。截图识别可单独指定支持图片的模型；[模型分工](docs/voice.md#自定义分工模型) | [截图](assets/readme/task-routing.webp) |
+| 实验体 | 用户配置指令和触发概率，dsh 在设备可操作时检查是否执行，并记录结果。默认关闭；锁屏或息屏跳过，恢复后不补跑；[实验体说明](docs/hosting.md) | [截图](assets/readme/specimen.webp) |
+| 微应用 | 描述需求，由 dsh 生成能在 DSHX 内运行的应用，或选择生成可独立安装的 Android 安装包；[微应用说明](docs/apps.md) | [截图](assets/readme/micro-apps.webp) |
+| 插件 | 用 dsh 管理器安装和启用扩展。能安装、已启用和工具能在 Android 上实际运行是三回事；[插件说明](docs/plugins.md) | [截图](assets/readme/plugins.webp) |
+| 穿透聊天 | 设备跨网收发文字、图片和文件，支持 AI 接待与人工接管。双方用同一穿透平台，优先直连；配置中继后，直连失败可由服务器转发加密数据；[聊天说明](docs/tunnel-chat.md) | [截图](assets/readme/tunnel-conversation.webp) |
+| 网页共享 | 将手机或局域网内已运行的网页分享给浏览器访客。端点需公开在线、网页条目需启用；访客不用安装 DSHX；[网页共享说明](docs/web-share.md) | [发布端](assets/readme/web-share.webp) · [访客端](assets/readme/web-direct.webp) |
+| 外观 | 在设置中选择跟随系统、浅色或深色；[界面说明](docs/interface.md) | [截图](assets/readme/appearance.webp) |
+| 备份与归档 | 停止引擎后可备份或恢复会话与附件；知识归档另在资料管理中操作。两者均不包含独立记忆或模型密钥；[备份范围](docs/backup.md) | [截图](assets/readme/backup.webp) |
+| 应用内更新 | 检查版本，在后台下载并验证安装包，支持断点续传；安装需到 Android 系统安装器确认；[更新说明](docs/update.md) | [截图](assets/readme/update.webp) |
+| 运行诊断 | 从工作台查看保存在本机的近期日志，用来排查引擎启动等问题；[引擎说明](docs/engine.md) | [截图](assets/readme/diagnostics.webp) |
 
 Full（完全权限）是应用为有效会话提供的工具准入模式，只使用应用已有的访问权限；它不授予 root（系统最高权限），也不替代 Android 系统授权。
 
@@ -252,7 +283,7 @@ Full（完全权限）是应用为有效会话提供的工具准入模式，只�
 </details>
 
 <details>
-<summary><strong>聊天页打不开，或页面能打开但没有回答，应该检查哪里？</strong></summary>
+<summary><strong>文字对话页打不开，或页面能打开但没有回答，应该检查哪里？</strong></summary>
 
 先确认工作台中的 dsh 已启动，再检查 WebView 是否达到 126 或更新版本。页面可用但请求失败时，检查模型服务地址、模型名称、凭据与网络。见[安装与首次对话验证](docs/development.md#安装并完成第一次对话)。
 
@@ -290,7 +321,7 @@ Full（完全权限）是应用为有效会话提供的工具准入模式，只�
 - **构建与使用：** [开发环境、安装与定向验证](docs/development.md)、[聊天界面](docs/interface.md)、[助手设置](docs/assistant.md)。
 - **跨设备与更新：** [网页共享](docs/web-share.md)、[穿透聊天](docs/tunnel-chat.md)、[Android 应用在线更新](docs/update.md)。
 - **架构与运行：** [术语和目录](docs/architecture.md)、[典型执行流程](docs/workflows.md)、[引擎生命周期](docs/engine.md)、[运行包安装](docs/runtime.md)、[本机通信](docs/bridge.md)。
-- **工具与扩展：** [文件、命令和附件](docs/tools.md)、[手机能力](docs/phone.md)、[语音与本机小模型](docs/voice.md)、[微应用](docs/apps.md)、[插件兼容](docs/plugins.md)。
+- **工具与扩展：** [文件、命令和附件](docs/tools.md)、[手机能力](docs/phone.md)、[语音与本机小模型](docs/voice.md)、[技能](docs/interface.md#知识库统一入口)、[实验体](docs/hosting.md)、[微应用](docs/apps.md)、[插件兼容](docs/plugins.md)。
 - **记忆与资料：** [长期记忆](docs/memory.md)、[知识库](docs/knowledge.md)、[共享读取额度](docs/read-budget.md)。
 - **数据与来源：** [存储和备份范围](docs/storage.md)、[迁移与归档](docs/backup.md)、[早期原型](docs/prototype.md)、[技术来源与许可证](docs/sources.md)。
 
