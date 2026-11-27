@@ -23,7 +23,7 @@ app/src/main/assets/core.zip
 app/src/main/assets/core.json
 app/src/main/assets/core-info.json
 app/libs/*.aar
-app/.cxx/
+.cxx/
 app/src/main/assets/voice/wake/
 app/src/main/assets/voice/clean/
 app/src/main/assets/voice/vad/
