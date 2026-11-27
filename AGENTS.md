@@ -11,7 +11,7 @@
 - 不进行全量测试，只运行当前包或模块内与改动相关的定向测试和必要构建。
 - 在已有测试文件中增加测试，不为一两个测试单独创建文件。
 - 报告完成前运行对应检查，区分构建通过、界面检查和实际功能验证，不能以其中一种代替其他验证。
-- 截图必须使用 [niri-window-screenshot](/home/skynit/.codex/skills/niri-window-screenshot/SKILL.md)，按实时窗口 ID 截取本机目标应用或控制台窗口并打开图片检查；不以整屏截图或设备截图代替。
+- 截图优先使用 [niri-window-screenshot](/home/skynit/.codex/skills/niri-window-screenshot/SKILL.md)，按实时窗口 ID 截取本机目标应用或控制台窗口并打开图片检查；不以整屏截图或设备截图代替。
 
 ## 提交与推送
 
